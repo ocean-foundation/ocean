@@ -66,7 +66,7 @@ func runtimeDecls() string {
         "declare void @oc_map_missing(i64) noreturn\n" +
         "declare void @oc_recover(ptr)\n" +
         "declare void @oc_run_defers(ptr)\n" +
-        "declare i32 @" + recoverySymbol() + "(ptr" + (util.Windows() ? ", ptr" : "") + ") returns_twice\n" +
+        "declare i32 @" + recoverySymbol() + "(ptr" + (targetWindows() ? ", ptr" : "") + ") returns_twice\n" +
         "declare void @llvm.trap() noreturn\n" +
         "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n" +
         "declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n" +
@@ -225,6 +225,7 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
     emitGenericMethods(g);
     out := util.NewBuf();
     out.Add("; Ocean program module\n");
+    if (!g.wasm && targetTriple() != "") out.Add("target triple = \"").Add(targetTriple()).Add("\"\n");
     if (g.wasm) {
         out.Add("target datalayout = \"e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20\"\n");
         out.Add("target triple = \"wasm32-unknown-unknown\"\n");

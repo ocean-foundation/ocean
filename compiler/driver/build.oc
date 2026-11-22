@@ -56,6 +56,8 @@ func packageMain(args []string) int {
 
 func buildPackage(o *BuildOptions) int {
     if (!validateTarget()) return 1;
+    cross, _ := util.Getenv("OCEAN_CROSS_TARGET");
+    if (cross != "" && !o.emit) { util.Stderr("ocean: OCEAN_CROSS_TARGET supports only build --emit-llvm\n"); return 1; }
     diags := newDiags();
     prog := Frontend(o.location, false, "", diags);
     if (prog.fatal) return 1;

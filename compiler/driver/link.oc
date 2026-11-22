@@ -204,6 +204,8 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
 // which re-prints wide constants in decimal), yet clang can build it alone.
 func selfContainedIR(p *Program, ir string) (string, bool) {
     if (targetWasm()) return ir, true; // the wasm runtime is linked by ocean build
+    cross, _ := util.Getenv("OCEAN_CROSS_TARGET");
+    if (cross != "") return ir, true;   // the host-built runtime does not apply
     dir, ok := util.MakeTempDir("ocean-ir-");
     if (!ok) return ir, true;
     out: util.Buf;
