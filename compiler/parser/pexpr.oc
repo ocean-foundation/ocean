@@ -197,7 +197,7 @@ func postfix(p *Parser, n *ast.Node) *ast.Node {
                 a := nodeAt(p, ast.NK.Assert, n);
                 a.a = n;
                 a.line = tok(p).line; a.col = tok(p).col;
-                a.b = typ(p);
+                a.b = typeChecked(p);
                 if (is(p, scanner.Kind.LBrace)) { a.flag = true; a.list = compositeBody(p); }
                 if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected closing type assertion parenthesis"); return a; }
                 n = finish(p, a);
@@ -335,9 +335,12 @@ func castTarget(p *Parser) *ast.Node {
     if (k == scanner.Kind.LBrack) return arrayType(p);
     if (k == scanner.Kind.Ident && tok(p).text == "buffer") return bufferType(p, true);
     if (k == scanner.Kind.Ident || k == scanner.Kind.KwAny) {
+        start := p.pos;
         n := node(p, ast.NK.Ident);
         n.name = tok(p).text;
         next(p);
+        // removed postfix syntax: x -> i8[] (fix rewrites it to x -> []i8)
+        if (is(p, scanner.Kind.LBrack) && (isBuiltinTypeName(n.name) || fixEligible(p, n))) legacyCheck(p, start);
         return finish(p, n);
     }
     err(p, "Expected cast type; multi-token types require parentheses");

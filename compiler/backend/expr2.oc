@@ -665,6 +665,7 @@ func genExtract(g *Gen, n *ast.Node, ev V, t *ast.Type) V {
 func genFuncLit(g *Gen, n *ast.Node, t *ast.Type) V {
     name := literalRef(g, n);
     k := len(n.syms);
+    if (k == 0) return pair(g, name, "null", t); // nothing captured: no environment
     env := tmp(g);
     emit(g, env + " = call ptr @oc_alloc(i64 " + itoa(k * 8) + ")");
     for (i, s := range n.syms) {

@@ -109,12 +109,13 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
         cacheStore(key, obj);
     }
     staged := output + ".ocean-tmp" + (p.isLibrary ? "" : util.ExeSuffix());
+    if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
     args := []string{"clang", obj, "-o", staged};
     if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
     ok2 := clangRun(args);
     util.RemoveAll(dir);
     if (!ok2) { util.Remove(staged); return false; }
-    if (!util.Rename(staged, output)) { util.Stderr("ocean: could not write " + output + "\n"); util.Remove(staged); return false; }
+    if (!util.Rename(staged, output)) { util.Stderr("could not save output: " + util.OutputError(output, true) + "\n"); util.Remove(staged); return false; }
     return true;
 }
 
@@ -147,6 +148,7 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
     if (!util.WriteFile(irPath, ir)) { util.Stderr("ocean: could not create IR file\n"); util.RemoveAll(dir); return false; }
     rts := runtimeSources(p, dir);
     staged := output + ".ocean-tmp" + (p.isLibrary ? "" : util.ExeSuffix());
+    if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
     args := []string{"clang", optLevel(), "-w", "-Wno-override-module"};
     if (p.isLibrary) {
         objs := make([]string);
@@ -173,7 +175,7 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
         if (!clangRun(args)) { util.RemoveAll(dir); util.Remove(staged); return false; }
     }
     util.RemoveAll(dir);
-    if (!util.Rename(staged, output)) { util.Stderr("ocean: could not write " + output + "\n"); util.Remove(staged); return false; }
+    if (!util.Rename(staged, output)) { util.Stderr("could not save output: " + util.OutputError(output, true) + "\n"); util.Remove(staged); return false; }
     return true;
 }
 

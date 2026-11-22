@@ -482,7 +482,7 @@ func genBuiltin(g *Gen, n *ast.Node, t *ast.Type) V {
     if (name == "recover") {
         out := alloca(g, check.TAny());
         emit(g, "call void @oc_recover(ptr " + out + ")");
-        return load(g, check.TAny(), out);
+        return freshV(g, load(g, check.TAny(), out).r, check.TAny());
     }
     mem := n.a;
     recv := mem.a;

@@ -312,6 +312,7 @@ func collectMethods(c *Checker, p *ast.Package) {
                 err(c, recv, "method receiver must name a struct, enum, or defined type");
                 continue;
             }
+            if (owner.pkg == p) refSym(c, base, base.line, base.col, owner, zero(*ast.Type));
             m := newSym(c, ast.SK.Func, d.name, d);
             m.owner = owner; m.recvPtr = ptr;
             declRef(c, src, d.nameLine, d.nameCol, m, zero(*ast.Type));
@@ -366,6 +367,7 @@ func (c *Checker) SetBuiltin(p *ast.Package) { c.builtinPkg = p; }
 
 // Check analyzes packages in dependency order.
 func (c *Checker) Check(order []*ast.Package, stdRoot string) int {
+    activeChecker = c; // diagnostics qualify types relative to c.pkg
     c.stdRoot = stdRoot;
     all := make([]*ast.Package);
     if (!nilPkg(c.builtinPkg)) all.append(c.builtinPkg);
@@ -382,6 +384,7 @@ func (c *Checker) Check(order []*ast.Package, stdRoot string) int {
     for (_, p := range all) markIntrinsics(c, p);
     for (_, p := range all) resolveDecls(c, p);
     for (_, p := range all) checkBodies(c, p);
+    activeChecker = zero(*Checker);
     return c.errors;
 }
 

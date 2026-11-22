@@ -119,6 +119,7 @@ func initFunction(g *Gen, packages []*ast.Package) {
     emit(g, prev + " = load ptr, ptr " + f.frame);
     emit(g, "store ptr " + prev + ", ptr @oc_top");
     term(g, "ret void");
+    emitLocalTable(g);
     g.mod.Add("define void @oc_init_globals() {\nentry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
 }
 
@@ -192,7 +193,10 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
         m := root.scope.LookupLocal("main");
         if (!nilS(m) && m.kind == ast.SK.Func) mainWrapper(g, m);
         setArgsWrapper(g, c.OsSetArgs());
-        g.mod.Add("@oc_argc = external global i32\n@oc_argv = external global ptr\ndeclare i32 @oc_start()\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n  store i32 %argc, ptr @oc_argc\n  store ptr %argv, ptr @oc_argv\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
+        // ELF (glibc) hands argc/argv to the runtime's constructor, so main
+        // takes no parameters there, as in ocean-c; elsewhere main stores them.
+        if (hostPlatform() == "linux") g.mod.Add("declare i32 @oc_start()\ndefine i32 @main() {\nentry:\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
+        else g.mod.Add("@oc_argc = external global i32\n@oc_argv = external global ptr\ndeclare i32 @oc_start()\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n  store i32 %argc, ptr @oc_argc\n  store ptr %argv, ptr @oc_argv\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
     } else {
         for (_, p := range packages) {
             if (p != root) continue;

@@ -172,7 +172,7 @@ func frameName(inst *Inst) string {
 
 func prologue(g *Gen, displayName string) {
     f := g.fn;
-    f.frame = allocaBytes(g, 40, 8);
+    f.frame = allocaBytes(g, 48, 8);
     prev := tmp(g);
     emit(g, prev + " = load ptr, ptr @oc_top");
     emit(g, "store ptr " + prev + ", ptr " + f.frame);
@@ -180,6 +180,8 @@ func prologue(g *Gen, displayName string) {
     emit(g, "store i64 0, ptr " + gep(g, f.frame, 16));
     emit(g, "store ptr null, ptr " + gep(g, f.frame, 24));
     emit(g, "store ptr null, ptr " + gep(g, f.frame, 32));
+    // owned locals, released by the runtime when a panic unwinds this frame
+    emit(g, "store ptr %loctab, ptr " + gep(g, f.frame, 40));
     emit(g, "store ptr " + f.frame + ", ptr @oc_top");
     if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
 }
@@ -307,14 +309,32 @@ func emitInst(g *Gen, inst *Inst) {
     if (f.hasDefer) emit(g, "call void @oc_run_defers(ptr " + f.frame + ")");
     dropAllLocals(g);
     br(g, "finish");
-    if (f.hasDefer) { g.fn.body.Add("recovered:\n"); f.terminated = false; br(g, "finish"); }
+    if (f.hasDefer) { g.fn.body.Add("recovered:\n"); f.terminated = false; dropAllLocals(g); br(g, "finish"); }
     label(g, "finish");
     prev := tmp(g);
     emit(g, prev + " = load ptr, ptr " + f.frame);
     emit(g, "store ptr " + prev + ", ptr @oc_top");
     emitReturn(g);
+    emitLocalTable(g);
     g.mod.AddBuf(&hdr);
     g.mod.Add("entry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
+}
+
+// emitLocalTable defines %loctab: {slot, type} pairs of the function's owned
+// locals, terminated by a null slot (the prologue stores it in the frame).
+func emitLocalTable(g *Gen) {
+    f := g.fn;
+    n := len(f.allLocals);
+    f.allocas.Add("  %loctab = alloca [").AddInt(n + 1).Add(" x {ptr, ptr}], align 8\n");
+    for (i, l := range f.allLocals) {
+        e := "%loctab." + itoa(i);
+        f.allocas.Add("  ").Add(e).Add(" = getelementptr inbounds {ptr, ptr}, ptr %loctab, i64 ").AddInt(i).Add("\n");
+        f.allocas.Add("  store ptr ").Add(l.slot).Add(", ptr ").Add(e).Add("\n");
+        f.allocas.Add("  ").Add(e).Add(".t = getelementptr inbounds i8, ptr ").Add(e).Add(", i64 8\n");
+        f.allocas.Add("  store ptr ").Add(desc(g, l.t)).Add(", ptr ").Add(e).Add(".t\n");
+    }
+    f.allocas.Add("  %loctab.end = getelementptr inbounds {ptr, ptr}, ptr %loctab, i64 ").AddInt(n).Add("\n");
+    f.allocas.Add("  store {ptr, ptr} zeroinitializer, ptr %loctab.end\n");
 }
 
 func (inst *Inst) sym_linkage(g *Gen) string {

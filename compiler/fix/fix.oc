@@ -101,6 +101,13 @@ func fixFile(path string, known map[string]bool) int {
         if (next == current) break;
         current = next;
     }
+    // like ocean-c, report remaining syntax errors without failing the fix
+    live := diag.NewList();
+    live.AddSource(path, current);
+    final := new(ast.Source);
+    final.path = path; final.text = current;
+    ftoks, sok := scanner.Scan(path, current, live, true);
+    if (sok) { final.tokens = ftoks; parser.ParseFile(final, live, false); }
     if (total > 0 && current != text) {
         tmp := path + ".ocean-fix-" + util.Itoa(util.Pid());
         if (!util.WriteFile(tmp, current)) { util.Stderr("ocean fix: cannot write " + path + "\n"); util.Remove(tmp); return -1; }

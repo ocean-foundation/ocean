@@ -174,18 +174,23 @@ func refType(a *Analysis, r *check.Ref) *ast.Type {
     return r.ty;
 }
 
+// builtinTypeRef: a predeclared type name (int, string, ...), which ocean-c
+// leaves without hover or definition.
+func builtinTypeRef(r *check.Ref) bool { return !nilR(r) && !ast.NilSym(r.sym) && r.sym.kind == ast.SK.BuiltinType; }
+
 func hover(a *Analysis, off int) string {
     r := refAt(a, off);
-    if (nilR(r)) return "null";
+    // like ocean-c: packages and builtin type names have no hover
+    if (nilR(r) || r.kind == 7 || builtinTypeRef(r)) return "null";
     t := refType(a, r);
     detail := r.name;
-    if (!nilT(t)) detail += " " + check.TypeString(t);
-    if (r.kind == 7) detail = "package " + r.name;
+    if (!nilT(t)) detail += ": " + check.TypeString(t);
     return "{\"contents\":{\"kind\":\"markdown\",\"value\":" + Quote("```ocean\n" + detail + "\n```") + "},\"range\":" + refRange(a, r) + "}";
 }
 
 func definition(a *Analysis, off int) string {
     r := refAt(a, off);
+    if (nilR(r) || r.kind == 7 || builtinTypeRef(r)) return "null";
     if (!navigable(r)) return "[]";
     d := declOf(a, r);
     if (nilR(d)) return "[]";
@@ -206,7 +211,7 @@ func typeDefinition(a *Analysis, off int) string {
 
 func references(a *Analysis, off int, includeDecl bool) string {
     r := refAt(a, off);
-    if (!navigable(r)) return "[]";
+    if (!navigable(r) || r.kind == 7) return "[]";
     b: util.Buf;
     n := 0;
     for (_, x := range a.checker.Index().refs) {
@@ -221,7 +226,7 @@ func references(a *Analysis, off int, includeDecl bool) string {
 func prepareRename(a *Analysis, off int) string {
     r := refAt(a, off);
     if (!navigable(r) || nilR(declOf(a, r)) || r.kind == 7) return "null";
-    return refRange(a, r);
+    return "{\"placeholder\":" + Quote(r.name) + ",\"range\":" + refRange(a, r) + "}";
 }
 
 func validIdentifier(s string) bool {

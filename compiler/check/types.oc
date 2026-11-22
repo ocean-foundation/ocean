@@ -218,13 +218,13 @@ func TypeString(t *ast.Type) string {
         s := "(";
         for (i, r := range t.results) { if (i > 0) s += ", "; s += TypeString(r); }
         return s + ")";
-    case ast.TK.Struct, ast.TK.Enum, ast.TK.Named, ast.TK.Family: return t.sym.name + argsString(t.args);
+    case ast.TK.Struct, ast.TK.Enum, ast.TK.Named, ast.TK.Family: return qualifiedName(t.sym) + argsString(t.args);
     case ast.TK.Interface:
         if (nilS(t.sym)) {
             if (len(t.methods) == 0 && len(t.terms) == 0) return "any";
             return "interface{...}";
         }
-        return t.sym.name + argsString(t.args);
+        return qualifiedName(t.sym) + argsString(t.args);
     case ast.TK.Param: return t.sym.name;
     case ast.TK.Union:
         s := "";
@@ -300,3 +300,16 @@ func intAlign(bits int) int {
     return 16;
 }
 func intSize(bits int) int { return align((bits + 7) / 8, intAlign(bits)); }
+
+// activeChecker is the checker producing diagnostics (nil after checking).
+activeChecker := zero(*Checker);
+
+// qualifiedName prefixes a declared type with its package name when it comes
+// from a package other than the one being checked (engine.Node<int>). Types of
+// the current package, builtins, and output outside checking stay bare.
+func qualifiedName(s *ast.Symbol) string {
+    if (nilS(s)) return "?";
+    c := activeChecker;
+    if ((c -> int) == 0 || nilPkg(c.pkg) || nilPkg(s.pkg) || s.builtin || s.pkg == c.pkg || s.pkg == c.builtinPkg || s.pkg.name == "") return s.name;
+    return s.pkg.name + "." + s.name;
+}

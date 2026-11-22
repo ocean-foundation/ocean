@@ -144,6 +144,7 @@ func typeOfExpr(c *Checker, n *ast.Node) (*ast.Type, bool) {
         if (s.kind == ast.SK.BuiltinType || s.kind == ast.SK.Struct || s.kind == ast.SK.Enum || s.kind == ast.SK.Interface ||
             s.kind == ast.SK.TypeDef || s.kind == ast.SK.Alias || s.kind == ast.SK.TypeParam) {
             n.sym = s;
+            refSym(c, n, n.line, n.col, s, zero(*ast.Type));
             t := symToType(c, n, s);
             n.sem = ast.Sem.TypeName; n.tyAlt = t;
             return t, true;
@@ -158,6 +159,8 @@ func typeOfExpr(c *Checker, n *ast.Node) (*ast.Type, bool) {
                 if (s.kind == ast.SK.Struct || s.kind == ast.SK.Enum || s.kind == ast.SK.Interface || s.kind == ast.SK.TypeDef || s.kind == ast.SK.Alias) {
                     if (!s.exported) return tInvalid, false;
                     n.a.sym = ps; n.sym = s;
+                    refSym(c, n.a, n.a.line, n.a.col, ps, zero(*ast.Type));
+                    refSym(c, n, n.nameLine, n.nameCol, s, zero(*ast.Type));
                     t := symToType(c, n, s);
                     n.sem = ast.Sem.TypeName; n.tyAlt = t;
                     return t, true;

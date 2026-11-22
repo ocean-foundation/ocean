@@ -41,7 +41,10 @@ typedef struct OcArr { int64_t len, cap; char *data; } OcArr;
 typedef struct { const OcType *t; void *data; } OcAny;
 typedef struct { const char *file; int64_t line, col; const char *text; } OcSite;
 typedef struct OcDefer { struct OcDefer *next; void (*thunk)(struct OcDefer *); } OcDefer;
-typedef struct OcFrame { struct OcFrame *prev; const char *name; int64_t site; OcDefer *defers; void *jb; } OcFrame;
+typedef struct OcLocal { void *slot; const struct OcType *t; } OcLocal;
+/* locals: the frame's owned locals (null-slot terminated), released when a
+ * panic unwinds past the frame. */
+typedef struct OcFrame { struct OcFrame *prev; const char *name; int64_t site; OcDefer *defers; void *jb; const OcLocal *locals; } OcFrame;
 
 extern const OcSite oc_sites[];
 extern const int64_t oc_nsites;
@@ -1095,7 +1098,7 @@ void oc_run_defers(OcFrame *f) {
     }
 }
 
-extern void ocean_threads_panic_exit(int32_t status) __attribute__((weak));
+extern void ocean_threads_panic_exit(int32_t status); /* threads.c or a module stub */
 static void die(void) {
     if (ocean_threads_panic_exit) ocean_threads_panic_exit(1);
     exit(1);
@@ -1112,6 +1115,13 @@ static char *msg_text(OcArr *msg) {
 }
 
 /* Unwind from frame 'start', running defers; recovery resumes in the frame. */
+void oc_drop(void *slot, const OcType *t);
+/* Locals only need releasing when some outer frame may recover (otherwise the
+ * process is about to exit). */
+static int recovery_possible(OcFrame *f) {
+    for (; f; f = f->prev) if (f->jb) return 1;
+    return 0;
+}
 static void unwind(OcArr *msg, int64_t site, OcFrame *start, OcFrame *traceFrom) {
     char *header = msg_text(msg);
     OcPanic p = {0};
@@ -1119,15 +1129,21 @@ static void unwind(OcArr *msg, int64_t site, OcFrame *start, OcFrame *traceFrom)
     panicking = &p;
     for (OcFrame *f = start; f; f = f->prev) {
         oc_top = f;
-        if (!f->defers) continue;
-        p.deferFrame = f;
-        oc_run_defers(f);
-        if (p.recovered && f->jb) {
-            panicking = p.outer;
-            oc_top = f;
-            free(header);
-            _longjmp(*(jmp_buf *)f->jb, 1);
+        if (f->defers) {
+            p.deferFrame = f;
+            oc_run_defers(f);
+            if (p.recovered && f->jb) {
+                panicking = p.outer;
+                oc_top = f;
+                free(header);
+                /* the panic owned its message; recover() handed out a copy */
+                { extern const OcType oc_type_string; oc_drop(&msg, &oc_type_string); }
+                _longjmp(*(jmp_buf *)f->jb, 1);
+            }
         }
+        /* the panic continues past this frame: release what it owns */
+        if (f->locals && (p.recovered || recovery_possible(f->prev)))
+            for (const OcLocal *l = f->locals; l->slot; l++) oc_drop(l->slot, l->t);
     }
     oc_trace(header, site, traceFrom);
     die();
@@ -1154,7 +1170,7 @@ void oc_recover(OcAny *out) {
     extern const OcType oc_type_string;
     out->t = &oc_type_string;
     OcArr **box = oc_alloc(8);
-    *box = p->msg;
+    *box = oc_str_copy(p->msg); /* the panic keeps (and later frees) its own */
     out->data = box;
 }
 int64_t oc_can_cancel(void) { return !in_defer; }
@@ -1163,8 +1179,8 @@ void oc_map_missing(int64_t site) { oc_panic(oc_str_c("map key does not exist"),
 void oc_null_deref(void) { __builtin_trap(); }
 
 /* Thread return/cancel: run every defer on this thread, then exit it. */
-extern _Noreturn void ocean_threads_exit(void) __attribute__((weak));
-extern void ocean_threads_begin_return(void) __attribute__((weak));
+extern _Noreturn void ocean_threads_exit(void);
+extern void ocean_threads_begin_return(void);
 void ocean_runtime_thread_return(void) {
     if (ocean_threads_begin_return) ocean_threads_begin_return();
     for (OcFrame *f = oc_top; f; f = f->prev) { oc_top = f; oc_run_defers(f); }

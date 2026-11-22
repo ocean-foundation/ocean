@@ -271,7 +271,7 @@ func switchStmt(p *Parser) *ast.Node {
             c.flag = true;
         } else if (accept(p, scanner.Kind.KwCase)) {
             for (;;) {
-                c.list.append(typeSwitch ? constraint(p) : ternary(p));
+                c.list.append(typeSwitch ? constraintChecked(p) : ternary(p));
                 if (p.failed) return n;
                 if (!accept(p, scanner.Kind.Comma)) break;
             }

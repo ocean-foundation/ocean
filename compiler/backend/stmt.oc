@@ -571,16 +571,19 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
     f.cur = "entry";
     g.fn = f;
     vals := make([]V);
+    shells := make([]string); // heap copies of aggregate arguments, freed after the call
     for (i, v := range items) {
         slot := gep(g, "%rec", 16 + i * 16);
         if (isAgg(v.t) || (under(v.t).kind == ast.TK.Int && under(v.t).bits > 128)) {
             h := tmp(g); emit(g, h + " = load ptr, ptr " + slot);
+            shells.append(h);
             vals.append(load(g, v.t, h));
         } else vals.append(load(g, v.t, slot));
     }
     if (kind == 4) {
         out := alloca(g, check.TAny());
         emit(g, "call void @oc_recover(ptr " + out + ")");
+        if (g.trackTemps) emit(g, "call void @oc_drop(ptr " + out + ", ptr " + desc(g, check.TAny()) + ")");
     } else if (kind == 6) {
         ffiCall(g, c.sym, vals, check.TVoid());
     } else if (kind == 8) {
@@ -676,6 +679,7 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
         if (rl == "void") emit(g, "call void " + fn + call);
         else { r := tmp(g); emit(g, r + " = call " + rl + " " + fn + call); }
     }
+    if (!g.fn.terminated) { for (_, h := range shells) emit(g, "call void @oc_free(ptr " + h + ")"); }
     term(g, "ret void");
     g.mod.Add("define internal void ").Add(name).Add("(ptr %rec) {\nentry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
     g.fn = saved;

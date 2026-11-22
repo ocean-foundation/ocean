@@ -28,7 +28,7 @@ func typeArgs(p *Parser) []*ast.Node {
     next(p); // '<'
     for (!p.failed) {
         if (tk(p) == scanner.Kind.Gt || tk(p) == scanner.Kind.Shr) break;
-        out.append(typ(p));
+        out.append(typeChecked(p));
         if (!accept(p, scanner.Kind.Comma)) break;
     }
     if (!closeAngle(p)) err(p, "Expected closing type argument angle");

@@ -318,3 +318,14 @@ func Rel(base string, path string) string {
     if (HasPrefix(p, b + "/")) return p[len(b) + 1:];
     return p;
 }
+
+// OutputError explains why an output path cannot be created or replaced, in
+// strerror's words, without depending on a platform's errno interface.
+func OutputError(path string, replacing bool) string {
+    if (IsDir(path)) return replacing && (Base(path) == "." || Base(path) == "..") ? "Device or resource busy" : "Is a directory";
+    parent := Dir(path);
+    if (parent == "") parent = ".";
+    if (!Exists(parent)) return "No such file or directory";
+    if (!IsDir(parent)) return "Not a directory";
+    return "Permission denied";
+}

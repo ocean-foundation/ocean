@@ -480,7 +480,15 @@ func collectionLen(g *Gen, v V) string {
         r := tmp(g); emit(g, r + " = udiv i64 " + h + ", " + itoa(es)); return r;
     case ast.TK.Buffer:
         if (u.len > 0) return itoa(u.len);
-        if (u.len == -1) { h := gep(g, v.r, -16); r := tmp(g); emit(g, r + " = load i64, ptr " + h); return r; }
+        if (u.len == -1) {
+            // runtime-sized buffer: the block header (bytes) precedes the elements
+            h := gep(g, v.r, -g.c.ArrayDataOffset(u.elem));
+            b := tmp(g); emit(g, b + " = load i64, ptr " + h);
+            es := sizeOf(g, u.elem);
+            if (es <= 1) return b;
+            r := tmp(g); emit(g, r + " = udiv i64 " + b + ", " + itoa(es));
+            return r;
+        }
     }
     return "0";
 }
@@ -703,15 +711,17 @@ func newRuntimeArray(g *Gen, t *ast.Type) string {
 
 // runtimeBuffer allocates n elements preceded by a hidden element count, and
 // returns the address of the first element (usable as an ordinary buffer view).
+// The storage is an ordinary array block owned by a hidden local of the
+// enclosing function (replaced on re-evaluation, released at function exit).
 func runtimeBuffer(g *Gen, elem *ast.Type, n string) string {
-    bytes := tmp(g);
-    emit(g, bytes + " = mul i64 " + n + ", " + itoa(sizeOf(g, elem)));
-    total := tmp(g);
-    emit(g, total + " = add i64 " + bytes + ", 16");
-    base := tmp(g);
-    emit(g, base + " = call ptr @oc_alloc(i64 " + total + ")");
-    emit(g, "store i64 " + n + ", ptr " + base);
-    return gep(g, base, 16);
+    blk := tmp(g);
+    emit(g, blk + " = call ptr @oc_block_new(i64 " + n + ", ptr " + desc(g, elem) + ")");
+    if (needsInit(g, elem)) emit(g, "call void @oc_init_block(ptr " + blk + ", ptr " + desc(g, elem) + ")");
+    blkT := check.ArrayOf(elem, -2);
+    hidden := alloca(g, blkT);
+    if (g.trackTemps) { emit(g, "call void @oc_drop(ptr " + hidden + ", ptr " + desc(g, blkT) + ")"); ownLocal(g, hidden, blkT); }
+    emit(g, "store ptr " + blk + ", ptr " + hidden);
+    return gep(g, blk, g.c.ArrayDataOffset(elem));
 }
 
 // hasRuntimeElems reports a fixed array whose elements (at some depth) are

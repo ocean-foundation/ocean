@@ -411,3 +411,12 @@ func windowsPoll(fds []int, events []int, timeoutMs int) []int {
         WinSleep(1);
     }
 }
+
+// CreateOutput creates (truncates) path for writing; false on failure.
+func CreateOutput(path string) bool {
+    c := CStr(path);
+    fd := native_open((c.data)->int, WriteFlags(), 493);
+    if (fd < 0) return false;
+    native_close(fd);
+    return true;
+}

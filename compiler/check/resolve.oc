@@ -100,8 +100,8 @@ func resolveStruct(c *Checker, s *ast.Symbol) {
         }
         f := new(ast.FieldInfo);
         f.name = fd.name; f.node = fd; f.bits = fd.ival;
-        refField(c, fd.src, fd.line, fd.col, s, fd.name, zero(*ast.Type), true);
         f.ty = resolveType(c, fd.a);
+        refField(c, fd.src, fd.line, fd.col, s, fd.name, f.ty, true);
         if (f.ty.kind == ast.TK.Void) err(c, fd, "void is not a field storage type");
         if (f.ty.kind == ast.TK.Buffer && f.ty.len == -1) err(c, fd, "runtime-sized buffers cannot be used in type declarations");
         if (f.bits > 0) checkBitfield(c, fd, f);
@@ -161,7 +161,7 @@ func resolveEnum(c *Checker, s *ast.Symbol) {
     for (i, vn := range n.list) {
         v := new(ast.VariantInfo);
         v.name = vn.name; v.vkind = vn.ival; v.index = i; v.node = vn;
-        refVariant(c, vn.src, vn.line, vn.col, s, vn.name, zero(*ast.Type), true);
+        refVariant(c, vn.src, vn.line, vn.col, s, vn.name, s.ty, true);
         if (vn.ival == 1) {
             for (_, tn := range vn.list) {
                 t := resolveType(c, tn);
