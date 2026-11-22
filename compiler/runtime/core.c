@@ -1197,7 +1197,9 @@ extern int64_t oc_user_main(void);
 extern void oc_set_args(char *stream, int64_t argc);
 int oc_argc; char **oc_argv;
 /* glibc passes argc/argv to ELF constructors; the module defines main(). */
+#if !defined(__wasm__)
 __attribute__((constructor)) static void oc_capture_args(int argc, char **argv) { oc_argc = argc; oc_argv = argv; }
+#endif
 int oc_start(void) {
     int argc = oc_argc; char **argv = oc_argv;
     if (!argv) { static char *none[] = {"", NULL}; argv = none; argc = 1; }

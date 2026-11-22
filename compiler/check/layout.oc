@@ -133,16 +133,16 @@ func sizeOf1(c *Checker, t *ast.Type) int {
     case ast.TK.Bool: return 1;
     case ast.TK.Int: return intSize(t.bits);
     case ast.TK.Float: return t.bits / 8;
-    case ast.TK.String, ast.TK.Ptr, ast.TK.Dyn, ast.TK.Map: return 8;
-    case ast.TK.Interface, ast.TK.Func, ast.TK.Union, ast.TK.Family: return 16;
+    case ast.TK.String, ast.TK.Ptr, ast.TK.Dyn, ast.TK.Map: return c.PtrSize();
+    case ast.TK.Interface, ast.TK.Func, ast.TK.Union, ast.TK.Family: return 2 * c.PtrSize();
     case ast.TK.Named: return c.SizeOf(Underlying(t));
     case ast.TK.Array:
-        if (t.len < 0) return 8;
+        if (t.len < 0) return c.PtrSize();
         return align(c.ArrayDataOffset(t.elem) + t.len * c.SizeOf(t.elem), c.AlignOf(t));
     case ast.TK.Buffer:
-        if (nilT(t.elem)) return 16;
+        if (nilT(t.elem)) return 2 * c.PtrSize();
         if (t.len > 0) return t.len * c.SizeOf(t.elem);
-        return 8;
+        return c.PtrSize();
     case ast.TK.Struct: return c.StructLayoutOf(t).size;
     case ast.TK.Enum:
         size, al := enumPayload(c, t);
@@ -151,7 +151,7 @@ func sizeOf1(c *Checker, t *ast.Type) int {
         return align(align(8, al) + size, a);
     case ast.TK.Tuple: return c.TupleLayout(t.results).size;
     }
-    return 8;
+    return c.PtrSize();
 }
 
 func (c *Checker) AlignOf(t *ast.Type) int {
@@ -172,17 +172,21 @@ func alignOf1(c *Checker, t *ast.Type) int {
     case ast.TK.Float: return t.bits / 8;
     case ast.TK.Named: return c.AlignOf(Underlying(t));
     case ast.TK.Array:
-        if (t.len < 0) return 8;
+        if (t.len < 0) return c.PtrSize();
         a := c.AlignOf(t.elem);
         return a > 8 ? a : 8;
     case ast.TK.Buffer:
         if (t.len > 0) return c.AlignOf(t.elem);
-        return 8;
+        return c.PtrSize();
     case ast.TK.Struct: return c.StructLayoutOf(t).align;
     case ast.TK.Enum:
         _, al := enumPayload(c, t);
         return al > 8 ? al : 8;
     case ast.TK.Tuple: return c.TupleLayout(t.results).align;
     }
-    return 8;
+    return c.PtrSize();
 }
+
+// PtrSize is the target's pointer width in bytes (4 on wasm32).
+func (c *Checker) PtrSize() int { return c.ptrSize > 0 ? c.ptrSize : 8; }
+func (c *Checker) SetPtrSize(n int) { c.ptrSize = n; }

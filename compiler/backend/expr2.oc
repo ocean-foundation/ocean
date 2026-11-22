@@ -273,7 +273,7 @@ func homogeneousCheck(g *Gen, data string, length string, idx string, val V) {
     chk := newLabel(g, "homo"); done := newLabel(g, "homodone"); bad := newLabel(g, "homobad");
     condBr(g, has, chk, done);
     label(g, chk);
-    op := gepDyn(g, data, other, 16);
+    op := gepDyn(g, data, other, 2 * g.c.PtrSize());
     od := tmp(g); emit(g, od + " = load ptr, ptr " + op);
     same := tmp(g); emit(g, same + " = icmp eq ptr " + od + ", " + d);
     condBr(g, same, done, bad);
@@ -667,10 +667,10 @@ func genFuncLit(g *Gen, n *ast.Node, t *ast.Type) V {
     k := len(n.syms);
     if (k == 0) return pair(g, name, "null", t); // nothing captured: no environment
     env := tmp(g);
-    emit(g, env + " = call ptr @oc_alloc(i64 " + itoa(k * 8) + ")");
+    emit(g, env + " = call ptr @oc_alloc(i64 " + itoa(k * g.c.PtrSize()) + ")");
     for (i, s := range n.syms) {
         p := storageOf(g, s, n);
-        emit(g, "store ptr " + p + ", ptr " + gep(g, env, i * 8));
+        emit(g, "store ptr " + p + ", ptr " + gep(g, env, i * g.c.PtrSize()));
     }
     return pair(g, name, env, t);
 }

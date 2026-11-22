@@ -51,6 +51,7 @@ func Frontend(location string, test bool, harness string, diags *diag.List) *Pro
     prog.order = b.Order();
     c := check.NewChecker(diags);
     c.SetBuiltin(builtinPackage(diags));
+    if (targetWasm()) c.SetPtrSize(4); // wasm32
     prog.checker = c;
     errs := c.Check(b.Order(), b.StandardSource());
     prog.ok = errs == 0;

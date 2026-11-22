@@ -33,6 +33,15 @@ func runtimeSources(p *Program, dir string) []string {
     core := dir + "/ocean_core.c";
     util.WriteFile(core, runtime.Core());
     files.append(core);
+    if (targetWasm()) {
+        // freestanding libc subset: header shims plus their implementation
+        util.WriteFile(dir + "/ocean_wasm.h", runtime.Wasm());
+        for (_, h := range []string{"stdlib.h", "stdio.h", "string.h", "setjmp.h", "unistd.h"}) util.WriteFile(dir + "/" + h, "#include \"ocean_wasm.h\"\n");
+        libc := dir + "/ocean_wasm.c";
+        util.WriteFile(libc, "#define OCEAN_WASM_IMPL\n#include \"ocean_wasm.h\"\n");
+        files.append(libc);
+        return files;
+    }
     if (p.checker.UsesThreads()) {
         th := dir + "/ocean_threads.c";
         util.WriteFile(th, runtime.Threads());
@@ -80,7 +89,7 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
         cacheStore(key, output);
         return true;
     }
-    if (root == "") return compileUncached(p, ir, output, staticLink);
+    if (root == "" || targetWasm()) return compileUncached(p, ir, output, staticLink);
     key := cacheKey(p, ir, false) + ".o";
     dir, ok := util.MakeTempDir("ocean-build-");
     if (!ok) { util.Stderr("ocean: cannot create temporary directory\n"); return false; }
@@ -146,10 +155,19 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
     if (!ok) { util.Stderr("ocean: cannot create temporary directory\n"); return false; }
     irPath := dir + "/program.ll";
     if (!util.WriteFile(irPath, ir)) { util.Stderr("ocean: could not create IR file\n"); util.RemoveAll(dir); return false; }
+    if (targetWasm() && (p.checker.UsesThreads() || p.usesFFI || usesPackage(p, "os/exec"))) {
+        util.Stderr(p.checker.UsesThreads() ? "backend error: threads and sync are unavailable on WebAssembly\n" : p.usesFFI ? "backend error: C variadic calls are unavailable on WebAssembly\n" : "backend error: native processes are unavailable on WebAssembly\n");
+        util.RemoveAll(dir); return false;
+    }
     rts := runtimeSources(p, dir);
-    staged := output + ".ocean-tmp" + (p.isLibrary ? "" : util.ExeSuffix());
+    staged := output + ".ocean-tmp" + (p.isLibrary || targetWasm() ? "" : util.ExeSuffix());
     if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
     args := []string{"clang", optLevel(), "-w", "-Wno-override-module"};
+    if (targetWasm()) {
+        args = []string{"clang", "-O1", "-w", "-Wno-override-module"};
+        args.append(wasmCompileFlags(dir)...);
+        if (!p.isLibrary) args.append("-nostdlib", "-Wl,--no-entry", "-Wl,--export=main", "-Wl,--allow-undefined", "-Wl,--gc-sections");
+    }
     if (p.isLibrary) {
         objs := make([]string);
         all := make([]string);
@@ -158,6 +176,7 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
         for (i, f := range all) {
             obj := dir + "/part" + util.Itoa(i) + ".o";
             cargs := []string{"clang", optLevel(), "-w", "-Wno-override-module", "-ffunction-sections", "-fdata-sections", "-DOC_LIBRARY", "-c"};
+            if (targetWasm()) cargs.append(wasmCompileFlags(dir)...);
             if (util.HasSuffix(f, ".ll")) cargs.append("-x", "ir");
             else cargs.append("-x", "c");
             cargs.append(f, "-o", obj);
@@ -171,7 +190,7 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
         args.append("-x", "ir", irPath, "-x", "c");
         args.append(rts...);
         args.append("-o", staged);
-        if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
+        if (!targetWasm() && !appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
         if (!clangRun(args)) { util.RemoveAll(dir); util.Remove(staged); return false; }
     }
     util.RemoveAll(dir);
@@ -184,6 +203,7 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
 // inline asm: the program IR is emitted untouched (no llvm-link round trip,
 // which re-prints wide constants in decimal), yet clang can build it alone.
 func selfContainedIR(p *Program, ir string) (string, bool) {
+    if (targetWasm()) return ir, true; // the wasm runtime is linked by ocean build
     dir, ok := util.MakeTempDir("ocean-ir-");
     if (!ok) return ir, true;
     out: util.Buf;
@@ -295,7 +315,13 @@ func labelChar(ch i8) bool { return util.IsLetter(ch) || util.IsDigit(ch) || ch 
 
 // COFF libraries are indexed archives. Darwin relocatable links must retain
 // private externals referenced by other cached objects.
+// wasmCompileFlags select wasm32 and the freestanding runtime headers in dir.
+func wasmCompileFlags(dir string) []string {
+    return []string{"--target=wasm32-unknown-unknown", "-I" + dir, "-D__thread=", "-ffunction-sections", "-fdata-sections"};
+}
+
 func objectLinkArgs(output string) []string {
+    if (targetWasm()) return []string{"clang", "--target=wasm32-unknown-unknown", "-r", "-nostdlib", "-o", output};
     if (util.Windows()) return []string{"llvm-ar", "rcs", output};
     args := []string{"clang", "-r", "-nostdlib", "-o", output};
     if (util.MacOS()) args.append("-Wl,-keep_private_externs");

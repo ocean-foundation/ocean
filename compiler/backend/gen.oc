@@ -588,7 +588,7 @@ func lineText(text string, line int) string {
 func setSite(g *Gen, n *ast.Node) {
     id := site(g, n);
     if (g.fn.forward > 0) id = id + 1099511627776;
-    emit(g, "store i64 " + itoa(id) + ", ptr " + gep(g, g.fn.frame, 16));
+    emit(g, "store i64 " + itoa(id) + ", ptr " + gep(g, g.fn.frame, frameOff(g, "site")));
 }
 
 func declare(g *Gen, name string, text string) {

@@ -170,18 +170,34 @@ func frameName(inst *Inst) string {
     return "?";
 }
 
+// frameOff gives the offset of an OcFrame field (core.c) for the target's
+// pointer size: {prev, name, i64 site, defers, jb, locals}.
+func frameOff(g *Gen, field string) int {
+    p := g.c.PtrSize();
+    site := p == 8 ? 16 : 8;
+    switch (field) {
+    case "name": return p;
+    case "site": return site;
+    case "defers": return site + 8;
+    case "jb": return site + 8 + p;
+    case "locals": return site + 8 + 2 * p;
+    case "size": return (site + 8 + 3 * p + 7) / 8 * 8;
+    }
+    return 0;
+}
+
 func prologue(g *Gen, displayName string) {
     f := g.fn;
-    f.frame = allocaBytes(g, 48, 8);
+    f.frame = allocaBytes(g, frameOff(g, "size"), 8);
     prev := tmp(g);
     emit(g, prev + " = load ptr, ptr @oc_top");
     emit(g, "store ptr " + prev + ", ptr " + f.frame);
-    emit(g, "store ptr " + cstr(g, displayName) + ", ptr " + gep(g, f.frame, 8));
-    emit(g, "store i64 0, ptr " + gep(g, f.frame, 16));
-    emit(g, "store ptr null, ptr " + gep(g, f.frame, 24));
-    emit(g, "store ptr null, ptr " + gep(g, f.frame, 32));
+    emit(g, "store ptr " + cstr(g, displayName) + ", ptr " + gep(g, f.frame, frameOff(g, "name")));
+    emit(g, "store i64 0, ptr " + gep(g, f.frame, frameOff(g, "site")));
+    emit(g, "store ptr null, ptr " + gep(g, f.frame, frameOff(g, "defers")));
+    emit(g, "store ptr null, ptr " + gep(g, f.frame, frameOff(g, "jb")));
     // owned locals, released by the runtime when a panic unwinds this frame
-    emit(g, "store ptr %loctab, ptr " + gep(g, f.frame, 40));
+    emit(g, "store ptr %loctab, ptr " + gep(g, f.frame, frameOff(g, "locals")));
     emit(g, "store ptr " + f.frame + ", ptr @oc_top");
     if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
 }
@@ -190,7 +206,7 @@ func prologue(g *Gen, displayName string) {
 func setupDefer(g *Gen, recovered string) {
     f := g.fn;
     jb := allocaBytes(g, 512, 16);
-    emit(g, "store ptr " + jb + ", ptr " + gep(g, f.frame, 32));
+    emit(g, "store ptr " + jb + ", ptr " + gep(g, f.frame, frameOff(g, "jb")));
     r := tmp(g);
     emit(g, r + " = call i32 @" + recoverySymbol() + "(ptr " + jb + (util.Windows() ? ", ptr null" : "") + ") returns_twice");
     c := tmp(g);
@@ -270,7 +286,7 @@ func emitInst(g *Gen, inst *Inst) {
     if (inst.kind == 1) {
         for (i, s := range n.syms) {
             cell := tmp(g);
-            slot := gep(g, "%env", i * 8);
+            slot := gep(g, "%env", i * g.c.PtrSize());
             emit(g, cell + " = load ptr, ptr " + slot);
             f.locals[s.id] = cell;
         }
@@ -330,7 +346,7 @@ func emitLocalTable(g *Gen) {
         e := "%loctab." + itoa(i);
         f.allocas.Add("  ").Add(e).Add(" = getelementptr inbounds {ptr, ptr}, ptr %loctab, i64 ").AddInt(i).Add("\n");
         f.allocas.Add("  store ptr ").Add(l.slot).Add(", ptr ").Add(e).Add("\n");
-        f.allocas.Add("  ").Add(e).Add(".t = getelementptr inbounds i8, ptr ").Add(e).Add(", i64 8\n");
+        f.allocas.Add("  ").Add(e).Add(".t = getelementptr inbounds i8, ptr ").Add(e).Add(", i64 ").AddInt(g.c.PtrSize()).Add("\n");
         f.allocas.Add("  store ptr ").Add(desc(g, l.t)).Add(", ptr ").Add(e).Add(".t\n");
     }
     f.allocas.Add("  %loctab.end = getelementptr inbounds {ptr, ptr}, ptr %loctab, i64 ").AddInt(n).Add("\n");

@@ -698,7 +698,7 @@ func newRuntimeArray(g *Gen, t *ast.Type) string {
         condBr(g, c, body, done);
         label(g, body);
         inner := newRuntimeArray(g, u.elem);
-        emit(g, "store ptr " + inner + ", ptr " + gepDyn(g, out, i, 8));
+        emit(g, "store ptr " + inner + ", ptr " + gepDyn(g, out, i, g.c.PtrSize()));
         i2 := tmp(g); emit(g, i2 + " = add i64 " + i + ", 1");
         emit(g, "store i64 " + i2 + ", ptr " + idx);
         br(g, head);

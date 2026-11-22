@@ -521,8 +521,8 @@ func genDefer(g *Gen, n *ast.Node) {
         } else store(g, v.t, slot, v);
     }
     thunk := deferThunk(g, n, c, kind, callee, ft, items, recvIdx);
-    emit(g, "store ptr " + thunk + ", ptr " + gep(g, rec, 8));
-    fd := gep(g, g.fn.frame, 24);
+    emit(g, "store ptr " + thunk + ", ptr " + gep(g, rec, g.c.PtrSize()));
+    fd := gep(g, g.fn.frame, frameOff(g, "defers"));
     old := tmp(g); emit(g, old + " = load ptr, ptr " + fd);
     emit(g, "store ptr " + old + ", ptr " + rec);
     emit(g, "store ptr " + rec + ", ptr " + fd);

@@ -55,6 +55,7 @@ func packageMain(args []string) int {
 }
 
 func buildPackage(o *BuildOptions) int {
+    if (!validateTarget()) return 1;
     diags := newDiags();
     prog := Frontend(o.location, false, "", diags);
     if (prog.fatal) return 1;
@@ -81,3 +82,14 @@ func buildPackage(o *BuildOptions) int {
 
 func ast_nil(p *Program) bool { return (p -> int) == 0; }
 func targetWasm() bool { os, _ := util.Getenv("OCOS"); arch, _ := util.Getenv("OCARCH"); return os == "js" && arch == "wasm"; }
+
+// validateTarget checks the OCOS/OCARCH overrides (only js/wasm, together).
+func validateTarget() bool {
+    os, _ := util.Getenv("OCOS"); arch, _ := util.Getenv("OCARCH");
+    if (os == "js" || arch == "wasm") {
+        if (os != "js" || arch != "wasm") { util.Stderr("backend error: WebAssembly requires OCOS=js and OCARCH=wasm together\n"); return false; }
+    } else if (os != "" || arch != "") {
+        util.Stderr("backend error: target overrides currently support only OCOS=js OCARCH=wasm\n"); return false;
+    }
+    return true;
+}

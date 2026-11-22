@@ -24,6 +24,7 @@ struct FuncCtx {
 }
 
 struct Checker {
+    ptrSize int;
     assignTarget bool;
     litCache map[int]*BigNat;
     diags *diag.List;
