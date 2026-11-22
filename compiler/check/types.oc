@@ -1,0 +1,302 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+// Builtin type singletons.
+tInvalid: *ast.Type;
+tVoid: *ast.Type;
+tBool: *ast.Type;
+tInt: *ast.Type;
+tI8: *ast.Type;
+tI16: *ast.Type;
+tI32: *ast.Type;
+tUint: *ast.Type;
+tU8: *ast.Type;
+tU16: *ast.Type;
+tU32: *ast.Type;
+tFloat: *ast.Type;
+tF32: *ast.Type;
+tString: *ast.Type;
+tAny: *ast.Type;
+tNull: *ast.Type;
+tUntypedInt: *ast.Type;
+tUntypedFloat: *ast.Type;
+tVoidPtr: *ast.Type;
+tBufferFamily: *ast.Type;
+nextTypeId: int;
+typesReady: bool;
+
+func intType(bits int, signed bool) *ast.Type {
+    t := ast.NewType(ast.TK.Int);
+    t.bits = bits; t.signed = signed;
+    return t;
+}
+
+func InitTypes() {
+    if (typesReady) return;
+    typesReady = true;
+    tInvalid = ast.NewType(ast.TK.Invalid);
+    tVoid = ast.NewType(ast.TK.Void);
+    tBool = ast.NewType(ast.TK.Bool);
+    tInt = intType(64, true); tI8 = intType(8, true); tI16 = intType(16, true); tI32 = intType(32, true);
+    tUint = intType(64, false); tU8 = intType(8, false); tU16 = intType(16, false); tU32 = intType(32, false);
+    tFloat = ast.NewType(ast.TK.Float); tFloat.bits = 64;
+    tF32 = ast.NewType(ast.TK.Float); tF32.bits = 32;
+    tString = ast.NewType(ast.TK.String);
+    tAny = ast.NewType(ast.TK.Interface);
+    tNull = ast.NewType(ast.TK.Null);
+    tUntypedInt = ast.NewType(ast.TK.UntypedInt);
+    tUntypedFloat = ast.NewType(ast.TK.UntypedFloat);
+    tVoidPtr = ast.NewType(ast.TK.Ptr); tVoidPtr.elem = tVoid;
+    tBufferFamily = ast.NewType(ast.TK.Buffer); tBufferFamily.len = -2;
+}
+
+func TInt() *ast.Type { InitTypes(); return tInt; }
+func TString() *ast.Type { InitTypes(); return tString; }
+func TBool() *ast.Type { InitTypes(); return tBool; }
+func TAny() *ast.Type { InitTypes(); return tAny; }
+func TFloat() *ast.Type { InitTypes(); return tFloat; }
+func TI8() *ast.Type { InitTypes(); return tI8; }
+func TI32() *ast.Type { InitTypes(); return tI32; }
+func TVoid() *ast.Type { InitTypes(); return tVoid; }
+func TVoidPtr() *ast.Type { InitTypes(); return tVoidPtr; }
+func TUint() *ast.Type { InitTypes(); return tUint; }
+
+func nilT(t *ast.Type) bool { return (t -> int) == 0; }
+func nilS(s *ast.Symbol) bool { return (s -> int) == 0; }
+func nilN(n *ast.Node) bool { return (n -> int) == 0; }
+
+func varintType(bits int, signed bool) *ast.Type {
+    t := intType(bits, signed);
+    t.varw = true;
+    return t;
+}
+func PtrTo(e *ast.Type) *ast.Type { t := ast.NewType(ast.TK.Ptr); t.elem = e; return t; }
+func DynOf(e *ast.Type) *ast.Type { t := ast.NewType(ast.TK.Dyn); t.elem = e; return t; }
+func MixedOf(e *ast.Type) *ast.Type { t := ast.NewType(ast.TK.Dyn); t.elem = e; t.isMixed = true; return t; }
+func ArrayOf(e *ast.Type, n int) *ast.Type { t := ast.NewType(ast.TK.Array); t.elem = e; t.len = n; return t; }
+func BufferOf(e *ast.Type, n int) *ast.Type { t := ast.NewType(ast.TK.Buffer); t.elem = e; t.len = n; return t; }
+func MapOf(k *ast.Type, v *ast.Type) *ast.Type { t := ast.NewType(ast.TK.Map); t.key = k; t.elem = v; return t; }
+func FuncOf(params []*ast.Type, results []*ast.Type, variadic bool) *ast.Type {
+    t := ast.NewType(ast.TK.Func); t.params = params; t.results = results; t.variadic = variadic; return t;
+}
+func TupleOf(results []*ast.Type) *ast.Type { t := ast.NewType(ast.TK.Tuple); t.results = results; return t; }
+func ParamType(s *ast.Symbol) *ast.Type { t := ast.NewType(ast.TK.Param); t.sym = s; return t; }
+
+func IsInt(t *ast.Type) bool { return t.kind == ast.TK.Int; }
+func IsFloat(t *ast.Type) bool { return t.kind == ast.TK.Float; }
+
+// Underlying resolves defined types to their representation.
+func Underlying(t *ast.Type) *ast.Type {
+    for (i := 0; i < 100 && t.kind == ast.TK.Named; i++) {
+        u := t.sym.ty;
+        if (nilT(u)) return tInvalid;
+        t = u;
+    }
+    return t;
+}
+
+func IsInteger(t *ast.Type) bool { return Underlying(t).kind == ast.TK.Int; }
+func IsFloating(t *ast.Type) bool { return Underlying(t).kind == ast.TK.Float; }
+func IsNumeric(t *ast.Type) bool { k := Underlying(t).kind; return k == ast.TK.Int || k == ast.TK.Float; }
+func IsInterface(t *ast.Type) bool { return t.kind == ast.TK.Interface; }
+func IsAny(t *ast.Type) bool { return t.kind == ast.TK.Interface && nilS(t.sym) && len(t.methods) == 0; }
+func IsVoidPtr(t *ast.Type) bool { return t.kind == ast.TK.Ptr && t.elem.kind == ast.TK.Void; }
+func IsOptional(t *ast.Type) bool { return t.kind == ast.TK.Enum && t.sym.builtin && t.sym.name == "Optional"; }
+func IsResult(t *ast.Type) bool { return t.kind == ast.TK.Enum && t.sym.builtin && t.sym.name == "Result"; }
+
+// Identical reports type identity (aliases are already resolved).
+func Identical(a *ast.Type, b *ast.Type) bool {
+    if (a == b) return true;
+    if (nilT(a) || nilT(b)) return false;
+    if (a.kind != b.kind) return false;
+    switch (a.kind) {
+    case ast.TK.Invalid, ast.TK.Void, ast.TK.Bool, ast.TK.String, ast.TK.Null, ast.TK.UntypedInt, ast.TK.UntypedFloat: return true;
+    case ast.TK.Int: return a.bits == b.bits && a.signed == b.signed && a.varw == b.varw;
+    case ast.TK.Float: return a.bits == b.bits;
+    case ast.TK.Ptr: return Identical(a.elem, b.elem);
+    case ast.TK.Array: return a.len == b.len && Identical(a.elem, b.elem);
+    case ast.TK.Dyn: return a.isMixed == b.isMixed && Identical(a.elem, b.elem);
+    case ast.TK.Buffer:
+        if (nilT(a.elem) || nilT(b.elem)) return nilT(a.elem) && nilT(b.elem);
+        return a.len == b.len && Identical(a.elem, b.elem);
+    case ast.TK.Map: return Identical(a.key, b.key) && Identical(a.elem, b.elem);
+    case ast.TK.Func, ast.TK.Tuple:
+        if (len(a.params) != len(b.params) || len(a.results) != len(b.results) || a.variadic != b.variadic) return false;
+        for (i := 0; i < len(a.params); i++) { if (!Identical(a.params[i], b.params[i])) return false; }
+        for (i := 0; i < len(a.results); i++) { if (!Identical(a.results[i], b.results[i])) return false; }
+        return true;
+    case ast.TK.Struct, ast.TK.Enum, ast.TK.Family:
+        if (a.sym != b.sym || len(a.args) != len(b.args)) return false;
+        for (i := 0; i < len(a.args); i++) { if (!Identical(a.args[i], b.args[i])) return false; }
+        return true;
+    case ast.TK.Interface:
+        if (a.sym != b.sym) {
+            // interface{} literals are identical to any; other literals compare method sets.
+            if (nilS(a.sym) && nilS(b.sym)) return sameMethods(a, b);
+            return false;
+        }
+        if (nilS(a.sym)) return sameMethods(a, b);
+        if (len(a.args) != len(b.args)) return false;
+        for (i := 0; i < len(a.args); i++) { if (!Identical(a.args[i], b.args[i])) return false; }
+        return true;
+    case ast.TK.Named, ast.TK.Param: return a.sym == b.sym;
+    case ast.TK.Union:
+        if (len(a.terms) != len(b.terms)) return false;
+        for (i := 0; i < len(a.terms); i++) { if (a.tilde[i] != b.tilde[i] || !Identical(a.terms[i], b.terms[i])) return false; }
+        return true;
+    }
+    return false;
+}
+
+func sameMethods(a *ast.Type, b *ast.Type) bool {
+    if (len(a.methods) != len(b.methods)) return false;
+    for (i := 0; i < len(a.methods); i++) {
+        if (a.methods[i].name != b.methods[i].name || !Identical(a.methods[i].ty, b.methods[i].ty)) return false;
+    }
+    return len(a.terms) == len(b.terms);
+}
+
+func intName(t *ast.Type) string {
+    if (t.varw) return (t.signed ? "varint(" : "varuint(") + util.Itoa(t.bits) + ")";
+    if (t.signed) {
+        if (t.bits == 64) return "int";
+        return "i" + util.Itoa(t.bits);
+    }
+    if (t.bits == 64) return "uint";
+    return "u" + util.Itoa(t.bits);
+}
+
+func argsString(args []*ast.Type) string {
+    if (len(args) == 0) return "";
+    s := "<";
+    for (i, a := range args) { if (i > 0) s += ", "; s += TypeString(a); }
+    return s + ">";
+}
+
+func funcString(t *ast.Type) string {
+    s := "func(";
+    for (i, p := range t.params) {
+        if (i > 0) s += ", ";
+        if (t.variadic && i == len(t.params) - 1) s += "..." + TypeString(p.elem);
+        else s += TypeString(p);
+    }
+    s += ")";
+    if (len(t.results) == 1) s += " " + TypeString(t.results[0]);
+    else if (len(t.results) > 1) {
+        s += " (";
+        for (i, r := range t.results) { if (i > 0) s += ", "; s += TypeString(r); }
+        s += ")";
+    }
+    return s;
+}
+
+// TypeString renders a type with Ocean prefix spelling.
+func TypeString(t *ast.Type) string {
+    if (nilT(t)) return "<nil>";
+    switch (t.kind) {
+    case ast.TK.Invalid: return "invalid";
+    case ast.TK.Void: return "void";
+    case ast.TK.Bool: return "bool";
+    case ast.TK.Int: return intName(t);
+    case ast.TK.Float: return t.bits == 32 ? "f32" : "float";
+    case ast.TK.String: return "string";
+    case ast.TK.Ptr: return "*" + TypeString(t.elem);
+    case ast.TK.Array:
+        if (t.len == -2) return "array<" + TypeString(t.elem) + ">";
+        if (t.len == -1) return "[n]" + TypeString(t.elem);
+        return "[" + util.Itoa(t.len) + "]" + TypeString(t.elem);
+    case ast.TK.Dyn: return (t.isMixed ? "mixed []" : "[]") + TypeString(t.elem);
+    case ast.TK.Buffer:
+        if (nilT(t.elem)) return "buffer";
+        if (t.len > 0) return "buffer<" + TypeString(t.elem) + ", " + util.Itoa(t.len) + ">";
+        if (t.len == -1) return "buffer<" + TypeString(t.elem) + ", n>";
+        return "buffer<" + TypeString(t.elem) + ">";
+    case ast.TK.Map: return "map[" + TypeString(t.key) + "]" + TypeString(t.elem);
+    case ast.TK.Func: return funcString(t);
+    case ast.TK.Tuple:
+        s := "(";
+        for (i, r := range t.results) { if (i > 0) s += ", "; s += TypeString(r); }
+        return s + ")";
+    case ast.TK.Struct, ast.TK.Enum, ast.TK.Named, ast.TK.Family: return t.sym.name + argsString(t.args);
+    case ast.TK.Interface:
+        if (nilS(t.sym)) {
+            if (len(t.methods) == 0 && len(t.terms) == 0) return "any";
+            return "interface{...}";
+        }
+        return t.sym.name + argsString(t.args);
+    case ast.TK.Param: return t.sym.name;
+    case ast.TK.Union:
+        s := "";
+        for (i, term := range t.terms) {
+            if (i > 0) s += " | ";
+            if (t.tilde[i]) s += "~";
+            s += TypeString(term);
+        }
+        return s;
+    case ast.TK.Null: return "null";
+    case ast.TK.UntypedInt: return "int";
+    case ast.TK.UntypedFloat: return "float";
+    }
+    return "?";
+}
+
+// TypeKey is a canonical identity key (distinct from the display text).
+func TypeKey(t *ast.Type) string {
+    if (nilT(t)) return "nil";
+    if (t.key2 != "") return t.key2;
+    k := "";
+    switch (t.kind) {
+    case ast.TK.Int: k = (t.varw ? "w" : "") + (t.signed ? "i" : "u") + util.Itoa(t.bits);
+    case ast.TK.Float: k = "f" + util.Itoa(t.bits);
+    case ast.TK.Bool: k = "b";
+    case ast.TK.String: k = "s";
+    case ast.TK.Void: k = "v";
+    case ast.TK.Null: k = "null";
+    case ast.TK.Ptr: k = "P" + TypeKey(t.elem);
+    case ast.TK.Array: k = "A" + util.Itoa(t.len) + "_" + TypeKey(t.elem);
+    case ast.TK.Dyn: k = (t.isMixed ? "X" : "D") + TypeKey(t.elem);
+    case ast.TK.Buffer: k = nilT(t.elem) ? "Bfam" : "B" + util.Itoa(t.len) + "_" + TypeKey(t.elem);
+    case ast.TK.Map: k = "M" + TypeKey(t.key) + "_" + TypeKey(t.elem);
+    case ast.TK.Func, ast.TK.Tuple:
+        k = t.kind == ast.TK.Func ? "F(" : "T(";
+        for (_, p := range t.params) k += TypeKey(p) + ",";
+        k += t.variadic ? "...)" : ")";
+        for (_, r := range t.results) k += TypeKey(r) + ",";
+        k += ";";
+    case ast.TK.Struct, ast.TK.Enum, ast.TK.Named, ast.TK.Param, ast.TK.Family:
+        k = "N" + util.Itoa(t.sym.id) + t.sym.name;
+        if (len(t.args) > 0) { k += "<"; for (_, a := range t.args) k += TypeKey(a) + ","; k += ">"; }
+    case ast.TK.Interface:
+        if (nilS(t.sym)) {
+            if (len(t.methods) == 0 && len(t.terms) == 0) k = "any";
+            else {
+                k = "I{";
+                for (_, m := range t.methods) k += m.name + ":" + TypeKey(m.ty) + ";";
+                for (_, term := range t.terms) k += TypeKey(term) + "|";
+                k += "}";
+            }
+        } else {
+            k = "N" + util.Itoa(t.sym.id) + t.sym.name;
+            if (len(t.args) > 0) { k += "<"; for (_, a := range t.args) k += TypeKey(a) + ","; k += ">"; }
+        }
+    case ast.TK.Union:
+        k = "U(";
+        for (i, term := range t.terms) k += (t.tilde[i] ? "~" : "") + TypeKey(term) + "|";
+        k += ")";
+    default: k = "?";
+    }
+    t.key2 = k;
+    return k;
+}
+
+func align(n int, a int) int { if (a <= 1) return n; return (n + a - 1) / a * a; }
+
+func intAlign(bits int) int {
+    if (bits <= 8) return 1;
+    if (bits <= 16) return 2;
+    if (bits <= 32) return 4;
+    if (bits <= 64) return 8;
+    return 16;
+}
+func intSize(bits int) int { return align((bits + 7) / 8, intAlign(bits)); }

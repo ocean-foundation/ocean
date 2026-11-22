@@ -1,0 +1,214 @@
+package backend;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+func runtimeDecls() string {
+    return "declare ptr @oc_alloc(i64)\n" +
+        "declare void @oc_free(ptr)\n" +
+        "declare void @oc_zero(ptr, ptr)\n" +
+        "declare void @oc_set_tag(ptr, i64, ptr)\n" +
+        "declare void @oc_copy(ptr, ptr, ptr)\n" +
+        "declare i64 @oc_equal(ptr, ptr, ptr)\n" +
+        "declare i64 @oc_elems_equal(ptr, i64, ptr, i64, ptr)\n" +
+        "declare i64 @oc_any_equal(ptr, ptr, ptr, ptr)\n" +
+        "declare ptr @oc_box(ptr, ptr)\n" +
+        "declare ptr @oc_box_elements(ptr, ptr)\n" +
+        "declare ptr @oc_box_elements_block(ptr, ptr)\n" +
+        "declare ptr @oc_str_concat(ptr, ptr)\n" +
+        "declare ptr @oc_str_add_byte(ptr, i8, i64)\n" +
+        "declare i64 @oc_str_cmp(ptr, ptr)\n" +
+        "declare i64 @oc_str_eq(ptr, ptr)\n" +
+        "declare ptr @oc_str_cdata(ptr)\n" +
+        "declare ptr @oc_arr_data(ptr)\n" +
+        "declare i64 @oc_arr_len(ptr)\n" +
+        "declare i64 @oc_arr_cap(ptr)\n" +
+        "declare ptr @oc_arr_new(i64, i64, i64)\n" +
+        "declare ptr @oc_arr_new_init(i64, ptr, i64)\n" +
+        "declare ptr @oc_arr_copy(ptr, ptr)\n" +
+        "declare ptr @oc_arr_insert(ptr, i64, i64, i64, i64)\n" +
+        "declare void @oc_arr_insert_from(ptr, i64, ptr, i64, ptr, i64)\n" +
+        "declare ptr @oc_arr_push(ptr, i64)\n" +
+        "declare void @oc_arr_remove(ptr, i64, i64, ptr, i64)\n" +
+        "declare void @oc_arr_pop(ptr, i64, ptr, i64)\n" +
+        "declare void @oc_arr_free(ptr)\n" +
+        "declare ptr @oc_arr_to_block(ptr, ptr)\n" +
+        "declare ptr @oc_block_copy(ptr, ptr)\n" +
+        "declare ptr @oc_block_new(i64, ptr)\n" +
+        "declare ptr @oc_slice(ptr, i64, i64, i64, ptr, i64, i64)\n" +
+        "declare ptr @oc_concat(ptr, i64, ptr, i64, ptr)\n" +
+        "declare ptr @oc_map_get(ptr, ptr, ptr)\n" +
+        "declare void @oc_map_set(ptr, ptr, ptr, ptr, ptr)\n" +
+        "declare ptr @oc_map_slot(ptr, ptr, ptr, ptr)\n" +
+        "declare void @oc_map_delete(ptr, ptr, ptr)\n" +
+        "declare i64 @oc_map_len(ptr)\n" +
+        "declare ptr @oc_map_copy(ptr)\n" +
+        "declare void @oc_map_snapshot(ptr, ptr, ptr, ptr, ptr)\n" +
+        "declare ptr @oc_reflect_fields(ptr, ptr)\n" +
+        "declare i64 @oc_reflect_is_struct(ptr)\n" +
+        "declare i64 @oc_reflect_is_enum(ptr)\n" +
+        "declare ptr @oc_reflect_enum_variant(ptr, ptr)\n" +
+        "declare ptr @oc_method(ptr, ptr, i64)\n" +
+        "declare void @oc_panic(ptr, i64) noreturn\n" +
+        "declare void @oc_return_panic(ptr, i64) noreturn\n" +
+        "declare void @oc_bounds(i64, i64, i64) noreturn\n" +
+        "declare void @oc_data_literal_bounds(i64, i64, i64) noreturn\n" +
+        "declare void @oc_uninit_func(i64) noreturn\n" +
+        "declare void @oc_map_missing(i64) noreturn\n" +
+        "declare void @oc_recover(ptr)\n" +
+        "declare void @oc_run_defers(ptr)\n" +
+        "declare i32 @_setjmp(ptr) returns_twice\n" +
+        "declare void @llvm.trap() noreturn\n" +
+        "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n" +
+        "declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n" +
+        "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n" +
+        "@oc_top = external thread_local global ptr\n";
+}
+
+func threadDecls() string {
+    return "declare void @ocean_threads_checkpoint()\n" +
+        "declare i64 @ocean_threads_spawn(ptr, ptr)\n" +
+        "declare void @ocean_runtime_thread_return()\n";
+}
+
+func globalDef(g *Gen, s *ast.Symbol) {
+    t := sub(g, s.ty);
+    name := globalRef(g, s);
+    if (isAgg(t)) {
+        g.globals.Add(name).Add(" = internal global [").AddInt(sizeOf(g, t)).Add(" x i8] zeroinitializer, align ").AddInt(alignOf(g, t)).Add("\n");
+    } else {
+        g.globals.Add(name).Add(" = internal global ").Add(ll(t)).Add(" ").Add(zeroLit(t)).Add(", align 8\n");
+    }
+}
+
+// initFunction initializes globals: all to zero first, then initializers in order.
+func initFunction(g *Gen, packages []*ast.Package) {
+    inst := new(Inst);
+    inst.kind = 3;
+    inst.env = g.env;
+    f := newFn(g, inst, "@oc_init_globals");
+    f.cur = "entry";
+    g.fn = f;
+    prologue(g, "<globals>");
+    for (_, p := range packages) {
+        for (_, s := range p.syms) {
+            if (s.kind != ast.SK.Var) continue;
+            t := sub(g, s.ty);
+            if (needsInit(g, t)) zeroInto(g, t, globalRef(g, s));
+        }
+    }
+    for (_, p := range packages) {
+        for (_, src := range p.files) {
+            if (nilN(src.file)) continue;
+            for (_, d := range src.file.list) {
+                if (d.kind != ast.NK.VarDecl || len(d.list2) == 0) continue;
+                genGlobalInit(g, d);
+            }
+        }
+    }
+    prev := tmp(g);
+    emit(g, prev + " = load ptr, ptr " + f.frame);
+    emit(g, "store ptr " + prev + ", ptr @oc_top");
+    term(g, "ret void");
+    g.mod.Add("define void @oc_init_globals() {\nentry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
+}
+
+func genGlobalInit(g *Gen, d *ast.Node) {
+    names := d.list; values := d.list2;
+    if (len(values) == 1 && len(names) > 1) {
+        tv := genExpr(g, values[0]);
+        rts := under(tv.t).results;
+        for (i, id := range names) {
+            if (nilS(id.sym)) continue;
+            vt := sub(g, id.sym.ty);
+            store(g, vt, globalRef(g, id.sym), copyV(g, conv(g, load(g, rts[i], gep(g, tv.r, tupleOffset(g, rts, i))), vt)));
+        }
+        return;
+    }
+    for (i, id := range names) {
+        if (nilS(id.sym) || i >= len(values)) continue;
+        vt := sub(g, id.sym.ty);
+        v := genAs(g, values[i], vt);
+        store(g, vt, globalRef(g, id.sym), conv(g, v, vt));
+    }
+}
+
+// mainWrapper defines oc_user_main, calling the program's main.
+func mainWrapper(g *Gen, main *ast.Symbol) {
+    name := funcRef(g, main, make([]*ast.Type));
+    ft := main.ty;
+    if (len(ft.results) == 1) {
+        g.mod.Add("define i64 @oc_user_main() {\nentry:\n  %r = call i64 ").Add(name).Add("(ptr null)\n  ret i64 %r\n}\n\n");
+    } else {
+        g.mod.Add("define i64 @oc_user_main() {\nentry:\n  call void ").Add(name).Add("(ptr null)\n  ret i64 0\n}\n\n");
+    }
+}
+
+func setArgsWrapper(g *Gen, s *ast.Symbol) {
+    if (nilS(s)) { g.mod.Add("define void @oc_set_args(ptr %s, i64 %n) {\nentry:\n  ret void\n}\n\n"); return; }
+    name := funcRef(g, s, make([]*ast.Type));
+    g.mod.Add("define void @oc_set_args(ptr %s, i64 %n) {\nentry:\n  call void ").Add(name).Add("(ptr null, ptr %s, i64 %n)\n  ret void\n}\n\n");
+}
+
+func drain(g *Gen) {
+    for (;;) {
+        progress := false;
+        for (g.qpos < len(g.queue)) {
+            inst := g.queue[g.qpos];
+            g.qpos++;
+            emitInst(g, inst);
+            progress = true;
+        }
+        if (g.descDone < len(g.descTypes)) { emitPendingDescs(g); progress = true; }
+        if (!progress) break;
+    }
+}
+
+struct Options { library bool; usesThreads bool; wasm bool; }
+
+// Generate produces a complete LLVM module for the checked program.
+func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts Options) (string, bool) {
+    g := NewGen(c);
+    g.library = opts.library;
+    g.usesThreads = opts.usesThreads;
+    g.wasm = opts.wasm;
+    // the string descriptor is referenced by the runtime
+    desc(g, check.TString());
+    for (_, p := range packages) {
+        for (_, s := range p.syms) {
+            if (s.kind == ast.SK.Var) globalDef(g, s);
+        }
+    }
+    if (!opts.library) {
+        m := root.scope.LookupLocal("main");
+        if (!nilS(m) && m.kind == ast.SK.Func) mainWrapper(g, m);
+        setArgsWrapper(g, c.OsSetArgs());
+        g.mod.Add("declare i32 @oc_start()\ndefine i32 @main() {\nentry:\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
+    } else {
+        for (_, p := range packages) {
+            if (p != root) continue;
+            for (_, s := range p.syms) {
+                if (s.kind == ast.SK.Func && len(s.typeParams) == 0) funcRef(g, s, make([]*ast.Type));
+                if (s.kind == ast.SK.Struct || s.kind == ast.SK.Enum || s.kind == ast.SK.TypeDef) {
+                    for (_, m := range s.methodList) {
+                        if (len(m.typeParams) == 0 && len(s.typeParams) == 0) methodRef(g, m, s.self, make([]*ast.Type));
+                    }
+                }
+            }
+        }
+    }
+    initFunction(g, packages);
+    drain(g);
+    emitMatchers(g);
+    drain(g);
+    out := util.NewBuf();
+    out.Add("; Ocean program module\n");
+    out.Add(runtimeDecls());
+    if (g.usesThreads) out.Add(threadDecls());
+    for (_, name := range g.declOrder) out.Add(g.decls[name]).Add("\n");
+    out.Add("@oc_sites = constant [").AddInt(g.nsites).Add(" x {ptr, i64, i64, ptr}] [{ptr, i64, i64, ptr} zeroinitializer").AddBuf(g.sites).Add("]\n");
+    out.Add("@oc_nsites = constant i64 ").AddInt(g.nsites).Add("\n");
+    out.AddBuf(g.globals);
+    out.AddBuf(g.mod);
+    return out.String(), g.errors == 0;
+}

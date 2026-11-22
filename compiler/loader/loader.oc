@@ -1,0 +1,597 @@
+package loader;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/parser";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+extern int readlink(buffer<i8> path, buffer<i8> out, int size);
+
+// Overlay supplies unsaved editor text for a path.
+struct Overlay { path string; text string; }
+
+struct Build {
+    diags *diag.List;
+    packages []*ast.Package;      // in load order (by id)
+    order []*ast.Package;         // dependency (initialization) order
+    modules map[string]*ast.Module;
+    noModule map[string]bool;
+    byDir map[string]*ast.Package;
+    root *ast.Package;
+    errors int;
+    recover bool;
+    overlays []*Overlay;
+    testDirectory string;
+    harnessDirectory string;
+    loadingExternal bool;
+    nfiles int;
+    sourceCount int;
+    stdRoot string;
+    stdRootSet bool;
+    isLibrary bool;
+    packageName string;
+    fatal bool;
+}
+
+func NewBuild(diags *diag.List) *Build { b := new(Build); b.diags = diags; return b; }
+
+// RelativeSourcePath displays absolute paths relative to the working directory.
+func RelativeSourcePath(path string) string {
+    if (path == "") return "<source>";
+    if (path[0] != '/') {
+        for (len(path) >= 2 && path[0] == '.' && path[1] == '/') path = path[2:];
+        return path;
+    }
+    cwd := util.Getcwd();
+    common := 0; i := 0;
+    for (i < len(cwd) && i < len(path) && cwd[i] == path[i]) {
+        if (path[i] == '/') common = i + 1;
+        i++;
+    }
+    if (i == len(cwd) && (i == len(path) || path[i] == '/')) common = i + ((i < len(path) && path[i] == '/') ? 1 : 0);
+    parents := 0;
+    if (common < len(cwd)) {
+        for (j := common; j < len(cwd); j++) { if (j == common || cwd[j - 1] == '/') parents++; }
+    }
+    b: util.Buf;
+    for (j := 0; j < parents; j++) b.Add("../");
+    suffix := path[common:];
+    b.Add(suffix);
+    s := b.String();
+    if (suffix == "") {
+        if (len(s) > 0) return s[0:len(s) - 1];
+        return ".";
+    }
+    return s;
+}
+
+func error(b *Build, file string, msg string) {
+    display := RelativeSourcePath(file == "" ? "ocean" : file);
+    b.errors++;
+    b.diags.Error(display, 1, 1, "package", msg);
+}
+
+func ValidModulePath(path string) bool {
+    if (path == "" || path[0] == '/' || util.IndexByte(path, '\\') >= 0) return false;
+    parts := util.Split(path, '/');
+    for (_, p := range parts) {
+        if (p == "" || p == "." || p == "..") return false;
+        for (i := 0; i < len(p); i++) {
+            c := p[i];
+            if (!(util.IsLetter(c) || util.IsDigit(c) || c == '.' || c == '_' || c == '-' || c == '~')) return false;
+        }
+    }
+    return true;
+}
+
+func pathPrefix(path string, base string) bool {
+    return util.HasPrefix(path, base) && (len(path) == len(base) || path[len(base)] == '/');
+}
+
+func words(line string) []string {
+    out := make([]string);
+    i := 0;
+    for (i < len(line)) {
+        for (i < len(line) && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r' || line[i] == ';')) i++;
+        if (i >= len(line)) break;
+        if (line[i] == '#' || (line[i] == '/' && i + 1 < len(line) && line[i + 1] == '/')) break;
+        if (line[i] == '"') {
+            i++;
+            s := i;
+            for (i < len(line) && line[i] != '"') i++;
+            out.append(line[s:i]);
+            if (i < len(line)) i++;
+        } else {
+            s := i;
+            for (i < len(line) && line[i] != ' ' && line[i] != '\t' && line[i] != '\r' && line[i] != ';') i++;
+            out.append(line[s:i]);
+        }
+    }
+    return out;
+}
+
+func readFile(b *Build, path string) (string, bool) {
+    for (_, o := range b.overlays) { if (o.path == path) return o.text, true; }
+    if (!util.IsRegular(path)) { error(b, path, "cannot read file: No such file or directory"); return "", false; }
+    text, ok := util.ReadFile(path);
+    if (!ok) { error(b, path, "cannot read file"); return "", false; }
+    return text, true;
+}
+
+// FindModule returns the module whose ocean.mod is nearest above location.
+func (b *Build) FindModule(location string) *ast.Module {
+    root := location;
+    for (;;) {
+        m, ok := b.modules[root];
+        if (ok) return m;
+        manifest := root + "/ocean.mod";
+        if (util.Exists(manifest)) {
+            mod := new(ast.Module);
+            mod.root = root;
+            b.modules[root] = mod;
+            text, rok := readFile(b, manifest);
+            block := 0;
+            lines := util.Split(rok ? text : "", '\n');
+            for (_, line := range lines) {
+                part := words(line);
+                n := len(part);
+                if (n == 0) continue;
+                if (part[0] == ")") { block = 0; continue; }
+                directive := block;
+                start := 0;
+                if (part[0] == "module") {
+                    if (n != 2 || mod.path != "" || !ValidModulePath(part[1])) error(b, manifest, "invalid module declaration");
+                    else mod.path = part[1];
+                    continue;
+                }
+                if (part[0] == "ocean") continue;
+                if (part[0] == "require" || part[0] == "replace") {
+                    directive = part[0] == "require" ? 1 : 2; start = 1;
+                    if (n == 2 && part[1] == "(") { block = directive; continue; }
+                }
+                if (directive == 0 || n <= start || !ValidModulePath(part[start])) { error(b, manifest, "invalid module directive"); continue; }
+                name := part[start];
+                if (directive == 1) {
+                    if (n != start + 2 || !ValidModulePath(part[start + 1])) error(b, manifest, "require expects a module path and version");
+                    else mod.requires[name] = part[start + 1];
+                } else {
+                    arrow := start + 1;
+                    if (arrow < n && part[arrow] != "=>") arrow++;
+                    if (arrow + 1 >= n || part[arrow] != "=>") error(b, manifest, "replace expects module => directory or module version");
+                    else {
+                        mod.replaces[name] = part[arrow + 1];
+                        if (arrow + 2 < n) mod.replaceVersions[name] = part[arrow + 2];
+                    }
+                    _, had := mod.requires[name];
+                    if (!had) mod.requires[name] = "";
+                }
+            }
+            if (mod.path == "") error(b, manifest, "missing module declaration");
+            if (block != 0) error(b, manifest, "unterminated directive block");
+            return mod;
+        }
+        next := util.Dir(root);
+        if (next == root) return zero(*ast.Module);
+        root = next;
+    }
+    return zero(*ast.Module);
+}
+
+func NilModule(m *ast.Module) bool { return (m -> int) == 0; }
+
+func Executable() string {
+    out := make([]i8);
+    for (i := 0; i < 4096; i++) out.append(0);
+    path := util.CStr("/proc/self/exe");
+    n := extern.readlink(path.data, out.data, 4095);
+    if (n <= 0) return "";
+    return out[0:n] -> string;
+}
+
+// StandardSource locates the standard library: $OCEAN_SRC, else <exe>/../src.
+func (b *Build) StandardSource() string {
+    if (b.stdRootSet) return b.stdRoot;
+    b.stdRootSet = true;
+    o, ok := util.Getenv("OCEAN_SRC");
+    if (ok) { b.stdRoot = o; return o; }
+    exe := Executable();
+    if (exe != "") {
+        candidate := util.Dir(util.Dir(exe)) + "/src";
+        // A development binary outside an installed layout falls back to the
+        // installed standard library next to the system `ocean` command.
+        if (!util.IsDir(candidate)) {
+            fallback := "/usr/local/lib/ocean/src";
+            if (util.IsDir(fallback)) candidate = fallback;
+        }
+        b.stdRoot = candidate;
+    }
+    return b.stdRoot;
+}
+
+func moduleCache() string {
+    c, ok := util.Getenv("OCEAN_MOD_CACHE");
+    if (ok) return c;
+    home, hok := util.Getenv("HOME");
+    return (hok ? home : "/tmp") + "/.cache/ocean/modules";
+}
+
+func download(b *Build, module string, version string) string {
+    if (!ValidModulePath(module) || (version != "" && (!ValidModulePath(version) || version[0] == '-'))) {
+        error(b, module, "invalid module path or version"); return "";
+    }
+    dest := moduleCache() + "/" + module + "@" + (version == "" ? "latest" : version);
+    if (util.IsDir(dest)) { r, _ := util.Realpath(dest); return r; }
+    base := util.Dir(dest);
+    if (!util.MkdirAll(base)) { error(b, base, "cannot create module cache"); return ""; }
+    tmp := base + "/.download-" + util.Itoa(util.Pid());
+    util.RemoveAll(tmp);
+    util.Stderr("ocean: downloading " + module + " " + (version == "" ? "latest" : version) + "\n");
+    args := []string{"git", "clone", "--quiet", "--depth", "1"};
+    if (version != "") { args.append("--branch"); args.append(version); }
+    args.append("--"); args.append("https://" + module); args.append(tmp);
+    st := util.Run(args.array());
+    if (st.Code != 0 || st.Failed) { error(b, module, "module download failed"); util.RemoveAll(tmp); return ""; }
+    if (!util.Exists(tmp + "/ocean.mod")) { error(b, module, "downloaded module has no ocean.mod"); util.RemoveAll(tmp); return ""; }
+    if (!util.Rename(tmp, dest)) {
+        if (!util.IsDir(dest)) error(b, dest, "cannot install downloaded module");
+        util.RemoveAll(tmp);
+    }
+    r, _ := util.Realpath(dest);
+    return r;
+}
+
+func resolveImport(b *Build, from *ast.Package, path string) *ast.Package {
+    if (b.testDirectory != "" && (path == "__ocean_test_internal" || path == "__ocean_test_external")) {
+        prev := b.loadingExternal;
+        b.loadingExternal = path == "__ocean_test_external";
+        r := loadDirectory(b, b.testDirectory);
+        b.loadingExternal = prev;
+        return r;
+    }
+    if (!ValidModulePath(path)) { error(b, from.dir, "invalid import path: " + path); return zero(*ast.Package); }
+    location := "";
+    mod := from.module;
+    hasMod := !NilModule(mod);
+    if (hasMod && mod.path != "" && pathPrefix(path, mod.path)) {
+        location = mod.root + path[len(mod.path):];
+    } else if (hasMod && util.IsDir(mod.root + "/" + path)) {
+        location = mod.root + "/" + path;
+    } else {
+        std := b.StandardSource();
+        if (std == "") { error(b, from.dir, "cannot locate compiler executable for standard library lookup"); return zero(*ast.Package); }
+        if (util.IsDir(std + "/" + path)) location = std + "/" + path;
+    }
+    if (location == "") {
+        matched := "";
+        if (hasMod) {
+            for (name, _ := range mod.requires) {
+                if (pathPrefix(path, name) && len(name) > len(matched)) matched = name;
+            }
+        }
+        name := matched;
+        if (name == "") {
+            slash := util.IndexByte(path, '/');
+            if (slash < 0 || util.IndexByte(path[0:slash], '.') < 0) { error(b, from.dir, "package not found: " + path); return zero(*ast.Package); }
+            parts := util.Split(path, '/');
+            if (len(parts) > 3) name = parts[0] + "/" + parts[1] + "/" + parts[2];
+            else name = path;
+        }
+        replacement := "";
+        replaced := false;
+        if (matched != "") { r, ok := mod.replaces[matched]; if (ok) { replacement = r; replaced = true; } }
+        root := "";
+        if (replaced && (replacement[0] == '.' || replacement[0] == '/')) {
+            p := replacement[0] == '/' ? replacement : mod.root + "/" + replacement;
+            r, ok := util.Realpath(p);
+            if (ok) root = r;
+        } else {
+            version := "";
+            if (matched != "") {
+                if (replaced) { v, _ := mod.replaceVersions[matched]; version = v; }
+                else { v, _ := mod.requires[matched]; version = v; }
+            }
+            root = download(b, replaced ? replacement : name, version);
+        }
+        if (root == "") { error(b, from.dir, "cannot resolve module: " + name); return zero(*ast.Package); }
+        downloaded := b.FindModule(root);
+        if (NilModule(downloaded) || downloaded.root != root) { error(b, root, "module root must contain ocean.mod"); return zero(*ast.Package); }
+        if (!replaced && downloaded.path != "" && downloaded.path != name) {
+            error(b, root, "module declares " + downloaded.path + ", expected " + name); return zero(*ast.Package);
+        }
+        location = root + path[len(name):];
+    }
+    resolved, ok := util.Realpath(location);
+    if (!ok || !util.IsDir(resolved)) { error(b, location, "package directory does not exist"); return zero(*ast.Package); }
+    return loadDirectory(b, resolved);
+}
+
+func IsTestFile(name string) bool { return util.HasSuffix(name, "_test.oc"); }
+
+func TargetSource(name string) bool {
+    n := len(name);
+    if (n < 3) return true;
+    n -= IsTestFile(name) ? 8 : 3;
+    arch, _ := util.Getenv("OCARCH");
+    wasm := arch == "wasm";
+    if (n >= 7 && name[n - 7:n] == "_native") return !wasm;
+    if (n >= 5 && name[n - 5:n] == "_wasm") return wasm;
+    return true;
+}
+
+func validPackageName(s string) bool {
+    if (s == "") return false;
+    if (!(util.IsLetter(s[0]) || s[0] == '_')) return false;
+    for (i := 0; i < len(s); i++) { if (!(util.IsLetter(s[i]) || util.IsDigit(s[i]) || s[i] == '_')) return false; }
+    return true;
+}
+
+func loadDirectory(b *Build, location string) *ast.Package {
+    target := b.testDirectory != "" && location == b.testDirectory;
+    external := target && b.loadingExternal;
+    b.loadingExternal = false;
+    key := location + (external ? "#external" : "");
+    existing, seen := b.byDir[key];
+    if (seen) {
+        if (existing.loading) error(b, location, "import cycle");
+        return existing;
+    }
+    p := new(ast.Package);
+    p.externalTest = external;
+    p.id = len(b.packages);
+    p.dir = location;
+    p.loading = true;
+    p.module = b.FindModule(location);
+    b.packages.append(p);
+    b.byDir[key] = p;
+    std := b.StandardSource();
+    if (std != "") {
+        stdReal, ok := util.Realpath(std);
+        if (ok && pathPrefix(location, stdReal)) { p.std = true; p.path = location[len(stdReal) + 1:]; }
+    }
+    if (p.path == "") {
+        if (!NilModule(p.module) && p.module.path != "") {
+            p.path = p.module.path + location[len(p.module.root):];
+            p.isRootModule = location == p.module.root;
+        } else p.path = location;
+    }
+    harness := b.harnessDirectory != "" && location == b.harnessDirectory;
+    names := make([]string);
+    if (!harness) {
+        entries, ok := util.ListDir(location);
+        if (!ok) { error(b, location, "cannot read package directory"); p.loading = false; b.order.append(p); return p; }
+        for (_, e := range entries) {
+            if (len(e) < 4 || !util.HasSuffix(e, ".oc")) continue;
+            if (!TargetSource(e)) continue;
+            if (IsTestFile(e) ? !target : external) continue;
+            path := location + "/" + e;
+            if (!util.IsRegular(path)) continue;
+            names.append(path);
+        }
+    }
+    for (_, o := range b.overlays) {
+        if (util.Dir(o.path) != location || !util.HasSuffix(o.path, ".oc")) continue;
+        if (!TargetSource(util.Base(o.path))) continue;
+        if (IsTestFile(o.path) ? !target : external) continue;
+        dup := false;
+        for (_, n := range names) { if (n == o.path) dup = true; }
+        if (!dup) names.append(o.path);
+    }
+    if (target && !external) {
+        // Ordinary sources first so the package name comes from them.
+        ordinary := make([]string); tests := make([]string);
+        for (_, n := range names) { if (IsTestFile(n)) tests.append(n); else ordinary.append(n); }
+        util.SortStrings(&ordinary); util.SortStrings(&tests);
+        names = ordinary + tests;
+    } else util.SortStrings(&names);
+    if (len(names) == 0 && !external) error(b, location, "directory contains no Ocean source files");
+    for (_, path := range names) {
+        text, ok := readFile(b, path);
+        if (!ok) continue;
+        src := new(ast.Source);
+        src.abs = path;
+        src.path = RelativeSourcePath(path);
+        src.text = text;
+        src.pkg = p;
+        src.test = IsTestFile(path);
+        src.index = b.nfiles;
+        b.nfiles++;
+        b.diags.AddSource(src.path, text);
+        toks, sok := scanner.Scan(src.path, text, b.diags, b.recover);
+        if (!sok && !b.recover) {
+            b.errors++;
+            util.Stdout("One or more errors encountered during scanning, quitting.\n");
+            b.fatal = true;
+            break;
+        }
+        src.tokens = toks;
+        file, pok := parser.ParseFile(src, b.diags, b.recover);
+        src.file = file;
+        if (target && src.test && file.name != "") {
+            baseName := p.name;
+            if (external) {
+                internal, iok := b.byDir[location];
+                if (iok) baseName = internal.name;
+            }
+            isExternal := len(file.name) > 5 && util.HasSuffix(file.name, "_test") && (baseName == "" || file.name != baseName);
+            if (isExternal != external) continue;
+        }
+        p.files.append(src);
+        if (!pok) { b.errors++; if (!b.recover) continue; }
+        if (file.name == "") continue;
+        if (!validPackageName(file.name)) error(b, path, "package name must be an identifier");
+        if (p.name == "") p.name = file.name;
+        else if (p.name != file.name) error(b, path, "package " + file.name + " conflicts with package " + p.name);
+    }
+    if (target && !external) {
+        // Restore filename order for initialization and test discovery.
+        sorted := make([]*ast.Source);
+        paths := make([]string);
+        for (_, f := range p.files) paths.append(f.abs);
+        util.SortStrings(&paths);
+        for (_, path := range paths) { for (_, f := range p.files) { if (f.abs == path) sorted.append(f); } }
+        p.files = sorted;
+    }
+    if (b.errors > 0 && !b.recover) { p.loading = false; b.order.append(p); return p; }
+    for (_, src := range p.files) {
+        if (ast.Nil(src.file)) continue;
+        for (_, imp := range src.file.list2) {
+            imported := resolveImport(b, p, imp.text);
+            if (ast.NilPkg(imported)) {
+                if (b.recover) b.diags.Error(src.path, imp.line, imp.col, "package", "could not resolve import: " + imp.text);
+                continue;
+            }
+            imp.ref = new(ast.Node);
+            alias := imp.name;
+            if (alias == "") {
+                alias = imported.name;
+                if (!NilModule(imported.module) && imported.dir == imported.module.root) {
+                    slash := util.LastIndexByte(imp.text, '/');
+                    alias = slash >= 0 ? imp.text[slash + 1:] : imp.text;
+                }
+            }
+            if (alias == "") continue;
+            for (_, old := range src.importNodes) {
+                if (old.name == alias && alias != "_" && alias != ".") error(b, src.abs, "duplicate import name: " + alias);
+            }
+            rec := new(ast.Node);
+            rec.kind = ast.NK.Import; rec.name = alias; rec.text = imp.text; rec.src = src;
+            rec.line = imp.line; rec.col = imp.col;
+            rec.sym = new(ast.Symbol);
+            rec.sym.kind = ast.SK.Package; rec.sym.name = alias; rec.sym.importPkg = imported;
+            rec.sym.node = rec; rec.sym.src = src;
+            src.importNodes.append(rec);
+            dup := false;
+            for (_, q := range p.imports) { if (q == imported) dup = true; }
+            if (!dup) p.imports.append(imported);
+        }
+    }
+    p.loading = false;
+    b.order.append(p);
+    return p;
+}
+
+func canonicalLocation(b *Build, location string) string {
+    path, ok := util.Realpath(location);
+    if (!ok) { error(b, location, "location does not exist"); return ""; }
+    if (!util.IsDir(path)) {
+        if (!util.HasSuffix(path, ".oc")) { error(b, location, "expected an Ocean file or package directory"); return ""; }
+        path = util.Dir(path);
+    }
+    return path;
+}
+
+// LoadPackage loads a package and its dependencies. Returns false on error.
+func (b *Build) LoadPackage(location string) bool {
+    path := canonicalLocation(b, location);
+    if (path == "") return false;
+    b.root = loadDirectory(b, path);
+    if (b.errors > 0 && !b.recover) return false;
+    if (b.root.name == "") return false;
+    finish(b);
+    return b.errors == 0;
+}
+
+func finish(b *Build) {
+    b.packageName = b.root.name;
+    b.isLibrary = b.root.name != "main";
+}
+
+// HasTestSources reports whether a location contains *_test.oc sources.
+func (b *Build) HasTestSources(location string) bool {
+    path, ok := util.Realpath(location);
+    if (!ok) return false;
+    if (!util.IsDir(path)) path = util.Dir(path);
+    entries, _ := util.ListDir(path);
+    for (_, e := range entries) { if (IsTestFile(e) && TargetSource(e)) return true; }
+    for (_, o := range b.overlays) { if (util.Dir(o.path) == path && IsTestFile(util.Base(o.path)) && TargetSource(util.Base(o.path))) return true; }
+    return false;
+}
+
+struct TestFunc { name string; external bool; }
+
+// LoadTestPackage builds the synthesized test harness for a package.
+func (b *Build) LoadTestPackage(location string, harnessDirectory string) bool {
+    path := canonicalLocation(b, location);
+    if (path == "") return false;
+    b.testDirectory = path;
+    b.harnessDirectory = harnessDirectory;
+    internal := loadDirectory(b, path);
+    if (b.errors == 0 && internal.name == "") error(b, path, "no package under test; add ordinary source or same-package test files");
+    if (b.errors > 0 && !b.recover) return false;
+    b.loadingExternal = true;
+    external := loadDirectory(b, path);
+    if (b.errors > 0 && !b.recover) return false;
+    if (internal.name == "") { b.root = internal; return false; }
+    if (external.name != "" && external.name != internal.name + "_test") {
+        error(b, path, "external test package must be " + internal.name + "_test"); return false;
+    }
+    h: util.Buf;
+    h.Add("package main; import \"testing\"; import \"__ocean_test_internal\" as tested; ");
+    if (external.name != "") h.Add("import \"__ocean_test_external\" as external; ");
+    h.Add("func main() int { testing.Start(); ");
+    targets := []*ast.Package{internal, external};
+    for (k := 0; k < 2; k++) {
+        for (_, src := range targets[k].files) {
+            if (!src.test || ast.Nil(src.file)) continue;
+            for (_, d := range src.file.list) {
+                if (d.kind != ast.NK.Func || !ast.Nil(d.a) || !util.HasPrefix(d.name, "Test")) continue;
+                if (d.flag || len(d.list3) > 0 || len(d.list) != 1 || len(d.list2) > 0) {
+                    error(b, src.abs, d.name + " must have signature func " + d.name + "(t *testing.T)");
+                    continue;
+                }
+                h.Add("testing.RunTest(\"").Add(d.name).Add("\", ").Add(k == 1 ? "external" : "tested").Add(".").Add(d.name).Add("); ");
+            }
+        }
+    }
+    h.Add("return testing.Finish(); }");
+    o := new(Overlay);
+    o.path = harnessDirectory + "/runner.oc";
+    o.text = h.String();
+    b.overlays.append(o);
+    b.root = loadDirectory(b, harnessDirectory);
+    b.overlays.pop();
+    if (b.errors > 0 && !b.recover) return false;
+    finish(b);
+    return b.errors == 0;
+}
+
+// PackageTestPath gives the module-qualified display path of a location.
+func (b *Build) PackageTestPath(location string) string {
+    path, ok := util.Realpath(location);
+    if (!ok) return location;
+    if (!util.IsDir(path)) path = util.Dir(path);
+    m := b.FindModule(path);
+    if (!NilModule(m) && m.path != "") return m.path + path[len(m.root):];
+    return path;
+}
+
+// PackageTestLocation resolves a location, accepting import paths too.
+func (b *Build) PackageTestLocation(location string) string {
+    path, ok := util.Realpath(location);
+    if (ok) return path;
+    cwd := util.Getcwd();
+    m := b.FindModule(cwd);
+    if (!NilModule(m) && m.path != "" && pathPrefix(location, m.path)) {
+        r, rok := util.Realpath(m.root + location[len(m.path):]);
+        if (rok) return r;
+        return "";
+    }
+    from := new(ast.Package);
+    from.dir = cwd; from.module = m;
+    saved := b.diags.live;
+    b.diags.live = false;
+    p := resolveImport(b, from, location);
+    b.diags.live = saved;
+    if (ast.NilPkg(p)) return "";
+    return p.dir;
+}
+
+func (b *Build) AddOverlay(path string, text string) { o := new(Overlay); o.path = path; o.text = text; b.overlays.append(o); }
+func (b *Build) SetRecover(r bool) { b.recover = r; }
+func (b *Build) Root() *ast.Package { return b.root; }
+func (b *Build) Order() []*ast.Package { return b.order; }
+func (b *Build) Errors() int { return b.errors; }
+func (b *Build) IsLibrary() bool { return b.isLibrary; }
+func (b *Build) PackageName() string { return b.packageName; }
+func (b *Build) Diags() *diag.List { return b.diags; }
+func (b *Build) IsFatal() bool { return b.fatal; }

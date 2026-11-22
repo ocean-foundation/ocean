@@ -1,0 +1,209 @@
+package util;
+
+func Itoa(n int) string {
+    if (n == 0) return "0";
+    neg := n < 0;
+    digits: [24]i8;
+    i := 24;
+    if (neg) {
+        // Handle INT64_MIN by working with negative remainders.
+        for (n != 0) { i--; digits[i] = ('0' - (n % 10)) -> i8; n = n / 10; }
+        i--; digits[i] = '-';
+    } else {
+        for (n != 0) { i--; digits[i] = ('0' + n % 10) -> i8; n = n / 10; }
+    }
+    out := make([]i8);
+    for (j := i; j < 24; j++) out.append(digits[j]);
+    return out -> string;
+}
+
+func Utoa(n uint) string {
+    if (n == 0->uint) return "0";
+    digits: [24]i8;
+    i := 24;
+    for (n != 0->uint) { i--; digits[i] = ('0'->uint + n % 10->uint) -> i8; n = n / 10->uint; }
+    out := make([]i8);
+    for (j := i; j < 24; j++) out.append(digits[j]);
+    return out -> string;
+}
+
+func HexDigit(v int) i8 { return "0123456789abcdef"[v & 15]; }
+
+func Hex(n uint, width int) string {
+    out := make([]i8);
+    for (i := width - 1; i >= 0; i--) out.append(HexDigit(((n >> ((i * 4)->uint)) & 15->uint) -> int));
+    return out -> string;
+}
+
+func HasPrefix(s string, p string) bool {
+    if (len(p) > len(s)) return false;
+    for (i := 0; i < len(p); i++) { if (s[i] != p[i]) return false; }
+    return true;
+}
+
+func HasSuffix(s string, p string) bool {
+    if (len(p) > len(s)) return false;
+    off := len(s) - len(p);
+    for (i := 0; i < len(p); i++) { if (s[off + i] != p[i]) return false; }
+    return true;
+}
+
+func Index(s string, p string) int {
+    if (len(p) == 0) return 0;
+    for (i := 0; i + len(p) <= len(s); i++) {
+        ok := true;
+        for (j := 0; j < len(p); j++) { if (s[i + j] != p[j]) { ok = false; break; } }
+        if (ok) return i;
+    }
+    return -1;
+}
+
+func IndexByte(s string, c i8) int {
+    for (i := 0; i < len(s); i++) { if (s[i] == c) return i; }
+    return -1;
+}
+
+func LastIndexByte(s string, c i8) int {
+    for (i := len(s) - 1; i >= 0; i--) { if (s[i] == c) return i; }
+    return -1;
+}
+
+func Contains(s string, p string) bool { return Index(s, p) >= 0; }
+
+func Split(s string, sep i8) []string {
+    out := make([]string);
+    start := 0;
+    for (i := 0; i < len(s); i++) {
+        if (s[i] == sep) { out.append(s[start:i]); start = i + 1; }
+    }
+    out.append(s[start:]);
+    return out;
+}
+
+func Join(parts array<string>, sep string) string {
+    b: Buf;
+    for (i := 0; i < len(parts); i++) {
+        if (i > 0) b.Add(sep);
+        b.Add(parts[i]);
+    }
+    return b.String();
+}
+
+func JoinList(parts []string, sep string) string {
+    b: Buf;
+    for (i := 0; i < len(parts); i++) {
+        if (i > 0) b.Add(sep);
+        b.Add(parts[i]);
+    }
+    return b.String();
+}
+
+func IsSpace(c i8) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+func Trim(s string) string {
+    a := 0; b := len(s);
+    for (a < b && IsSpace(s[a])) a++;
+    for (b > a && IsSpace(s[b - 1])) b--;
+    return s[a:b];
+}
+
+func Replace(s string, old string, repl string) string {
+    if (len(old) == 0) return s;
+    b: Buf;
+    i := 0;
+    for (i < len(s)) {
+        if (i + len(old) <= len(s) && s[i:i + len(old)] == old) { b.Add(repl); i += len(old); }
+        else { b.Addc(s[i]); i++; }
+    }
+    return b.String();
+}
+
+func Repeat(s string, n int) string {
+    b: Buf;
+    for (i := 0; i < n; i++) b.Add(s);
+    return b.String();
+}
+
+func IsDigit(c i8) bool { return c >= '0' && c <= '9'; }
+func IsLetter(c i8) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+
+// ParseInt parses a decimal integer, returning ok=false on failure.
+func Atoi(s string) (int, bool) {
+    if (len(s) == 0) return 0, false;
+    neg := false; i := 0;
+    if (s[0] == '-') { neg = true; i = 1; }
+    if (i >= len(s)) return 0, false;
+    n := 0;
+    for (; i < len(s); i++) {
+        if (!IsDigit(s[i])) return 0, false;
+        n = n * 10 + (s[i] - '0') -> int;
+    }
+    return neg ? -n : n, true;
+}
+
+// SortStrings sorts in place with unsigned byte ordering.
+func SortStrings(a *[]string) {
+    n := len(*a);
+    if (n < 2) return;
+    // Merge sort via temporary arrays keeps this O(n log n).
+    tmp := make([]string);
+    for (i := 0; i < n; i++) tmp.append("");
+    for (width := 1; width < n; width = width * 2) {
+        for (lo := 0; lo < n; lo += 2 * width) {
+            mid := lo + width; if (mid > n) mid = n;
+            hi := lo + 2 * width; if (hi > n) hi = n;
+            i := lo; j := mid; k := lo;
+            for (i < mid && j < hi) {
+                if ((*a)[j] < (*a)[i]) { tmp[k] = (*a)[j]; j++; } else { tmp[k] = (*a)[i]; i++; }
+                k++;
+            }
+            for (i < mid) { tmp[k] = (*a)[i]; i++; k++; }
+            for (j < hi) { tmp[k] = (*a)[j]; j++; k++; }
+        }
+        for (i := 0; i < n; i++) (*a)[i] = tmp[i];
+    }
+}
+
+// Quote produces a C-like escaped string literal.
+func Quote(s string) string {
+    b: Buf;
+    b.Addc('"');
+    for (i := 0; i < len(s); i++) {
+        c := s[i];
+        if (c == '"') b.Add("\\\"");
+        else if (c == '\\') b.Add("\\\\");
+        else if (c == '\n') b.Add("\\n");
+        else if (c == '\t') b.Add("\\t");
+        else if (c == '\r') b.Add("\\r");
+        else if (c >= 0 && c < 32) { b.Add("\\u00"); b.Addc(HexDigit((c->int) >> 4)); b.Addc(HexDigit(c->int)); }
+        else b.Addc(c);
+    }
+    b.Addc('"');
+    return b.String();
+}
+
+// FormatFixed formats v with the given number of decimals (round half up).
+func FormatFixed(v float, decimals int) string {
+    neg := v < 0.0;
+    if (neg) v = -v;
+    scale := 1.0;
+    for (i := 0; i < decimals; i++) scale = scale * 10.0;
+    scaled := v * scale + 0.5;
+    if (scaled >= 9.0e18) return (neg ? "-" : "") + "inf";
+    n := scaled -> int;
+    digits := Itoa(n);
+    for (len(digits) <= decimals) digits = "0" + digits;
+    out := digits;
+    if (decimals > 0) out = digits[0:len(digits) - decimals] + "." + digits[len(digits) - decimals:];
+    if (neg && n != 0) out = "-" + out;
+    return out;
+}
+
+// PadLeft / PadRight pad with spaces to a display width counted in code points.
+func Width(s string) int {
+    n := 0;
+    for (i := 0; i < len(s); i++) { if (((s[i] -> int) & 192) != 128) n++; }
+    return n;
+}
+func PadLeft(s string, w int) string { for (Width(s) < w) s = " " + s; return s; }
+func PadRight(s string, w int) string { for (Width(s) < w) s = s + " "; return s; }

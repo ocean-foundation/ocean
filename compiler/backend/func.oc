@@ -1,0 +1,382 @@
+package backend;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+// ---- calling convention ----
+// Ocean functions: ret @f(ptr env, [ptr sret], [recv], params...)
+// Aggregates are passed by pointer to a callee-owned copy; one aggregate result
+// or several results use an sret pointer (a tuple block for several).
+
+func resultAgg(g *Gen, results []*ast.Type) bool {
+    if (len(results) == 0) return false;
+    if (len(results) > 1) return true;
+    return isAgg(results[0]);
+}
+func retLL(g *Gen, results []*ast.Type) string {
+    if (len(results) == 0 || resultAgg(g, results)) return "void";
+    return ll(results[0]);
+}
+func paramLL(t *ast.Type) string { if (isAgg(t)) return "ptr"; return ll(t); }
+
+// fnTypeLL is the LLVM function type used at call sites.
+func fnTypeLL(g *Gen, ft *ast.Type, recv *ast.Type) string {
+    s := retLL(g, ft.results) + " (ptr";
+    if (resultAgg(g, ft.results)) s += ", ptr";
+    if (!nilT(recv)) s += ", " + paramLL(recv);
+    for (_, p := range ft.params) s += ", " + paramLL(sub(g, p));
+    return s + ")";
+}
+
+func tupleType(results []*ast.Type) *ast.Type { return check.TupleOf(results); }
+
+// resultStorageType is the type held in the sret block.
+func resultStorage(g *Gen, results []*ast.Type) *ast.Type {
+    if (len(results) == 1) return results[0];
+    return tupleType(results);
+}
+
+func tupleOffset(g *Gen, results []*ast.Type, i int) int {
+    return g.c.TupleLayout(results).places[i].offset;
+}
+
+// ---- instances ----
+
+func mangle(s string) string {
+    b: util.Buf;
+    for (i := 0; i < len(s); i++) {
+        c := s[i];
+        if (c == '"' || c == '\\' || ((c -> int) & 255) < 32) b.Addc('_'); else b.Addc(c);
+    }
+    return b.String();
+}
+
+func argsKey(args []*ast.Type) string {
+    if (len(args) == 0) return "";
+    s := "<";
+    for (i, a := range args) { if (i > 0) s += ","; s += check.TypeKey(a); }
+    return s + ">";
+}
+
+func enqueue(g *Gen, inst *Inst) { g.queue.append(inst); }
+
+// funcRef returns the LLVM name of a function instance, scheduling it.
+func funcRef(g *Gen, s *ast.Symbol, targs []*ast.Type) string {
+    args := make([]*ast.Type);
+    for (_, a := range targs) args.append(sub(g, a));
+    key := "F" + itoa(s.id) + argsKey(args);
+    inst, ok := g.funcs[key];
+    if (ok) return inst.name;
+    inst = new(Inst);
+    inst.sym = s; inst.node = s.node;
+    inst.env = check.MakeEnv(s.typeParams, args);
+    pkgPart := "";
+    if (!nilPkgB(s.pkg)) pkgPart = s.pkg.name + ".";
+    inst.name = "@\"" + mangle(pkgPart + s.name + "." + itoa(s.id) + argsKey(args)) + "\"";
+    g.funcs[key] = inst;
+    enqueue(g, inst);
+    return inst.name;
+}
+func nilPkgB(p *ast.Package) bool { return (p -> int) == 0; }
+
+// methodRef instantiates method m for a concrete receiver type and method type arguments.
+func methodRef(g *Gen, m *ast.Symbol, recv *ast.Type, targs []*ast.Type) string {
+    base := sub(g, recv);
+    if (base.kind == ast.TK.Ptr) base = base.elem;
+    margs := make([]*ast.Type);
+    for (_, a := range targs) margs.append(sub(g, a));
+    key := "M" + itoa(m.id) + "|" + check.TypeKey(base) + argsKey(margs);
+    inst, ok := g.funcs[key];
+    if (ok) return inst.name;
+    inst = new(Inst);
+    inst.sym = m; inst.node = m.node; inst.recvType = base;
+    env := check.MakeEnv(m.recvParams, base.args);
+    inst.env = env.Extend(m.typeParams, margs);
+    owner := m.owner.name;
+    inst.name = "@\"" + mangle(m.pkg.name + "." + owner + "." + m.name + "." + itoa(m.id) + argsKey(base.args) + argsKey(margs)) + "\"";
+    g.funcs[key] = inst;
+    enqueue(g, inst);
+    return inst.name;
+}
+
+// thunkFor produces the interface-dispatch adapter for a boxed receiver.
+func thunkFor(g *Gen, m *ast.Symbol, base *ast.Type, ptrBox bool) string {
+    key := "T" + itoa(m.id) + "|" + check.TypeKey(base) + (ptrBox ? "*" : "");
+    inst, ok := g.funcs[key];
+    if (ok) return inst.name;
+    inst = new(Inst);
+    inst.sym = m; inst.node = m.node; inst.kind = 2; inst.thunkPtr = ptrBox; inst.recvType = base;
+    inst.env = check.MakeEnv(m.recvParams, base.args);
+    inst.name = "@\"" + mangle("thunk." + m.owner.name + "." + m.name + "." + itoa(m.id) + check.TypeKey(base) + (ptrBox ? "*" : "")) + "\"";
+    g.funcs[key] = inst;
+    enqueue(g, inst);
+    return inst.name;
+}
+
+// literalRef returns the function for a function literal in the current environment.
+func literalRef(g *Gen, n *ast.Node) string {
+    key := "L" + itoa(n.off) + "@" + n.src.path + "|" + envKey(g.env);
+    inst, ok := g.funcs[key];
+    if (ok) return inst.name;
+    g.nlit++;
+    inst = new(Inst);
+    inst.node = n; inst.kind = 1; inst.env = g.env;
+    inst.name = "@\"lit." + itoa(g.nlit) + "\"";
+    g.funcs[key] = inst;
+    enqueue(g, inst);
+    return inst.name;
+}
+
+func envKey(e *check.Env) string {
+    s := "";
+    for (i, a := range e.Args()) s += itoa(e.Params()[i].id) + "=" + check.TypeKey(a) + ";";
+    return s;
+}
+
+// ---- function bodies ----
+
+func newFn(g *Gen, inst *Inst, name string) *Fn {
+    f := new(Fn);
+    f.inst = inst;
+    f.body = util.NewBuf();
+    f.allocas = util.NewBuf();
+    f.name = name;
+    return f;
+}
+
+func frameName(inst *Inst) string {
+    if (inst.kind == 1) return "func literal";
+    if (!nilS(inst.sym)) return inst.sym.name;
+    return "?";
+}
+
+func prologue(g *Gen, displayName string) {
+    f := g.fn;
+    f.frame = allocaBytes(g, 40, 8);
+    prev := tmp(g);
+    emit(g, prev + " = load ptr, ptr @oc_top");
+    emit(g, "store ptr " + prev + ", ptr " + f.frame);
+    emit(g, "store ptr " + cstr(g, displayName) + ", ptr " + gep(g, f.frame, 8));
+    emit(g, "store i64 0, ptr " + gep(g, f.frame, 16));
+    emit(g, "store ptr null, ptr " + gep(g, f.frame, 24));
+    emit(g, "store ptr null, ptr " + gep(g, f.frame, 32));
+    emit(g, "store ptr " + f.frame + ", ptr @oc_top");
+    if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
+}
+
+// setupDefer installs the recovery point for functions containing defer.
+func setupDefer(g *Gen, recovered string) {
+    f := g.fn;
+    jb := allocaBytes(g, 512, 16);
+    emit(g, "store ptr " + jb + ", ptr " + gep(g, f.frame, 32));
+    r := tmp(g);
+    emit(g, r + " = call i32 @_setjmp(ptr " + jb + ") returns_twice");
+    c := tmp(g);
+    emit(g, c + " = icmp ne i32 " + r + ", 0");
+    body := newLabel(g, "body");
+    condBr(g, c, recovered, body);
+    label(g, body);
+}
+
+func hasDefer(n *ast.Node) bool {
+    if (nilN(n)) return false;
+    if (n.kind == ast.NK.Defer) return true;
+    if (n.kind == ast.NK.FuncLit) return false;
+    if (hasDefer(n.a) || hasDefer(n.b) || hasDefer(n.c) || hasDefer(n.d)) return true;
+    for (_, x := range n.list) { if (hasDefer(x)) return true; }
+    for (_, x := range n.list2) { if (hasDefer(x)) return true; }
+    return false;
+}
+
+// localStorage allocates storage for a declared local (a heap cell if captured).
+func localStorage(g *Gen, s *ast.Symbol, t *ast.Type) string {
+    p := "";
+    if (s.captured) {
+        p = tmp(g);
+        emit(g, p + " = call ptr @oc_alloc(i64 " + itoa(sizeOf(g, t)) + ")");
+    } else p = alloca(g, t);
+    g.fn.locals[s.id] = p;
+    return p;
+}
+
+func emitInst(g *Gen, inst *Inst) {
+    g.env = inst.env;
+    if (inst.kind == 2) { emitThunk(g, inst); return; }
+    n := inst.node;
+    ft := zero(*ast.Type);
+    recvT := zero(*ast.Type);
+    params := n.list;
+    results := n.list2;
+    body := n.b;
+    if (inst.kind == 1) ft = n.ty;
+    else {
+        ft = inst.sym.ty;
+        if (!nilS(inst.sym.owner)) {
+            recvT = inst.recvType;
+            if (inst.sym.recvPtr) recvT = check.PtrTo(recvT);
+        }
+    }
+    resultTypes := make([]*ast.Type);
+    for (_, r := range ft.results) resultTypes.append(sub(g, r));
+    f := newFn(g, inst, inst.name);
+    g.fn = f;
+    f.resultTypes = resultTypes;
+    f.hasDefer = hasDefer(body);
+    hdr: util.Buf;
+    hdr.Add("define ").Add(inst.sym_linkage(g)).Add(retLL(g, resultTypes)).Add(" ").Add(inst.name).Add("(ptr %env");
+    if (resultAgg(g, resultTypes)) { hdr.Add(", ptr %sret"); f.sret = "%sret"; }
+    if (!nilT(recvT)) hdr.Add(", ").Add(paramLL(recvT)).Add(" %recv");
+    for (i, p := range ft.params) hdr.Add(", ").Add(paramLL(sub(g, p))).Add(" %p").AddInt(i);
+    hdr.Add(")");
+    if (f.hasDefer) hdr.Add(" noinline");
+    hdr.Add(" {\n");
+    f.envParam = "%env";
+    f.cur = "entry";
+    prologue(g, frameName(inst));
+    // closure captures
+    if (inst.kind == 1) {
+        for (i, s := range n.syms) {
+            cell := tmp(g);
+            slot := gep(g, "%env", i * 8);
+            emit(g, cell + " = load ptr, ptr " + slot);
+            f.locals[s.id] = cell;
+        }
+    }
+    // receiver and parameters
+    if (!nilT(recvT)) {
+        rs := n.a.sym;
+        bindParam(g, rs, recvT, "%recv");
+    }
+    for (i, p := range params) {
+        pt := sub(g, ft.params[i]);
+        if (nilS(p.sym)) continue;
+        bindParam(g, p.sym, pt, "%p" + itoa(i));
+    }
+    // results
+    for (i, r := range results) {
+        rt := resultTypes[i];
+        slot := "";
+        if (!nilS(r.sym) && r.sym.name != "_") slot = localStorage(g, r.sym, rt);
+        else slot = alloca(g, rt);
+        zeroInto(g, rt, slot);
+        f.resultSlots.append(slot);
+    }
+    for (i := len(f.resultSlots); i < len(resultTypes); i++) {
+        slot := alloca(g, resultTypes[i]);
+        zeroInto(g, resultTypes[i], slot);
+        f.resultSlots.append(slot);
+    }
+    f.exit = "exit";
+    recovered := "recovered";
+    if (f.hasDefer) setupDefer(g, recovered);
+    genBlock(g, body);
+    if (!f.terminated) br(g, "exit");
+    // epilogue
+    label(g, "exit");
+    if (f.hasDefer) emit(g, "call void @oc_run_defers(ptr " + f.frame + ")");
+    br(g, "finish");
+    if (f.hasDefer) { g.fn.body.Add("recovered:\n"); f.terminated = false; br(g, "finish"); }
+    label(g, "finish");
+    prev := tmp(g);
+    emit(g, prev + " = load ptr, ptr " + f.frame);
+    emit(g, "store ptr " + prev + ", ptr @oc_top");
+    emitReturn(g);
+    g.mod.AddBuf(&hdr);
+    g.mod.Add("entry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
+}
+
+func (inst *Inst) sym_linkage(g *Gen) string {
+    if (g.library && inst.kind == 0 && !nilS(inst.sym) && inst.sym.exported && len(inst.sym.typeParams) == 0) return "";
+    return "internal ";
+}
+
+func bindParam(g *Gen, s *ast.Symbol, t *ast.Type, arg string) {
+    if (isAgg(t)) {
+        if (s.captured) {
+            cell := localStorage(g, s, t);
+            memcpy(g, cell, arg, sizeOf(g, t));
+        } else g.fn.locals[s.id] = arg;
+        return;
+    }
+    slot := localStorage(g, s, t);
+    emit(g, "store " + ll(t) + " " + arg + ", ptr " + slot);
+}
+
+func loadResult(g *Gen, i int) V {
+    t := g.fn.resultTypes[i];
+    slot := g.fn.resultSlots[i];
+    if (g.fn.hasDefer && !isAgg(t)) {
+        r := tmp(g);
+        emit(g, r + " = load volatile " + ll(t) + ", ptr " + slot);
+        return mkV(r, t);
+    }
+    return load(g, t, slot);
+}
+
+func emitReturn(g *Gen) {
+    f := g.fn;
+    rts := f.resultTypes;
+    if (len(rts) == 0) { term(g, "ret void"); return; }
+    if (!resultAgg(g, rts)) {
+        v := loadResult(g, 0);
+        term(g, "ret " + ll(rts[0]) + " " + v.r);
+        return;
+    }
+    if (len(rts) == 1) {
+        memcpy(g, f.sret, f.resultSlots[0], sizeOf(g, rts[0]));
+        term(g, "ret void");
+        return;
+    }
+    for (i, t := range rts) {
+        v := loadResult(g, i);
+        store(g, t, gep(g, f.sret, tupleOffset(g, rts, i)), v);
+    }
+    term(g, "ret void");
+}
+
+// emitThunk adapts a boxed receiver (pointer to box data) to the method ABI.
+func emitThunk(g *Gen, inst *Inst) {
+    m := inst.sym;
+    ft := m.ty;
+    base := inst.recvType;
+    resultTypes := make([]*ast.Type);
+    for (_, r := range ft.results) resultTypes.append(sub(g, r));
+    f := newFn(g, inst, inst.name);
+    g.fn = f;
+    f.cur = "entry";
+    hdr: util.Buf;
+    sret := resultAgg(g, resultTypes);
+    hdr.Add("define internal ").Add(retLL(g, resultTypes)).Add(" ").Add(inst.name).Add("(ptr %env");
+    if (sret) hdr.Add(", ptr %sret");
+    hdr.Add(", ptr %data");
+    args := "ptr null";
+    if (sret) args += ", ptr %sret";
+    for (i, p := range ft.params) {
+        pl := paramLL(sub(g, p));
+        hdr.Add(", ").Add(pl).Add(" %p").AddInt(i);
+    }
+    hdr.Add(") {\n");
+    recvT := m.recvPtr ? check.PtrTo(base) : base;
+    recv := "";
+    if (inst.thunkPtr) {
+        p := tmp(g);
+        emit(g, p + " = load ptr, ptr %data");
+        if (m.recvPtr) recv = "ptr " + p;
+        else {
+            v := copyV(g, load(g, base, p));
+            if (isAgg(base)) recv = "ptr " + spill(g, v); else recv = ll(base) + " " + v.r;
+        }
+    } else {
+        v := copyV(g, load(g, base, "%data"));
+        if (isAgg(base)) recv = "ptr " + spill(g, v); else recv = ll(base) + " " + v.r;
+    }
+    args += ", " + recv;
+    for (i, p := range ft.params) args += ", " + paramLL(sub(g, p)) + " %p" + itoa(i);
+    callee := methodRef(g, m, base, make([]*ast.Type));
+    rl := retLL(g, resultTypes);
+    if (rl == "void") { emit(g, "call void " + callee + "(" + args + ")"); term(g, "ret void"); }
+    else { r := tmp(g); emit(g, r + " = call " + rl + " " + callee + "(" + args + ")"); term(g, "ret " + rl + " " + r); }
+    recvT.cache = "";
+    g.mod.AddBuf(&hdr);
+    g.mod.Add("entry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
+}

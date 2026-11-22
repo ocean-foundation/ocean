@@ -1,0 +1,14 @@
+package driver;
+
+// Injected at build time: ocean build -ldflags "-X github.com/ocean-foundation/ocean/compiler/driver.version=1.2.3 ..."
+version: string = "dev";
+commit: string = "unknown";
+commitDate: string = "unknown";
+commitYear: string = "2026";
+buildDate: string = "unknown";
+
+func Version() string { return version; }
+func Commit() string { return commit; }
+func CommitDate() string { return commitDate; }
+func CommitYear() string { return commitYear; }
+func BuildDate() string { return buildDate; }

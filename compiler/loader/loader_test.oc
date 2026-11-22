@@ -1,0 +1,87 @@
+package loader;
+import "testing";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+func quiet() *diag.List { d := diag.NewList(); d.live = false; return d; }
+
+func writeTree(t *testing.T, files []string) string {
+    dir, ok := util.MakeTempDir("ocean-loader-test-");
+    if (!ok) t.Fatal("tempdir");
+    real, _ := util.Realpath(dir);
+    for (i := 0; i + 1 < len(files); i += 2) {
+        path := real + "/" + files[i];
+        util.MkdirAll(util.Dir(path));
+        util.WriteFile(path, files[i + 1]);
+    }
+    return real;
+}
+
+func TestModuleResolution(t *testing.T) {
+    root := writeTree(t, []string{
+        "ocean.mod", "module example.com/app\n\nocean 0.1\nrequire (\n  example.com/lib v1.0.0 // comment\n)\nreplace example.com/lib => ./vendored\n",
+        "main.oc", "package main; import \"example.com/app/helper\"; import \"io\"; import h2 \"helper\"; import \"example.com/lib/sub\"; func main() {}",
+        "helper/a.oc", "package helper; func A() int { return 1; }",
+        "helper/b_native.oc", "package helper;",
+        "helper/c_wasm.oc", "package other;",
+        "helper/x_test.oc", "package helper;",
+        "vendored/ocean.mod", "module example.com/lib\n",
+        "vendored/sub/s.oc", "package sub;"});
+    b := NewBuild(quiet());
+    ok := b.LoadPackage(root);
+    if (!ok) { t.Fatal("load failed: ", b.diags.items[0].message); }
+    if (b.root.name != "main" || b.isLibrary) t.Error("root");
+    names := "";
+    for (_, p := range b.order) names += p.name + " ";
+    if (!util.Contains(names, "helper") || !util.Contains(names, "io") || !util.Contains(names, "sub")) t.Error("order: ", names);
+    for (_, p := range b.packages) {
+        if (p.name == "helper" && len(p.files) != 2) t.Error("helper files ", len(p.files));
+        if (p.name == "io" && !p.std) t.Error("io std");
+    }
+    if (len(b.root.files[0].importNodes) != 4 || b.root.files[0].importNodes[2].name != "h2") t.Error("imports");
+    util.RemoveAll(root);
+}
+
+func TestErrors(t *testing.T) {
+    root := writeTree(t, []string{
+        "ocean.mod", "module m\n",
+        "a/a.oc", "package a; import \"m/b\";",
+        "b/b.oc", "package b; import \"m/a\";",
+        "c/c.oc", "package c;", "c/d.oc", "package d;",
+        "e/e.oc", "package e; import \"nowhere/x\";"});
+    d := quiet();
+    b := NewBuild(d);
+    if (b.LoadPackage(root + "/a")) t.Error("cycle accepted");
+    if (d.items[0].message != "import cycle") t.Error("cycle msg ", d.items[0].message);
+    d2 := quiet();
+    if (NewBuild(d2).LoadPackage(root + "/c")) t.Error("conflict accepted");
+    if (d2.items[0].message != "package d conflicts with package c") t.Error("conflict msg ", d2.items[0].message);
+    d3 := quiet();
+    if (NewBuild(d3).LoadPackage(root + "/e")) t.Error("missing accepted");
+    if (d3.items[0].message != "package not found: nowhere/x") t.Error("missing msg ", d3.items[0].message);
+    util.RemoveAll(root);
+}
+
+func TestTestHarness(t *testing.T) {
+    root := writeTree(t, []string{
+        "ocean.mod", "module m\n",
+        "p/p.oc", "package p; func Add(a, b int) int { return a + b; }",
+        "p/p_test.oc", "package p; import \"testing\"; func TestAdd(t *testing.T) {} func helper() {}",
+        "p/ext_test.oc", "package p_test; import \"testing\"; import \"m/p\"; func TestExt(t *testing.T) {}"});
+    b := NewBuild(quiet());
+    if (!b.HasTestSources(root + "/p")) t.Error("has tests");
+    ok := b.LoadTestPackage(root + "/p", root + "/.harness");
+    if (!ok) { t.Fatal("load failed: ", b.diags.items[0].message); }
+    text := b.root.files[0].text;
+    if (!util.Contains(text, "testing.RunTest(\"TestAdd\", tested.TestAdd);") || !util.Contains(text, "external.TestExt")) t.Error("harness: ", text);
+    util.RemoveAll(root);
+}
+
+func TestPaths(t *testing.T) {
+    if (!ValidModulePath("github.com/a/b") || ValidModulePath("a//b") || ValidModulePath("../x") || ValidModulePath("a b")) t.Error("valid path");
+    cwd := util.Getcwd();
+    if (RelativeSourcePath(cwd + "/x/y.oc") != "x/y.oc") t.Error("rel1 ", RelativeSourcePath(cwd + "/x/y.oc"));
+    if (RelativeSourcePath("./a.oc") != "a.oc") t.Error("rel2");
+    if (RelativeSourcePath(util.Dir(cwd) + "/z.oc") != "../z.oc") t.Error("rel3 ", RelativeSourcePath(util.Dir(cwd) + "/z.oc"));
+    if (!TargetSource("a.oc") || !TargetSource("a_native.oc") || TargetSource("a_wasm_test.oc")) t.Error("target");
+}

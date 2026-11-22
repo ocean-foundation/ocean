@@ -1,0 +1,828 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/legacy";
+
+// exprExpect checks n against destination type d (reporting at n).
+func exprExpect(c *Checker, n *ast.Node, d *ast.Type) bool {
+    expr(c, n, d);
+    return coerce(c, n, d, n);
+}
+
+// valueExpr checks n and defaults untyped results.
+func valueExpr(c *Checker, n *ast.Node) *ast.Type {
+    t := expr(c, n, zero(*ast.Type));
+    return defaultType(c, n, t);
+}
+
+// expr type-checks an expression with an optional contextual type.
+func expr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
+    t := expr1(c, n, expected);
+    if (nilT(t)) t = tInvalid;
+    n.ty = t;
+    return t;
+}
+
+func expr1(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
+    switch (n.kind) {
+    case ast.NK.IntLit:
+        if (!nilT(expected) && expected.kind == ast.TK.Int && litFits(intLiteral(c, n), expected.bits, expected.signed)) return expected;
+        if (!nilT(expected) && expected.kind == ast.TK.Float) return expected;
+        return tUntypedInt;
+    case ast.NK.FloatLit:
+        if (!nilT(expected) && expected.kind == ast.TK.Float) {
+            checkF32Literal(c, n, expected);
+            return expected;
+        }
+        return tUntypedFloat;
+    case ast.NK.StrLit: return tString;
+    case ast.NK.Null: return tNull;
+    case ast.NK.Ident: return identExpr(c, n);
+    case ast.NK.Blank: err(c, n, "cannot use _ as a value"); return tInvalid;
+    case ast.NK.Member: return memberExpr(c, n, expected);
+    case ast.NK.Unary: return unaryExpr(c, n, expected);
+    case ast.NK.Binary: return binaryExpr(c, n, expected);
+    case ast.NK.PostInc: return incExpr(c, n, n.a);
+    case ast.NK.Assign: return assignExpr(c, n);
+    case ast.NK.MultiAssign: multiAssign(c, n); return tVoid;
+    case ast.NK.Ternary: return ternaryExpr(c, n, expected);
+    case ast.NK.Comma:
+        t := tVoid;
+        for (_, x := range n.list) t = valueExpr(c, x);
+        return t;
+    case ast.NK.Call: return callExpr(c, n, expected);
+    case ast.NK.Index: return indexExpr(c, n);
+    case ast.NK.Slice: return sliceExpr(c, n);
+    case ast.NK.Assert: return assertExpr(c, n);
+    case ast.NK.TypeGuard: err(c, n, "Type guard is only valid in a type switch header"); return tInvalid;
+    case ast.NK.Inst: return instExpr(c, n);
+    case ast.NK.Composite: return compositeExpr(c, n, expected);
+    case ast.NK.Cast: return castExpr(c, n);
+    case ast.NK.FuncLit: return funcLit(c, n);
+    case ast.NK.ExternRef: err(c, n, "extern functions must be called with extern.name(...)"); return tInvalid;
+    case ast.NK.Zero: return zeroExpr(c, n);
+    case ast.NK.New: return newExpr(c, n);
+    case ast.NK.Make: return makeExpr(c, n);
+    case ast.NK.Sizeof: return sizeofExpr(c, n);
+    case ast.NK.TArray: return arrayAllocExpr(c, n);
+    case ast.NK.TBuffer: return bufferAllocExpr(c, n);
+    case ast.NK.TSlice:
+        err(c, n, "Array type expression requires a literal body");
+        return tInvalid;
+    case ast.NK.TPtr, ast.NK.TMap, ast.NK.TFunc, ast.NK.TVarint, ast.NK.TMixed, ast.NK.TInterface:
+        err(c, n, "a type is not a value; use T{...}, zero(T), or [n]T to construct one");
+        return tInvalid;
+    }
+    err(c, n, "invalid expression");
+    return tInvalid;
+}
+
+func checkF32Literal(c *Checker, n *ast.Node, t *ast.Type) {
+    if (t.bits != 32) return;
+    v := scanner.ParseF32(n.text);
+    if (v - v != 0.0->f32) err(c, n, "floating-point literal is out of range for f32");
+}
+
+// markCapture records closure capture of a local variable from an outer function.
+func markCapture(c *Checker, s *ast.Symbol) {
+    if (nilF(c.fn) || s.global || s.kind != ast.SK.Var) return;
+    if (s.depth >= c.fn.level) return;
+    s.captured = true;
+    for (f := c.fn; !nilF(f) && f.level > s.depth; f = f.outer) {
+        found := false;
+        for (_, x := range f.node.syms) { if (x == s) found = true; }
+        if (!found) f.node.syms.append(s);
+    }
+}
+
+func identExpr(c *Checker, n *ast.Node) *ast.Type {
+    s := lookup(c, n.name);
+    if (nilS(s)) { err(c, n, "unresolved name: " + n.name); return tInvalid; }
+    n.sym = s;
+    switch (s.kind) {
+    case ast.SK.Var:
+        if (s.global) { n.sem = ast.Sem.GlobalVar; return resolveSymType(c, s); }
+        n.sem = ast.Sem.LocalVar;
+        markCapture(c, s);
+        if (s.freed) err(c, n, "dynamic array has been freed; re-create it before use");
+        return s.ty;
+    case ast.SK.Func:
+        n.sem = ast.Sem.FuncValue;
+        resolveSymType(c, s);
+        if (len(s.typeParams) > 0) { err(c, n, "generic function requires explicit type arguments: " + n.name); return tInvalid; }
+        return s.ty;
+    case ast.SK.BuiltinFunc:
+        if (n.name == "true" || n.name == "false") { n.sem = ast.Sem.BuiltinName; return tBool; }
+        n.sem = ast.Sem.BuiltinName;
+        err(c, n, "builtin " + n.name + " must be called");
+        return tInvalid;
+    case ast.SK.Package:
+        n.sem = ast.Sem.PackageName;
+        err(c, n, "use of package " + n.name + " without selector");
+        return tInvalid;
+    case ast.SK.Extern:
+        err(c, n, "extern functions must be called with extern.name(...)");
+        return tInvalid;
+    }
+    n.sem = ast.Sem.TypeName;
+    n.tyAlt = symToType(c, n, s);
+    return n.tyAlt;
+}
+
+// typeOfExpr interprets an expression as a type name if it denotes one.
+func typeOfExpr(c *Checker, n *ast.Node) (*ast.Type, bool) {
+    switch (n.kind) {
+    case ast.NK.Ident:
+        if (n.name == "array" || n.name == "buffer") return resolveTypeOrFamily(c, n), true;
+        s := lookup(c, n.name);
+        if (nilS(s)) return tInvalid, false;
+        if (s.kind == ast.SK.BuiltinType || s.kind == ast.SK.Struct || s.kind == ast.SK.Enum || s.kind == ast.SK.Interface ||
+            s.kind == ast.SK.TypeDef || s.kind == ast.SK.Alias || s.kind == ast.SK.TypeParam) {
+            n.sym = s;
+            t := symToType(c, n, s);
+            n.sem = ast.Sem.TypeName; n.tyAlt = t;
+            return t, true;
+        }
+        return tInvalid, false;
+    case ast.NK.Member:
+        if (n.a.kind == ast.NK.Ident) {
+            ps := lookup(c, n.a.name);
+            if (!nilS(ps) && ps.kind == ast.SK.Package) {
+                s := ps.importPkg.scope.LookupLocal(n.name);
+                if (nilS(s)) return tInvalid, false;
+                if (s.kind == ast.SK.Struct || s.kind == ast.SK.Enum || s.kind == ast.SK.Interface || s.kind == ast.SK.TypeDef || s.kind == ast.SK.Alias) {
+                    if (!s.exported) return tInvalid, false;
+                    n.a.sym = ps; n.sym = s;
+                    t := symToType(c, n, s);
+                    n.sem = ast.Sem.TypeName; n.tyAlt = t;
+                    return t, true;
+                }
+            }
+        }
+        return tInvalid, false;
+    case ast.NK.Inst:
+        base := n.a;
+        if (base.kind == ast.NK.Ident && base.name == "array") return resolveTypeOrFamily(c, n), true;
+        if (base.kind == ast.NK.Ident || base.kind == ast.NK.Member) {
+            _, isType := typeOfExpr(c, base);
+            if (isType) {
+                t := resolveTypeOrFamily(c, n);
+                n.sem = ast.Sem.TypeName; n.tyAlt = t;
+                return t, true;
+            }
+        }
+        return tInvalid, false;
+    case ast.NK.TPtr, ast.NK.TArray, ast.NK.TSlice, ast.NK.TMixed, ast.NK.TMap, ast.NK.TFunc, ast.NK.TBuffer, ast.NK.TVarint, ast.NK.TInterface:
+        return resolveTypeOrFamily(c, n), true;
+    }
+    return tInvalid, false;
+}
+
+// ---- members ----
+
+func variantOf(c *Checker, t *ast.Type, name string) *ast.VariantInfo {
+    if (t.kind != ast.TK.Enum && t.kind != ast.TK.Family) return zero(*ast.VariantInfo);
+    vs := t.kind == ast.TK.Enum ? c.VariantsOf(t) : t.sym.variants;
+    if (t.kind == ast.TK.Family) resolveSymType(c, t.sym);
+    if (t.kind == ast.TK.Family) vs = t.sym.variants;
+    for (_, v := range vs) { if (v.name == name) return v; }
+    return zero(*ast.VariantInfo);
+}
+func nilV(v *ast.VariantInfo) bool { return (v -> int) == 0; }
+
+func checkVariantExport(c *Checker, n *ast.Node, t *ast.Type, name string) {
+    if (!nilS(t.sym) && !t.sym.builtin && t.sym.pkg != c.pkg && !scanner.IsExported(name)) err(c, n, "enum variant is not exported by its package");
+}
+
+func memberExpr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
+    // package member
+    if (n.a.kind == ast.NK.Ident) {
+        ps := lookup(c, n.a.name);
+        if (!nilS(ps) && ps.kind == ast.SK.Package) {
+            n.a.sym = ps; n.a.sem = ast.Sem.PackageName;
+            s := packageMember(c, n, ps.importPkg, n.name);
+            if (nilS(s)) return tInvalid;
+            n.sym = s;
+            n.sem = ast.Sem.PkgMember;
+            switch (s.kind) {
+            case ast.SK.Var: return resolveSymType(c, s);
+            case ast.SK.Func:
+                resolveSymType(c, s);
+                if (len(s.typeParams) > 0) { err(c, n, "generic function requires explicit type arguments: " + n.name); return tInvalid; }
+                return s.ty;
+            }
+            n.sem = ast.Sem.TypeName;
+            n.tyAlt = symToType(c, n, s);
+            return n.tyAlt;
+        }
+    }
+    // enum variant through a type
+    et, isType := typeOfExpr(c, n.a);
+    if (isType) {
+        if (et.kind != ast.TK.Enum && et.kind != ast.TK.Family) { err(c, n, "type has no enum variants"); return tInvalid; }
+        if (et.kind == ast.TK.Family && et.sym.kind != ast.SK.Enum) { err(c, n, "type has no enum variants"); return tInvalid; }
+        v := variantOf(c, et, n.name);
+        if (nilV(v)) { err(c, n, "unknown enum variant: " + n.name); return tInvalid; }
+        checkVariantExport(c, n, et, n.name);
+        n.ival = v.index;
+        n.tyAlt = et;
+        if (et.kind == ast.TK.Family && !nilT(expected) && expected.kind == ast.TK.Enum && expected.sym == et.sym) et = expected;
+        if (v.vkind == 0 || v.vkind == 3) {
+            if (et.kind == ast.TK.Family) {
+                n.sem = ast.Sem.EnumSelector;
+                return et;
+            }
+            n.sem = v.vkind == 0 ? ast.Sem.EnumUnit : ast.Sem.EnumFixed;
+            n.tyAlt = et;
+            return et;
+        }
+        n.sem = ast.Sem.EnumSelector;
+        return et;
+    }
+    t := valueExpr(c, n.a);
+    if (t.kind == ast.TK.Invalid) return tInvalid;
+    base := t;
+    for (base.kind == ast.TK.Ptr && base.elem.kind == ast.TK.Ptr) base = base.elem;
+    if (base.kind == ast.TK.Ptr) base = base.elem;
+    if (base.kind == ast.TK.Null) { err(c, n, "null needs a typed pointer before member access"); return tInvalid; }
+    b := Underlying(base);
+    // builtin collection fields
+    if (b.kind == ast.TK.Dyn || b.kind == ast.TK.String) {
+        if (n.name == "length" || (n.name == "capacity") || n.name == "size") {
+            n.sem = n.name == "length" ? ast.Sem.ArrayLength : (n.name == "capacity" ? ast.Sem.ArrayCapacity : ast.Sem.ArraySize);
+            return tInt;
+        }
+        if (n.name == "data") { n.sem = ast.Sem.ArrayData; return BufferOf(b.kind == ast.TK.String ? tI8 : b.elem, -2); }
+        if (n.name == "append" || n.name == "prepend" || n.name == "add" || n.name == "remove" || n.name == "pop" || n.name == "array") {
+            n.sem = ast.Sem.Method; n.text = n.name; return tVoid;
+        }
+    }
+    if (b.kind == ast.TK.Dyn || b.kind == ast.TK.String) { err(c, n, "array only has size and data fields: " + n.name); return tInvalid; }
+    if (b.kind == ast.TK.Array) {
+        if (n.name == "size") { n.sem = ast.Sem.ArraySize; return tInt; }
+        if (n.name == "data") { n.sem = ast.Sem.ArrayData; return BufferOf(b.elem, -2); }
+        err(c, n, "array only has size and data fields: " + n.name);
+        return tInvalid;
+    }
+    if (b.kind == ast.TK.Buffer) { err(c, n, "buffer has no members"); return tInvalid; }
+    if (b.kind == ast.TK.Struct) {
+        fs := c.FieldsOf(b);
+        for (i, f := range fs) {
+            if (f.name == n.name) {
+                n.sem = f.bits > 0 ? ast.Sem.BitField : ast.Sem.Field;
+                n.ival = i;
+                return f.ty;
+            }
+        }
+    }
+    if (base.kind == ast.TK.Struct && base.sym.local == false && !nilS(base.sym) && base.sym.node.kind == ast.NK.Variant) {
+        // record payload snapshot
+    }
+    // methods
+    if (base.kind == ast.TK.Struct || base.kind == ast.TK.Enum || base.kind == ast.TK.Named) {
+        m := c.FindMethod(base, n.name);
+        if (m.ok) {
+            if (!m.sym.exported && !m.sym.builtin && m.sym.pkg != c.pkg) { err(c, n, "method is not exported by its package"); }
+            n.sem = ast.Sem.Method; n.sym = m.sym;
+            return m.ty;
+        }
+    }
+    if (base.kind == ast.TK.Interface) {
+        for (_, m := range methodsOf(c, base)) {
+            if (m.name == n.name) { n.sem = ast.Sem.IfaceMethod; n.text = n.name; return m.ty; }
+        }
+        err(c, n, "interface has no such method: " + n.name);
+        return tInvalid;
+    }
+    if (base.kind == ast.TK.Param) {
+        cons := base.sym.constraint;
+        if (!nilT(cons) && cons.kind == ast.TK.Interface) {
+            for (_, m := range methodsOf(c, cons)) {
+                if (m.name == n.name) { n.sem = ast.Sem.IfaceMethod; n.text = n.name; return m.ty; }
+            }
+        }
+        if (!nilT(cons) && (cons.kind == ast.TK.Struct || cons.kind == ast.TK.Family)) {
+            err(c, n, "narrow a generic family to concrete type arguments before member access");
+            return tInvalid;
+        }
+    }
+    if (base.kind == ast.TK.Enum) {
+        err(c, n, "extract a concrete enum variant before accessing its payload");
+        return tInvalid;
+    }
+    if (base.kind == ast.TK.Family) { err(c, n, "narrow a generic family to concrete type arguments before member access"); return tInvalid; }
+    err(c, n, "unknown field: " + n.name);
+    return tInvalid;
+}
+
+// ---- unary / binary ----
+
+func isUntyped(t *ast.Type) bool { return t.kind == ast.TK.UntypedInt || t.kind == ast.TK.UntypedFloat; }
+
+func unaryExpr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
+    switch (n.op) {
+    case scanner.Kind.Minus:
+        lit := intLiteral(c, n);
+        if (lit.ok) {
+            expr(c, n.a, zero(*ast.Type));
+            if (!nilT(expected) && expected.kind == ast.TK.Int && litFits(lit, expected.bits, expected.signed)) { setLitType(c, n.a, expected); return expected; }
+            if (!nilT(expected) && expected.kind == ast.TK.Float) { setLitType(c, n.a, expected); return expected; }
+            return tUntypedInt;
+        }
+        t := expr(c, n.a, expected);
+        if (t.kind == ast.TK.UntypedInt) {
+            if (!nilT(expected) && expected.kind == ast.TK.Int && litFits(intLiteral(c, n), expected.bits, expected.signed)) { setLitType(c, n.a, expected); return expected; }
+            if (!nilT(expected) && expected.kind == ast.TK.Float) { setLitType(c, n.a, expected); return expected; }
+            return tUntypedInt;
+        }
+        if (t.kind == ast.TK.UntypedFloat) return tUntypedFloat;
+        if (!numericOp(c, t)) { err(c, n, "invalid unary operand"); return tInvalid; }
+        return t;
+    case scanner.Kind.Bang:
+        t := valueExpr(c, n.a);
+        if (Underlying(t).kind != ast.TK.Bool && t.kind != ast.TK.Invalid) { err(c, n, "invalid unary operand"); return tInvalid; }
+        return t;
+    case scanner.Kind.Tilde:
+        t := valueExpr(c, n.a);
+        if (!integerOp(c, t)) { err(c, n, "operator requires integer operands"); return tInvalid; }
+        return t;
+    case scanner.Kind.Star:
+        t := valueExpr(c, n.a);
+        if (t.kind == ast.TK.Invalid) return t;
+        if (t.kind != ast.TK.Ptr) { err(c, n, "cannot dereference value"); return tInvalid; }
+        if (t.elem.kind == ast.TK.Void) { err(c, n, "cast a void pointer to a concrete pointer type before dereferencing"); return tInvalid; }
+        return t.elem;
+    case scanner.Kind.Amp:
+        t := valueExpr(c, n.a);
+        if (t.kind == ast.TK.Invalid) return t;
+        checkAddressable(c, n.a, true);
+        return PtrTo(t);
+    case scanner.Kind.PlusPlus, scanner.Kind.MinusMinus:
+        return incExpr(c, n, n.a);
+    }
+    err(c, n, "invalid unary operand");
+    return tInvalid;
+}
+
+func incExpr(c *Checker, n *ast.Node, target *ast.Node) *ast.Type {
+    t := valueExpr(c, target);
+    if (t.kind == ast.TK.Invalid) return t;
+    checkWritable(c, target, "increment requires a writable value");
+    if (t.kind == ast.TK.Ptr && t.elem.kind != ast.TK.Void) return t;
+    if (!numericOp(c, t)) { err(c, n, "increment requires a writable value"); return tInvalid; }
+    return t;
+}
+
+// termsOf yields the concrete types an operand may take (itself when concrete).
+func operandTerms(c *Checker, t *ast.Type) []*ast.Type {
+    if (t.kind == ast.TK.Param || t.kind == ast.TK.Union) return constraintTerms(c, t);
+    out := make([]*ast.Type);
+    out.append(t);
+    return out;
+}
+
+func allTerms(c *Checker, t *ast.Type, pred func(*ast.Type) bool) bool {
+    terms := operandTerms(c, t);
+    if (len(terms) == 0) return false;
+    for (_, x := range terms) { if (!pred(Underlying(x))) return false; }
+    return true;
+}
+func numericOp(c *Checker, t *ast.Type) bool {
+    if (t.kind == ast.TK.Invalid || isUntyped(t)) return true;
+    return allTerms(c, t, func(x *ast.Type) bool { return x.kind == ast.TK.Int || x.kind == ast.TK.Float; });
+}
+func integerOp(c *Checker, t *ast.Type) bool {
+    if (t.kind == ast.TK.Invalid || t.kind == ast.TK.UntypedInt) return true;
+    return allTerms(c, t, func(x *ast.Type) bool { return x.kind == ast.TK.Int; });
+}
+
+func isCompare(op scanner.Kind) bool { return op == scanner.Kind.EqEq || op == scanner.Kind.NotEq; }
+func isOrder(op scanner.Kind) bool { return op == scanner.Kind.Lt || op == scanner.Kind.LtEq || op == scanner.Kind.Gt || op == scanner.Kind.GtEq; }
+func isArith(op scanner.Kind) bool { return op == scanner.Kind.Plus || op == scanner.Kind.Minus || op == scanner.Kind.Star || op == scanner.Kind.Slash; }
+func isIntOp(op scanner.Kind) bool {
+    return op == scanner.Kind.Percent || op == scanner.Kind.Shl || op == scanner.Kind.Shr || op == scanner.Kind.Amp || op == scanner.Kind.Pipe || op == scanner.Kind.Caret;
+}
+
+func fixedInt(bits int, signed bool) *ast.Type {
+    if (signed) {
+        if (bits == 8) return tI8; if (bits == 16) return tI16; if (bits == 32) return tI32; if (bits == 64) return tInt;
+    } else {
+        if (bits == 8) return tU8; if (bits == 16) return tU16; if (bits == 32) return tU32; if (bits == 64) return tUint;
+    }
+    return varintType(bits, signed);
+}
+
+// NumericResult implements §9.2 result typing for concrete operands. nil if invalid.
+func (c *Checker) NumericResult(a *ast.Type, b *ast.Type) *ast.Type {
+    if (a.kind == ast.TK.Named || b.kind == ast.TK.Named) {
+        if (Identical(a, b)) return a;
+        return zero(*ast.Type);
+    }
+    if (a.kind == ast.TK.Float || b.kind == ast.TK.Float) {
+        if (a.kind == ast.TK.Float && b.kind == ast.TK.Float) return a.bits == b.bits ? a : tFloat;
+        if (a.kind == ast.TK.Float && b.kind == ast.TK.Int) return a;
+        if (b.kind == ast.TK.Float && a.kind == ast.TK.Int) return b;
+        return zero(*ast.Type);
+    }
+    if (a.kind != ast.TK.Int || b.kind != ast.TK.Int) return zero(*ast.Type);
+    if (Identical(a, b)) return a;
+    if (a.signed == b.signed) {
+        if (a.bits > b.bits) return a;
+        if (b.bits > a.bits) return b;
+        return a.varw ? b : a;
+    }
+    s := a.signed ? a : b;
+    u := a.signed ? b : a;
+    w := s.bits > u.bits ? s.bits : u.bits;
+    if (s.varw && u.varw) {
+        w = s.bits;
+        if (u.bits + 1 > w) w = u.bits + 1;
+        if (w > 8388608) return tInvalid;
+    } else if (!s.varw && !u.varw) {
+        return fixedInt(w, true);
+    } else if (u.varw && !s.varw && s.bits >= u.bits) {
+        return s;
+    }
+    if (s.bits == w) return s;
+    return fixedInt(w, true);
+}
+
+// unifyLiteral gives an untyped literal operand the other operand's type when it fits.
+func unifyLiteral(c *Checker, lit *ast.Node, other *ast.Type) *ast.Type {
+    if (lit.ty.kind == ast.TK.UntypedInt) {
+        o := other;
+        if (o.kind == ast.TK.Param) {
+            terms := constraintTerms(c, o);
+            ok := len(terms) > 0;
+            for (_, term := range terms) {
+                u := Underlying(term);
+                if (u.kind == ast.TK.Int && !litFits(intLiteral(c, lit), u.bits, u.signed)) ok = false;
+                if (u.kind != ast.TK.Int && u.kind != ast.TK.Float) ok = false;
+            }
+            if (ok) { setLitType(c, lit, o); return o; }
+            return defaultType(c, lit, lit.ty);
+        }
+        if (o.kind == ast.TK.Int && litFits(intLiteral(c, lit), o.bits, o.signed)) { setLitType(c, lit, o); return o; }
+        if (o.kind == ast.TK.Float) { setLitType(c, lit, o); return o; }
+        if (o.kind == ast.TK.String) {
+            if (litFits(intLiteral(c, lit), 8, true)) { setLitType(c, lit, tI8); return tI8; }
+        }
+        if (o.kind == ast.TK.Dyn || o.kind == ast.TK.Array) {
+            e := o.elem;
+            if (e.kind == ast.TK.Int && litFits(intLiteral(c, lit), e.bits, e.signed)) { setLitType(c, lit, e); return e; }
+        }
+        if (o.kind == ast.TK.Ptr) { setLitType(c, lit, tInt); return tInt; }
+        return defaultType(c, lit, lit.ty);
+    }
+    if (lit.ty.kind == ast.TK.UntypedFloat) {
+        if (other.kind == ast.TK.Float) { setLitType(c, lit, tFloat); return tFloat; }
+        if (other.kind == ast.TK.Param) { setLitType(c, lit, other); return other; }
+        return defaultType(c, lit, lit.ty);
+    }
+    return lit.ty;
+}
+
+func binaryExpr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
+    op := n.op;
+    if (op == scanner.Kind.AndAnd || op == scanner.Kind.OrOr) {
+        a := valueExpr(c, n.a); b := valueExpr(c, n.b);
+        if ((Underlying(a).kind != ast.TK.Bool && a.kind != ast.TK.Invalid) || (Underlying(b).kind != ast.TK.Bool && b.kind != ast.TK.Invalid)) { err(c, n, "invalid operands"); return tInvalid; }
+        return a;
+    }
+    ta := expr(c, n.a, zero(*ast.Type));
+    tb := expr(c, n.b, zero(*ast.Type));
+    if (ta.kind == ast.TK.Invalid || tb.kind == ast.TK.Invalid) return isCompare(op) || isOrder(op) ? tBool : tInvalid;
+    // literal unification
+    if (isUntyped(ta) && isUntyped(tb)) {
+        if (ta.kind == ast.TK.UntypedFloat || tb.kind == ast.TK.UntypedFloat) {
+            ta = unifyLiteral(c, n.a, tFloat); tb = unifyLiteral(c, n.b, tFloat);
+        } else { ta = defaultType(c, n.a, ta); tb = defaultType(c, n.b, tb); }
+    } else if (isUntyped(ta)) ta = unifyLiteral(c, n.a, tb);
+    else if (isUntyped(tb)) tb = unifyLiteral(c, n.b, ta);
+    return binaryTypes(c, n, op, ta, tb);
+}
+
+func isEnumSelector(c *Checker, n *ast.Node) bool { return n.kind == ast.NK.Member && n.sem == ast.Sem.EnumSelector || (n.kind == ast.NK.Member && (n.sem == ast.Sem.EnumUnit || n.sem == ast.Sem.EnumFixed) && !nilT(n.tyAlt)); }
+
+func binaryTypes(c *Checker, n *ast.Node, op scanner.Kind, ta *ast.Type, tb *ast.Type) *ast.Type {
+    if (isCompare(op)) {
+        if (!comparable(c, n, ta, tb)) { err(c, n, "invalid operands"); }
+        return tBool;
+    }
+    // type-list (boxed) operands
+    if (ta.kind == ast.TK.Union || tb.kind == ast.TK.Union) return unionBinary(c, n, op, ta, tb);
+    if (ta.kind == ast.TK.Param || tb.kind == ast.TK.Param) return paramBinary(c, n, op, ta, tb);
+    ua := Underlying(ta); ub := Underlying(tb);
+    if (isOrder(op)) {
+        if (ua.kind == ast.TK.String && ub.kind == ast.TK.String) return tBool;
+        if (IsNumeric(ua) && IsNumeric(ub) && !nilT(c.NumericResult(ta, tb))) return tBool;
+        err(c, n, "invalid operands");
+        return tBool;
+    }
+    if (op == scanner.Kind.Plus) {
+        if (ua.kind == ast.TK.String && ub.kind == ast.TK.String) return tString;
+        if (ua.kind == ast.TK.String && ub.kind == ast.TK.Int && ub.bits == 8 && ub.signed) return tString;
+        if (ub.kind == ast.TK.String && ua.kind == ast.TK.Int && ua.bits == 8 && ua.signed) return tString;
+        if (ta.kind == ast.TK.Ptr && ua.kind == ast.TK.Ptr && ub.kind == ast.TK.Int) { ptrArith(c, n, ta); return ta; }
+        if (tb.kind == ast.TK.Ptr && ub.kind == ast.TK.Int && ua.kind == ast.TK.Int) { ptrArith(c, n, tb); return tb; }
+        r := collectionAdd(c, n, ta, tb);
+        if (!nilT(r)) return r;
+    }
+    if (op == scanner.Kind.Minus) {
+        if (ta.kind == ast.TK.Ptr && ub.kind == ast.TK.Int) { ptrArith(c, n, ta); return ta; }
+        if (ta.kind == ast.TK.Ptr && tb.kind == ast.TK.Ptr) {
+            if (!Identical(ta, tb)) err(c, n, "invalid pointer arithmetic operands");
+            ptrArith(c, n, ta);
+            return tInt;
+        }
+    }
+    if (isArith(op)) {
+        if (!IsNumeric(ua) || !IsNumeric(ub)) { err(c, n, "invalid operands"); return tInvalid; }
+        r := c.NumericResult(ta, tb);
+        if (nilT(r)) { err(c, n, "invalid operands"); return tInvalid; }
+        if (r.kind == ast.TK.Invalid) { err(c, n, "mixed signed and unsigned integers need a result wider than 8388608 bits; use an explicit -> cast"); }
+        return r;
+    }
+    if (isIntOp(op)) {
+        if (ua.kind != ast.TK.Int || ub.kind != ast.TK.Int) { err(c, n, "operator requires integer operands"); return tInvalid; }
+        r := c.NumericResult(ta, tb);
+        if (nilT(r)) { err(c, n, "invalid operands"); return tInvalid; }
+        if (op == scanner.Kind.Shl || op == scanner.Kind.Shr) return r;
+        return r;
+    }
+    err(c, n, "invalid operands");
+    return tInvalid;
+}
+
+func ptrArith(c *Checker, n *ast.Node, p *ast.Type) {
+    if (p.elem.kind == ast.TK.Void) err(c, n, "invalid pointer arithmetic operands");
+}
+
+// collectionAdd types array/dynamic-array concatenation (§9.3.3).
+func collectionAdd(c *Checker, n *ast.Node, ta *ast.Type, tb *ast.Type) *ast.Type {
+    if (ta.kind == ast.TK.Dyn && tb.kind == ast.TK.Dyn && Identical(ta, tb)) return ta;
+    if (ta.kind == ast.TK.Dyn && c.Assignable(tb, ta.elem)) return ta;
+    if (tb.kind == ast.TK.Dyn && c.Assignable(ta, tb.elem)) return tb;
+    if (ta.kind == ast.TK.Array && tb.kind == ast.TK.Array && Identical(ta.elem, tb.elem)) {
+        if (ta.len >= 0 && tb.len >= 0) return ArrayOf(ta.elem, ta.len + tb.len);
+        return ArrayOf(ta.elem, -2);
+    }
+    if (ta.kind == ast.TK.Array && c.Assignable(tb, ta.elem)) return ta.len >= 0 ? ArrayOf(ta.elem, ta.len + 1) : ArrayOf(ta.elem, -2);
+    if (tb.kind == ast.TK.Array && c.Assignable(ta, tb.elem)) return tb.len >= 0 ? ArrayOf(tb.elem, tb.len + 1) : ArrayOf(tb.elem, -2);
+    if (ta.kind == ast.TK.Dyn || ta.kind == ast.TK.Array || tb.kind == ast.TK.Dyn || tb.kind == ast.TK.Array) {
+        err(c, n, "array addition requires matching arrays or a compatible element");
+        return tInvalid;
+    }
+    if (ta.kind == ast.TK.Buffer && tb.kind == ast.TK.Buffer) { err(c, n, "invalid operands"); return tInvalid; }
+    return zero(*ast.Type);
+}
+
+// paramBinary checks an operator over generic operands for every admitted type.
+func paramBinary(c *Checker, n *ast.Node, op scanner.Kind, ta *ast.Type, tb *ast.Type) *ast.Type {
+    same := ta.kind == ast.TK.Param && tb.kind == ast.TK.Param && ta.sym == tb.sym;
+    termsA := operandTerms(c, ta); termsB := operandTerms(c, tb);
+    if (len(termsA) == 0 || len(termsB) == 0) { err(c, n, "operator is not supported by every possible operand type"); return tInvalid; }
+    for (i, x := range termsA) {
+        for (j, y := range termsB) {
+            if (same && i != j) continue;
+            if (!validConcreteOp(c, op, x, y)) { err(c, n, "operator is not supported by every possible operand type"); return tInvalid; }
+        }
+    }
+    if (isOrder(op)) return tBool;
+    if (same) return ta;
+    if (ta.kind == ast.TK.Param && tb.kind != ast.TK.Param) return ta;
+    if (tb.kind == ast.TK.Param && ta.kind != ast.TK.Param) return tb;
+    return ta;
+}
+
+func validConcreteOp(c *Checker, op scanner.Kind, x *ast.Type, y *ast.Type) bool {
+    ux := Underlying(x); uy := Underlying(y);
+    if (isOrder(op)) return (ux.kind == ast.TK.String && uy.kind == ast.TK.String) || (IsNumeric(ux) && IsNumeric(uy));
+    if (op == scanner.Kind.Plus && ux.kind == ast.TK.String && uy.kind == ast.TK.String) return true;
+    if (isArith(op)) return IsNumeric(ux) && IsNumeric(uy) && !nilT(c.NumericResult(x, y));
+    if (isIntOp(op)) return ux.kind == ast.TK.Int && uy.kind == ast.TK.Int;
+    return false;
+}
+
+// unionBinary types an operator over boxed type-list values (§7.3).
+func unionBinary(c *Checker, n *ast.Node, op scanner.Kind, ta *ast.Type, tb *ast.Type) *ast.Type {
+    termsA := operandTerms(c, ta); termsB := operandTerms(c, tb);
+    results := make([]*ast.Type);
+    anyResult := false;
+    for (_, x := range termsA) {
+        for (_, y := range termsB) {
+            if (!validConcreteOp(c, op, x, y)) { err(c, n, "operator is not supported by every possible operand type"); return tInvalid; }
+            r := tBool;
+            if (!isOrder(op)) {
+                if (Underlying(x).kind == ast.TK.String) r = tString;
+                else r = c.NumericResult(x, y);
+            }
+            if (r.kind == ast.TK.Named || r.kind == ast.TK.Array) anyResult = true;
+            dup := false;
+            for (_, q := range results) { if (Identical(q, r)) dup = true; }
+            if (!dup) results.append(r);
+        }
+    }
+    if (isOrder(op)) return tBool;
+    if (anyResult) return tAny;
+    if (len(results) == 1) return results[0];
+    u := ast.NewType(ast.TK.Union);
+    for (_, r := range results) { u.terms.append(r); u.tilde.append(false); }
+    return u;
+}
+
+// comparable checks ==/!= operand compatibility (§9.3).
+func comparable(c *Checker, n *ast.Node, ta *ast.Type, tb *ast.Type) bool {
+    if (Identical(ta, tb)) return true;
+    if (ta.kind == ast.TK.Null) return tb.kind == ast.TK.Ptr || tb.kind == ast.TK.Interface || IsOptional(tb) || tb.kind == ast.TK.Buffer || tb.kind == ast.TK.Union || tb.kind == ast.TK.Param || tb.kind == ast.TK.Null;
+    if (tb.kind == ast.TK.Null) return ta.kind == ast.TK.Ptr || ta.kind == ast.TK.Interface || IsOptional(ta) || ta.kind == ast.TK.Buffer || ta.kind == ast.TK.Union || ta.kind == ast.TK.Param;
+    if (ta.kind == ast.TK.Enum || tb.kind == ast.TK.Enum || ta.kind == ast.TK.Family || tb.kind == ast.TK.Family) {
+        ea := ta; eb := tb;
+        if (ea.kind == ast.TK.Family || eb.kind == ast.TK.Family) {
+            if (ea.sym != eb.sym) { err(c, n, "cannot compare variants from different enum types"); return true; }
+            return true;
+        }
+        if (ea.kind == ast.TK.Enum && eb.kind == ast.TK.Enum) {
+            if (ea.sym != eb.sym) { err(c, n, "cannot compare variants from different enum types"); return true; }
+            err(c, n, "cannot compare different enum specializations");
+            return true;
+        }
+        return false;
+    }
+    ua := Underlying(ta); ub := Underlying(tb);
+    if (IsNumeric(ua) && IsNumeric(ub)) {
+        if (ta.kind == ast.TK.Named || tb.kind == ast.TK.Named) return Identical(ta, tb);
+        return !nilT(c.NumericResult(ta, tb));
+    }
+    if (ta.kind == ast.TK.Ptr && tb.kind == ast.TK.Ptr) return IsVoidPtr(ta) || IsVoidPtr(tb);
+    if ((ta.kind == ast.TK.Ptr && tb.kind == ast.TK.Buffer) || (tb.kind == ast.TK.Ptr && ta.kind == ast.TK.Buffer)) return IsVoidPtr(ta) || IsVoidPtr(tb);
+    if (ta.kind == ast.TK.Interface || tb.kind == ast.TK.Interface || ta.kind == ast.TK.Union || tb.kind == ast.TK.Union) {
+        if (ta.kind == ast.TK.Interface || ta.kind == ast.TK.Union) return c.Assignable(tb, ta) || tb.kind == ast.TK.Interface || tb.kind == ast.TK.Union;
+        return c.Assignable(ta, tb);
+    }
+    if (ta.kind == ast.TK.Param || tb.kind == ast.TK.Param) return ta.kind == tb.kind ? ta.sym == tb.sym : true;
+    if ((ua.kind == ast.TK.String || (ua.kind == ast.TK.Dyn && Identical(ua.elem, tI8))) && (ub.kind == ast.TK.String || (ub.kind == ast.TK.Dyn && Identical(ub.elem, tI8)))) return true;
+    if ((ua.kind == ast.TK.Array || ua.kind == ast.TK.Dyn) && (ub.kind == ast.TK.Array || ub.kind == ast.TK.Dyn)) return Identical(ua.elem, ub.elem);
+    if (ua.kind == ast.TK.Buffer && ub.kind == ast.TK.Buffer) return !nilT(ua.elem) && !nilT(ub.elem) && Identical(ua.elem, ub.elem);
+    return false;
+}
+
+func ternaryExpr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
+    ct := valueExpr(c, n.a);
+    if (Underlying(ct).kind != ast.TK.Bool && ct.kind != ast.TK.Invalid) err(c, n.a, "type mismatch: expected bool, got " + TypeString(ct));
+    ta := expr(c, n.b, expected);
+    tb := expr(c, n.c, expected);
+    if (ta.kind == ast.TK.Null && tb.kind != ast.TK.Null) { coerce(c, n.b, tb, n.b); return defaultType(c, n.c, tb); }
+    if (isUntyped(ta) && !isUntyped(tb)) { coerce(c, n.b, tb, n.b); return tb; }
+    if (isUntyped(ta) && isUntyped(tb)) {
+        if (!nilT(expected) && (expected.kind == ast.TK.Int || expected.kind == ast.TK.Float)) { coerce(c, n.b, expected, n.b); coerce(c, n.c, expected, n.c); return expected; }
+        if (ta.kind == ast.TK.UntypedFloat || tb.kind == ast.TK.UntypedFloat) { coerce(c, n.b, tFloat, n.b); coerce(c, n.c, tFloat, n.c); return tFloat; }
+        ta = defaultType(c, n.b, ta);
+        tb = defaultType(c, n.c, tb);
+        if (!Identical(ta, tb)) {
+            r := c.NumericResult(ta, tb);
+            if (!nilT(r)) { return r; }
+        }
+        return ta;
+    }
+    ta = defaultType(c, n.b, ta);
+    if (IsVoidPtr(ta) || IsVoidPtr(tb)) {
+        if ((ta.kind == ast.TK.Ptr || ta.kind == ast.TK.Buffer) && (tb.kind == ast.TK.Ptr || tb.kind == ast.TK.Buffer)) return tVoidPtr;
+    }
+    coerce(c, n.c, ta, n.c);
+    return ta;
+}
+
+// ---- writability ----
+
+func rootSym(c *Checker, n *ast.Node) *ast.Symbol {
+    for (;;) {
+        if (n.kind == ast.NK.Ident) return n.sym;
+        if (n.kind == ast.NK.Member || n.kind == ast.NK.Index) { n = n.a; continue; }
+        return zero(*ast.Symbol);
+    }
+    return zero(*ast.Symbol);
+}
+
+// checkWritable verifies an assignment target (§10.2).
+func checkWritable(c *Checker, n *ast.Node, msg string) bool {
+    switch (n.kind) {
+    case ast.NK.Ident:
+        if (n.sem == ast.Sem.LocalVar || n.sem == ast.Sem.GlobalVar) return true;
+        err(c, n, msg); return false;
+    case ast.NK.Blank: return true;
+    case ast.NK.Member:
+        if (n.sem == ast.Sem.PkgMember && !nilS(n.sym) && n.sym.kind == ast.SK.Var) return true;
+        if (n.sem == ast.Sem.Field || n.sem == ast.Sem.BitField) {
+            bt := n.a.ty;
+            if (!nilT(bt) && bt.kind == ast.TK.Ptr) bt = bt.elem;
+            if (!nilT(bt)) {
+                u := Underlying(bt);
+                if (u.kind == ast.TK.Struct) {
+                    fs := c.FieldsOf(u);
+                    if (n.ival < len(fs) && fs[n.ival].valueParam) { err(c, n, "cannot modify immutable struct parameter or field"); return false; }
+                    if (!nilS(u.sym) && u.sym.immutable) { err(c, n, "cannot modify immutable struct parameter or field"); return false; }
+                }
+            }
+            if (!nilT(n.a.ty) && n.a.ty.kind == ast.TK.Ptr) return true;
+            return checkWritable(c, n.a, msg);
+        }
+        if (n.sem == ast.Sem.ArrayData) return true;
+        if (n.sem == ast.Sem.ArrayLength || n.sem == ast.Sem.ArrayCapacity || n.sem == ast.Sem.ArraySize) { err(c, n, "cannot modify immutable struct parameter or field"); return false; }
+        err(c, n, msg); return false;
+    case ast.NK.Index:
+        at := n.a.ty;
+        if (!nilT(at) && Underlying(at).kind == ast.TK.String) { err(c, n, "strings are immutable; reassign the string instead"); return false; }
+        if (!nilT(at) && (at.kind == ast.TK.Buffer || at.kind == ast.TK.Map)) return true;
+        if (!nilT(at) && at.kind == ast.TK.Ptr) return true;
+        return checkWritable(c, n.a, msg);
+    case ast.NK.Unary:
+        if (n.op == scanner.Kind.Star) return true;
+    }
+    err(c, n, msg);
+    return false;
+}
+
+func checkAddressable(c *Checker, n *ast.Node, mutable bool) bool {
+    switch (n.kind) {
+    case ast.NK.Ident: return true;
+    case ast.NK.Member:
+        if (n.sem == ast.Sem.BitField) { err(c, n, "cannot take the address of a bitfield"); return false; }
+        if (n.sem == ast.Sem.ArrayData) { err(c, n, "array.data is inline storage; use array.data directly as its buffer address"); return false; }
+        if (n.sem == ast.Sem.ArraySize || n.sem == ast.Sem.ArrayLength || n.sem == ast.Sem.ArrayCapacity) { err(c, n, "cannot take a mutable address of an immutable struct parameter or field"); return false; }
+        if (n.sem == ast.Sem.Field) {
+            bt := n.a.ty;
+            if (!nilT(bt) && bt.kind == ast.TK.Ptr) bt = bt.elem;
+            if (!nilT(bt) && Underlying(bt).kind == ast.TK.Struct) {
+                fs := c.FieldsOf(Underlying(bt));
+                if (n.ival < len(fs) && fs[n.ival].valueParam) { err(c, n, "cannot take a mutable address of an immutable struct parameter or field"); return false; }
+            }
+            return true;
+        }
+        if (n.sem == ast.Sem.PkgMember) return true;
+        return true;
+    case ast.NK.Index:
+        at := n.a.ty;
+        if (!nilT(at) && at.kind == ast.TK.Map) { err(c, n, "cannot take the address of a map entry"); return false; }
+        if (!nilT(at) && Underlying(at).kind == ast.TK.String) { err(c, n, "string data is read-only; copy to i8[] for mutable access"); return false; }
+        return true;
+    case ast.NK.Unary: return n.op == scanner.Kind.Star;
+    }
+    return true;
+}
+
+// ---- instantiation as expression ----
+
+func instExpr(c *Checker, n *ast.Node) *ast.Type {
+    // generic function value f<int> or pkg.f<int>
+    fs := zero(*ast.Symbol);
+    if (n.a.kind == ast.NK.Ident) {
+        s := lookup(c, n.a.name);
+        if (!nilS(s) && s.kind == ast.SK.Func) fs = s;
+    } else if (n.a.kind == ast.NK.Member && n.a.a.kind == ast.NK.Ident) {
+        ps := lookup(c, n.a.a.name);
+        if (!nilS(ps) && ps.kind == ast.SK.Package) {
+            s := ps.importPkg.scope.LookupLocal(n.a.name);
+            if (!nilS(s) && s.kind == ast.SK.Func) {
+                if (!s.exported) diagPkg(c, n.a, "declaration " + n.a.name + " is not exported by package " + n.a.a.name);
+                n.a.a.sym = ps; fs = s;
+            }
+        }
+    }
+    if (!nilS(fs)) {
+        resolveSymType(c, fs);
+        n.a.sym = fs;
+        n.sym = fs;
+        args := typeArgsOf(c, n.list);
+        if (len(args) != len(fs.typeParams)) { err(c, n, "type argument count mismatch"); return tInvalid; }
+        for (i, a := range args) {
+            if (!satisfies(c, a, fs.typeParams[i].constraint)) { err(c, n, "type argument does not satisfy its constraint"); return tInvalid; }
+        }
+        n.targs = args;
+        n.sem = ast.Sem.FuncValue;
+        return Subst(fs.ty, makeEnv(fs.typeParams, args));
+    }
+    t, isType := typeOfExpr(c, n);
+    if (isType) {
+        n.sem = ast.Sem.TypeName; n.tyAlt = t;
+        return t;
+    }
+    err(c, n, "value cannot be instantiated");
+    return tInvalid;
+}
+
+// legacyIndexType reports T[n] on a user-defined type in an expression.
+func legacyIndexType(c *Checker, n *ast.Node) bool {
+    if (n.a.kind != ast.NK.Ident && n.a.kind != ast.NK.Member) return false;
+    _, isType := typeOfExpr(c, n.a);
+    if (!isType) return false;
+    toks := n.src.tokens;
+    start := -1;
+    for (i, t := range toks) { if (t.off == n.a.off) { start = i; break; } }
+    if (start >= 0) {
+        r := legacy.TypeRewrite(&toks, start, n.src.text, true);
+        if (r.ok) { err(c, n.a, legacy.Message(r.text, r.kinds)); return true; }
+    }
+    err(c, n, "a type is not a value; use T{...}, zero(T), or [n]T to construct one");
+    return true;
+}

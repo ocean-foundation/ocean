@@ -1,0 +1,87 @@
+package driver;
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/fix";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+func usage() string {
+    return "Usage: ocean build [--check | --emit-llvm | --static | -s] [-o output] [location]\n" +
+        "       ocean run [--static | -s] [location] [program-arguments...] [-- program-arguments...]\n" +
+        "       ocean test [location] [--json] [--outfile path] [--jsonfile path]\n" +
+        "       ocean check [location]\n" +
+        "       ocean check --lsp\n" +
+        "       ocean mod init [name]\n" +
+        "       ocean fix [location...]\n" +
+        "       ocean clean --cache\n" +
+        "       ocean -v | --version\n";
+}
+
+func Main(argv array<string>) int {
+    args := make([]string);
+    for (i := 0; i < len(argv); i++) args.append(argv[i]);
+    argc := len(args);
+    if (argc == 2 && (args[1] == "-v" || args[1] == "--version")) { util.Stdout(versionText()); return 0; }
+    if (argc > 1 && args[1] == "test") return testMain(args);
+    if (argc > 1 && args[1] == "check") {
+        if (argc == 3 && args[2] == "--lsp") return lspMain();
+        if (argc == 3 && args[2] == "--help") { util.Stdout("Usage: ocean check [location]\n       ocean check --lsp\n"); return 0; }
+        return packageMain(args);
+    }
+    if (argc > 1 && args[1] == "clean") {
+        if (argc == 3 && (args[2] == "--cache" || args[2] == "-cache")) return cleanCache();
+        if (argc == 3 && args[2] == "--help") { util.Stdout("Usage: ocean clean --cache\n"); return 0; }
+        util.Stderr("Usage: ocean clean --cache\n"); return 1;
+    }
+    if (argc > 1 && args[1] == "mod") return modMain(args);
+    if (argc > 1 && args[1] == "fix") {
+        if (argc == 3 && args[2] == "--help") {
+            util.Stdout("Usage: ocean fix [location...]\n" +
+                "Rewrites removed postfix type syntax (int[], T*, buffer<T>[N]) to prefix syntax\n" +
+                "([]int, *T, buffer<T, N>) in place. A location is a package directory, an Ocean\n" +
+                "file, or dir/... for every package below dir. Defaults to the current directory.\n");
+            return 0;
+        }
+        return fix.Main(args[2:]);
+    }
+    if (argc > 1 && (args[1] == "build" || args[1] == "run")) {
+        if (argc == 3 && args[2] == "--help") {
+            util.Stdout("Usage: ocean build [--check | --emit-llvm | --static | -s] [-o output] [location]\n" +
+                "       ocean run [--static | -s] [location] [program-arguments...] [-- program-arguments...]\n");
+            return 0;
+        }
+        return packageMain(args);
+    }
+    if (argc == 1 || (argc == 2 && (args[1] == "help" || args[1] == "--help"))) {
+        util.Stdout(usage());
+        return argc == 1 ? 1 : 0;
+    }
+    util.Stderr("ocean: unknown command: " + args[1] + "\n");
+    return 1;
+}
+
+func versionText() string {
+    return "Ocean compiler (ocean) " + Version() + "\nCommit " + Commit() + " (" + CommitDate() + "), built " + BuildDate() + "\nCopyright Connor Egan " + CommitYear() + "\n";
+}
+
+func modMain(args []string) int {
+    use := "Usage: ocean mod init [name]\n";
+    argc := len(args);
+    if ((argc == 3 && args[2] == "--help") || (argc == 4 && args[2] == "init" && args[3] == "--help")) { util.Stdout(use); return 0; }
+    if (argc < 3 || argc > 4 || args[2] != "init") { util.Stderr(use); return 1; }
+    name := "";
+    if (argc == 4) name = args[3];
+    else name = util.Base(util.Getcwd());
+    if (!loaderValidModulePath(name)) {
+        util.Stderr("ocean mod init: invalid module name; provide a name such as github.com/user/project\n");
+        return 1;
+    }
+    if (util.Exists("ocean.mod")) { util.Stderr("ocean mod init: ocean.mod already exists\n"); return 1; }
+    if (!util.WriteFile("ocean.mod", "module " + name + "\n\nocean 0.1\n")) {
+        util.Stderr("ocean mod init: cannot write ocean.mod\n");
+        util.Remove("ocean.mod");
+        return 1;
+    }
+    util.Stdout("ocean: created ocean.mod for module " + name + "\n");
+    return 0;
+}
+
+func newDiags() *diag.List { return diag.NewList(); }

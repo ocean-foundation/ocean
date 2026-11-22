@@ -1,0 +1,327 @@
+package backend;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+func isCmp(op scanner.Kind) bool {
+    return op == scanner.Kind.EqEq || op == scanner.Kind.NotEq || op == scanner.Kind.Lt || op == scanner.Kind.LtEq || op == scanner.Kind.Gt || op == scanner.Kind.GtEq;
+}
+
+func icmpPred(op scanner.Kind, signed bool) string {
+    switch (op) {
+    case scanner.Kind.EqEq: return "eq";
+    case scanner.Kind.NotEq: return "ne";
+    case scanner.Kind.Lt: return signed ? "slt" : "ult";
+    case scanner.Kind.LtEq: return signed ? "sle" : "ule";
+    case scanner.Kind.Gt: return signed ? "sgt" : "ugt";
+    case scanner.Kind.GtEq: return signed ? "sge" : "uge";
+    }
+    return "eq";
+}
+func fcmpPred(op scanner.Kind) string {
+    switch (op) {
+    case scanner.Kind.EqEq: return "oeq";
+    case scanner.Kind.NotEq: return "une";
+    case scanner.Kind.Lt: return "olt";
+    case scanner.Kind.LtEq: return "ole";
+    case scanner.Kind.Gt: return "ogt";
+    case scanner.Kind.GtEq: return "oge";
+    }
+    return "oeq";
+}
+
+func arithOp(op scanner.Kind, t *ast.Type) string {
+    u := under(t);
+    fl := u.kind == ast.TK.Float;
+    switch (op) {
+    case scanner.Kind.Plus: return fl ? "fadd" : "add";
+    case scanner.Kind.Minus: return fl ? "fsub" : "sub";
+    case scanner.Kind.Star: return fl ? "fmul" : "mul";
+    case scanner.Kind.Slash: return fl ? "fdiv" : (u.signed ? "sdiv" : "udiv");
+    case scanner.Kind.Percent: return u.signed ? "srem" : "urem";
+    case scanner.Kind.Shl: return "shl";
+    case scanner.Kind.Shr: return u.signed ? "ashr" : "lshr";
+    case scanner.Kind.Amp: return "and";
+    case scanner.Kind.Pipe: return "or";
+    case scanner.Kind.Caret: return "xor";
+    }
+    return "add";
+}
+
+// scalarArith applies a numeric operator after converting both operands to rt.
+func scalarArith(g *Gen, op scanner.Kind, a V, b V, rt *ast.Type) V {
+    x := numConv(g, a.r, a.t, rt);
+    y := numConv(g, b.r, b.t, rt);
+    r := tmp(g);
+    emit(g, r + " = " + arithOp(op, rt) + " " + ll(rt) + " " + x + ", " + y);
+    return mkV(r, rt);
+}
+
+func genBinary(g *Gen, n *ast.Node, t *ast.Type) V {
+    op := n.op;
+    if (op == scanner.Kind.AndAnd || op == scanner.Kind.OrOr) return genLogical(g, n);
+    a := genExpr(g, n.a);
+    // keep the left value stable against side effects of the right operand
+    if (isAgg(a.t) && !a.fresh) a = copyV(g, a);
+    b := genExpr(g, n.b);
+    return binaryValues(g, n, op, a, b, t);
+}
+
+func binaryValues(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, t *ast.Type) V {
+    ua := under(a.t); ub := under(b.t);
+    if (ua.kind == ast.TK.Union || ub.kind == ast.TK.Union) return unionBinary(g, n, op, a, b, t);
+    if (op == scanner.Kind.EqEq || op == scanner.Kind.NotEq) return mkV(genEquality(g, n, a, b, op == scanner.Kind.NotEq), check.TBool());
+    if (isCmp(op)) {
+        if (ua.kind == ast.TK.String) {
+            c := tmp(g); emit(g, c + " = call i64 @oc_str_cmp(ptr " + a.r + ", ptr " + b.r + ")");
+            r := tmp(g); emit(g, r + " = icmp " + icmpPred(op, true) + " i64 " + c + ", 0");
+            return mkV(r, check.TBool());
+        }
+        ct := g.c.NumericResult(a.t, b.t);
+        x := numConv(g, a.r, a.t, ct); y := numConv(g, b.r, b.t, ct);
+        r := tmp(g);
+        if (under(ct).kind == ast.TK.Float) emit(g, r + " = fcmp " + fcmpPred(op) + " " + ll(ct) + " " + x + ", " + y);
+        else emit(g, r + " = icmp " + icmpPred(op, under(ct).signed) + " " + ll(ct) + " " + x + ", " + y);
+        return mkV(r, check.TBool());
+    }
+    // strings
+    if (op == scanner.Kind.Plus && under(t).kind == ast.TK.String) {
+        r := tmp(g);
+        if (ua.kind == ast.TK.String && ub.kind == ast.TK.String) emit(g, r + " = call ptr @oc_str_concat(ptr " + a.r + ", ptr " + b.r + ")");
+        else if (ua.kind == ast.TK.String) emit(g, r + " = call ptr @oc_str_add_byte(ptr " + a.r + ", i8 " + b.r + ", i64 0)");
+        else emit(g, r + " = call ptr @oc_str_add_byte(ptr " + b.r + ", i8 " + a.r + ", i64 1)");
+        return freshV(r, t);
+    }
+    // pointer arithmetic
+    if (ua.kind == ast.TK.Ptr || ub.kind == ast.TK.Ptr) {
+        if (ua.kind == ast.TK.Ptr && ub.kind == ast.TK.Ptr) {
+            x := tmp(g); y := tmp(g); d := tmp(g); r := tmp(g);
+            emit(g, x + " = ptrtoint ptr " + a.r + " to i64");
+            emit(g, y + " = ptrtoint ptr " + b.r + " to i64");
+            emit(g, d + " = sub i64 " + x + ", " + y);
+            emit(g, r + " = sdiv exact i64 " + d + ", " + itoa(sizeOf(g, ua.elem)));
+            return mkV(r, check.TInt());
+        }
+        p := ua.kind == ast.TK.Ptr ? a : b;
+        k := ua.kind == ast.TK.Ptr ? b : a;
+        checkNullPtr(g, p.r);
+        idx := intConv(g, k.r, k.t, check.TInt());
+        if (op == scanner.Kind.Minus) { neg := tmp(g); emit(g, neg + " = sub i64 0, " + idx); idx = neg; }
+        return mkV(gepDyn(g, p.r, idx, sizeOf(g, under(p.t).elem)), p.t);
+    }
+    // collections
+    if (op == scanner.Kind.Plus && (under(t).kind == ast.TK.Dyn || under(t).kind == ast.TK.Array)) return concatValues(g, a, b, t);
+    rt := t;
+    if (op == scanner.Kind.Shl || op == scanner.Kind.Shr) {
+        x := numConv(g, a.r, a.t, rt);
+        y := numConv(g, b.r, b.t, rt);
+        r := tmp(g);
+        emit(g, r + " = " + arithOp(op, rt) + " " + ll(rt) + " " + x + ", " + y);
+        return mkV(r, rt);
+    }
+    return scalarArith(g, op, a, b, rt);
+}
+
+func genLogical(g *Gen, n *ast.Node) V {
+    a := genExpr(g, n.a);
+    from := g.fn.cur;
+    rhs := newLabel(g, "rhs"); done := newLabel(g, "logic");
+    if (n.op == scanner.Kind.AndAnd) condBr(g, a.r, rhs, done); else condBr(g, a.r, done, rhs);
+    label(g, rhs);
+    b := genExpr(g, n.b);
+    end := g.fn.cur;
+    br(g, done);
+    label(g, done);
+    r := tmp(g);
+    emit(g, r + " = phi i1 [ " + (n.op == scanner.Kind.AndAnd ? "false" : "true") + ", %" + from + " ], [ " + b.r + ", %" + end + " ]");
+    return mkV(r, check.TBool());
+}
+
+func genTernary(g *Gen, n *ast.Node, t *ast.Type) V {
+    c := genExpr(g, n.a);
+    yes := newLabel(g, "then"); no := newLabel(g, "else"); done := newLabel(g, "endif");
+    condBr(g, c.r, yes, no);
+    if (isAgg(t)) {
+        slot := alloca(g, t);
+        label(g, yes);
+        store(g, t, slot, genAs(g, n.b, t));
+        br(g, done);
+        label(g, no);
+        store(g, t, slot, genAs(g, n.c, t));
+        br(g, done);
+        label(g, done);
+        return freshV(slot, t);
+    }
+    label(g, yes);
+    a := genAs(g, n.b, t);
+    ya := g.fn.cur; br(g, done);
+    label(g, no);
+    b := genAs(g, n.c, t);
+    nb := g.fn.cur; br(g, done);
+    label(g, done);
+    r := tmp(g);
+    emit(g, r + " = phi " + ll(t) + " [ " + a.r + ", %" + ya + " ], [ " + b.r + ", %" + nb + " ]");
+    return freshV(r, t);
+}
+
+// ---- equality ----
+
+func isSelectorNode(n *ast.Node) bool {
+    return n.kind == ast.NK.Member && (n.sem == ast.Sem.EnumSelector || n.sem == ast.Sem.EnumUnit || n.sem == ast.Sem.EnumFixed) && n.flag3 == false;
+}
+
+func genEquality(g *Gen, n *ast.Node, a V, b V, negate bool) string {
+    r := equality(g, n, a, b);
+    if (!negate) return r;
+    x := tmp(g); emit(g, x + " = xor i1 " + r + ", true");
+    return x;
+}
+
+func tagOf(g *Gen, v V) string { r := tmp(g); emit(g, r + " = load i64, ptr " + v.r); return r; }
+
+func equality(g *Gen, n *ast.Node, a V, b V) string {
+    ua := under(a.t); ub := under(b.t);
+    // enum compared with a variant selector tests only the tag
+    if (!nilN(n) && n.kind == ast.NK.Binary && (ua.kind == ast.TK.Enum || ub.kind == ast.TK.Enum)) {
+        sa := isSelectorNode(n.a) && n.a.sem != ast.Sem.EnumFixed;
+        sb := isSelectorNode(n.b) && n.b.sem != ast.Sem.EnumFixed;
+        if (sa || sb) {
+            if (isSelectorNode(n.a) && n.a.sem == ast.Sem.EnumSelector || isSelectorNode(n.b) && n.b.sem == ast.Sem.EnumSelector || sa || sb) {
+                ta := tagOf(g, a); tb := tagOf(g, b);
+                r := tmp(g); emit(g, r + " = icmp eq i64 " + ta + ", " + tb);
+                return r;
+            }
+        }
+    }
+    if (a.t.kind == ast.TK.Null || b.t.kind == ast.TK.Null) {
+        o := a.t.kind == ast.TK.Null ? b : a;
+        uo := under(o.t);
+        if (uo.kind == ast.TK.Null) return "true";
+        if (uo.kind == ast.TK.Interface || uo.kind == ast.TK.Union || uo.kind == ast.TK.Func) {
+            d := extract(g, o.r, 0);
+            r := tmp(g); emit(g, r + " = icmp eq ptr " + d + ", null"); return r;
+        }
+        if (uo.kind == ast.TK.Enum) { t := tagOf(g, o); r := tmp(g); emit(g, r + " = icmp eq i64 " + t + ", 0"); return r; }
+        r := tmp(g); emit(g, r + " = icmp eq ptr " + o.r + ", " + nullPtr()); return r;
+    }
+    // interface on either side: compare boxes
+    if (ua.kind == ast.TK.Interface || ua.kind == ast.TK.Union || ub.kind == ast.TK.Interface || ub.kind == ast.TK.Union) {
+        x := box(g, a); y := box(g, b);
+        r := tmp(g);
+        emit(g, r + " = call i64 @oc_any_equal(ptr " + extract(g, x.r, 0) + ", ptr " + extract(g, x.r, 1) + ", ptr " + extract(g, y.r, 0) + ", ptr " + extract(g, y.r, 1) + ")");
+        c := tmp(g); emit(g, c + " = icmp ne i64 " + r + ", 0");
+        return c;
+    }
+    if ((ua.kind == ast.TK.Int || ua.kind == ast.TK.Float) && (ub.kind == ast.TK.Int || ub.kind == ast.TK.Float)) {
+        ct := g.c.NumericResult(a.t, b.t);
+        if (nilT(ct)) ct = a.t;
+        x := numConv(g, a.r, a.t, ct); y := numConv(g, b.r, b.t, ct);
+        r := tmp(g);
+        if (under(ct).kind == ast.TK.Float) emit(g, r + " = fcmp oeq " + ll(ct) + " " + x + ", " + y);
+        else emit(g, r + " = icmp eq " + ll(ct) + " " + x + ", " + y);
+        return r;
+    }
+    if (ua.kind == ast.TK.Bool) { r := tmp(g); emit(g, r + " = icmp eq i1 " + a.r + ", " + b.r); return r; }
+    if (ua.kind == ast.TK.Ptr || (ua.kind == ast.TK.Buffer && ua.len <= 0)) { r := tmp(g); emit(g, r + " = icmp eq ptr " + a.r + ", " + b.r); return r; }
+    if ((ua.kind == ast.TK.String || ua.kind == ast.TK.Dyn) && (ub.kind == ast.TK.String || ub.kind == ast.TK.Dyn) && (ua.kind == ast.TK.String || ub.kind == ast.TK.String || (under(ua.elem).kind == ast.TK.Int && sizeOf(g, ua.elem) == 1))) {
+        r := tmp(g); emit(g, r + " = call i64 @oc_str_eq(ptr " + a.r + ", ptr " + b.r + ")");
+        c := tmp(g); emit(g, c + " = icmp ne i64 " + r + ", 0"); return c;
+    }
+    if (ua.kind == ast.TK.Func) {
+        x0 := extract(g, a.r, 0); y0 := extract(g, b.r, 0); x1 := extract(g, a.r, 1); y1 := extract(g, b.r, 1);
+        e0 := tmp(g); e1 := tmp(g); r := tmp(g);
+        emit(g, e0 + " = icmp eq ptr " + x0 + ", " + y0);
+        emit(g, e1 + " = icmp eq ptr " + x1 + ", " + y1);
+        emit(g, r + " = and i1 " + e0 + ", " + e1);
+        return r;
+    }
+    // arrays of different representations compare by elements
+    if ((ua.kind == ast.TK.Array || ua.kind == ast.TK.Dyn) && (ub.kind == ast.TK.Array || ub.kind == ast.TK.Dyn) && (ua.kind != ub.kind || ua.len != ub.len)) {
+        da := arrayDataPtr(g, a); na := collectionLen(g, a);
+        db := arrayDataPtr(g, b); nb := collectionLen(g, b);
+        r := tmp(g);
+        emit(g, r + " = call i64 @oc_elems_equal(ptr " + da + ", i64 " + na + ", ptr " + db + ", i64 " + nb + ", ptr " + desc(g, ua.elem) + ")");
+        c := tmp(g); emit(g, c + " = icmp ne i64 " + r + ", 0"); return c;
+    }
+    pa := spill(g, a); pb := spill(g, b);
+    r := tmp(g);
+    emit(g, r + " = call i64 @oc_equal(ptr " + pa + ", ptr " + pb + ", ptr " + desc(g, a.t) + ")");
+    c := tmp(g); emit(g, c + " = icmp ne i64 " + r + ", 0");
+    return c;
+}
+
+// ---- collections ----
+
+func concatValues(g *Gen, a V, b V, t *ast.Type) V {
+    u := under(t);
+    elem := u.elem;
+    da := ""; na := ""; db := ""; nb := "";
+    ua := under(a.t); ub := under(b.t);
+    if (ua.kind == ast.TK.Dyn || ua.kind == ast.TK.Array) { da = arrayDataPtr(g, a); na = collectionLen(g, a); }
+    else { e := conv(g, a, elem); da = spill(g, e); na = "1"; }
+    if (ub.kind == ast.TK.Dyn || ub.kind == ast.TK.Array) { db = arrayDataPtr(g, b); nb = collectionLen(g, b); }
+    else { e := conv(g, b, elem); db = spill(g, e); nb = "1"; }
+    r := tmp(g);
+    emit(g, r + " = call ptr @oc_concat(ptr " + da + ", i64 " + na + ", ptr " + db + ", i64 " + nb + ", ptr " + desc(g, elem) + ")");
+    if (u.kind == ast.TK.Dyn) return freshV(r, t);
+    // fixed arrays: build a block of the combined length
+    blk := tmp(g);
+    emit(g, blk + " = call ptr @oc_arr_to_block(ptr " + r + ", ptr " + desc(g, elem) + ")");
+    if (u.len >= 0) {
+        p := alloca(g, t);
+        memcpy(g, p, blk, sizeOf(g, t));
+        return freshV(p, t);
+    }
+    return freshV(blk, t);
+}
+
+// ---- boxed type-list operations: dispatch over concrete term pairs ----
+
+func unionTerms(g *Gen, t *ast.Type) []*ast.Type {
+    u := under(t);
+    out := make([]*ast.Type);
+    if (u.kind == ast.TK.Union) { for (_, x := range u.terms) out.append(x); return out; }
+    out.append(t);
+    return out;
+}
+
+func unionBinary(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, t *ast.Type) V {
+    ta := unionTerms(g, a.t); tb := unionTerms(g, b.t);
+    boxedA := under(a.t).kind == ast.TK.Union; boxedB := under(b.t).kind == ast.TK.Union;
+    resultBoxed := under(t).kind == ast.TK.Union || under(t).kind == ast.TK.Interface;
+    slot := alloca(g, t);
+    done := newLabel(g, "udone");
+    da := boxedA ? extract(g, a.r, 0) : "";
+    db := boxedB ? extract(g, b.r, 0) : "";
+    for (_, x := range ta) {
+        for (_, y := range tb) {
+            next := newLabel(g, "unext");
+            body := newLabel(g, "ucase");
+            c := "true";
+            if (boxedA) { c1 := tmp(g); emit(g, c1 + " = icmp eq ptr " + da + ", " + desc(g, x)); c = c1; }
+            if (boxedB) {
+                c2 := tmp(g); emit(g, c2 + " = icmp eq ptr " + db + ", " + desc(g, y));
+                if (c == "true") c = c2; else { c3 := tmp(g); emit(g, c3 + " = and i1 " + c + ", " + c2); c = c3; }
+            }
+            condBr(g, c, body, next);
+            label(g, body);
+            av := a; bv := b;
+            if (boxedA) av = load(g, x, extract(g, a.r, 1)); else av.t = x;
+            if (boxedB) bv = load(g, y, extract(g, b.r, 1)); else bv.t = y;
+            rt := zero(*ast.Type);
+            if (isCmp(op)) rt = check.TBool();
+            else if (under(x).kind == ast.TK.String) rt = x;
+            else rt = g.c.NumericResult(x, y);
+            res := binaryValues(g, zero(*ast.Node), op, av, bv, rt);
+            stored := res;
+            if (resultBoxed) stored = conv(g, res, t);
+            else stored = conv(g, res, t);
+            store(g, t, slot, stored);
+            br(g, done);
+            label(g, next);
+        }
+    }
+    term(g, "call void @llvm.trap()\n  unreachable");
+    label(g, done);
+    return load(g, t, slot);
+}

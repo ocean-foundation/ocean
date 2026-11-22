@@ -1,0 +1,103 @@
+package scanner;
+import "testing";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+
+func quiet() *diag.List { d := diag.NewList(); d.live = false; return d; }
+
+func kinds(src string) string {
+    toks, _ := Scan("t.oc", src, quiet(), false);
+    out := "";
+    for (i, t := range toks) {
+        if (i > 0) out += " ";
+        out += KindText(t.kind);
+    }
+    return out;
+}
+
+func TestOperators(t *testing.T) {
+    got := kinds("a <<= b >>= c -> d => e ... += ++ -- != == <= >= && || ~");
+    want := "identifier <<= identifier >>= identifier -> identifier => identifier . . . += ++ -- != == <= >= && || ~ end of file";
+    if (got != want) t.Error("got ", got);
+}
+
+func TestKeywordsAndBlank(t *testing.T) {
+    got := kinds("func _ _x int varint null forward");
+    if (got != "func _ identifier identifier varint null identifier end of file") t.Error("got ", got);
+}
+
+func TestComments(t *testing.T) {
+    got := kinds("a /* x /* nested */ y */ b // tail\n c");
+    if (got != "identifier identifier identifier end of file") t.Error("got ", got);
+    d := quiet();
+    _, ok := Scan("t.oc", "a /* open /* */", d, false);
+    if (ok || d.errors != 1 || d.items[0].message != "Unterminated block comment") t.Error("unterminated");
+}
+
+func TestNumbers(t *testing.T) {
+    toks, ok := Scan("t.oc", "017 0x1F 0b101 0o17 1.5 2e10 0x1.8 1.x", quiet(), false);
+    if (!ok) { t.Fatal("scan failed"); }
+    if (toks[0].kind != Kind.Int || toks[0].text != "017") t.Error("dec");
+    if (toks[1].text != "0x1F" || toks[2].text != "0b101" || toks[3].text != "0o17") t.Error("bases");
+    if (toks[4].kind != Kind.Float || toks[5].kind != Kind.Float || toks[6].kind != Kind.Float) t.Error("floats");
+    if (toks[7].kind != Kind.Int || toks[8].kind != Kind.Dot || toks[9].kind != Kind.Ident) t.Error("1.x");
+    if (ParseF64("0x1.8") != 1.5 || ParseF64("0b1.01") != 1.25 || ParseF64("0o0.4") != 0.5) t.Error("float values");
+    d := quiet();
+    _, ok2 := Scan("t.oc", "1u", d, false);
+    if (ok2) t.Error("1u accepted");
+    _, ok3 := Scan("t.oc", "0x1g", quiet(), false);
+    if (ok3) t.Error("0x1g accepted");
+    _, ok4 := Scan("t.oc", "0b2", quiet(), false);
+    if (ok4) t.Error("0b2 accepted");
+}
+
+func TestStrings(t *testing.T) {
+    toks, ok := Scan("t.oc", "\"a\\n\\x41\\101\\u00e9\\0\" `raw\\n\nx`", quiet(), false);
+    if (!ok) { t.Fatal("scan failed"); }
+    s := toks[0].text;
+    if (len(s) != 7 || s[1] != 10 || s[2] != 'A' || s[3] != 'A' || (s[4]->int & 255) != 195 || s[6] != 0) t.Error("escapes ", len(s));
+    if (toks[1].text != "raw\\n\nx" || !toks[1].raw) t.Error("raw");
+    d := quiet();
+    _, ok2 := Scan("t.oc", "\"abc", d, false);
+    if (ok2 || d.items[0].message != "End of file inside string literal" || d.items[0].col != 5) t.Error("eof string");
+    d2 := quiet();
+    _, ok3 := Scan("t.oc", "\"a\nb\"", d2, false);
+    if (ok3 || d2.items[0].message != "Unescaped newline inside string literal") t.Error("newline");
+    _, ok4 := Scan("t.oc", "\"\\q\"", quiet(), false);
+    if (ok4) t.Error("bad escape");
+    _, ok5 := Scan("t.oc", "\"\\ud800\"", quiet(), false);
+    if (ok5) t.Error("surrogate");
+}
+
+func TestChars(t *testing.T) {
+    toks, ok := Scan("t.oc", "'a' '\\n' 'é' '\\u4e2d'", quiet(), false);
+    if (!ok) { t.Fatal("scan failed"); }
+    if (!toks[0].isChar || toks[0].charValue != 97 || toks[1].charValue != 10 || toks[2].charValue != 233 || toks[3].charValue != 20013) t.Error("chars");
+    _, ok2 := Scan("t.oc", "''", quiet(), false);
+    if (ok2) t.Error("empty char");
+    _, ok3 := Scan("t.oc", "'ab'", quiet(), false);
+    if (ok3) t.Error("two chars");
+}
+
+func TestUnicodeIdent(t *testing.T) {
+    toks, ok := Scan("t.oc", "café Ünder _x1", quiet(), false);
+    if (!ok || toks[0].text != "café" || toks[1].text != "Ünder") t.Error("unicode ident");
+    if (!IsExported("Ünder") || IsExported("café") || IsExported("_X")) t.Error("exported");
+}
+
+func TestAsm(t *testing.T) {
+    toks, ok := Scan("t.oc", "asm x86_64/linux { mov rax, 1 # } comment\n { nested } \"}\" }; x", quiet(), false);
+    if (!ok) { t.Fatal("scan failed"); }
+    if (toks[4].kind != Kind.AsmBody || toks[5].kind != Kind.Semi || toks[6].text != "x") t.Error("asm tokens");
+    if (toks[4].text != " mov rax, 1 # } comment\n { nested } \"}\" ") t.Error("asm body <", toks[4].text, ">");
+}
+
+func TestPositions(t *testing.T) {
+    toks, _ := Scan("t.oc", "a\n  bb cc", quiet(), false);
+    if (toks[1].line != 2 || toks[1].col != 3 || toks[2].col != 6 || toks[2].off != 7) t.Error("positions");
+}
+
+func TestRecovery(t *testing.T) {
+    d := quiet();
+    toks, ok := Scan("t.oc", "a $ b", d, true);
+    if (ok || len(toks) != 3 || toks[1].text != "b") t.Error("recovery ", len(toks));
+}

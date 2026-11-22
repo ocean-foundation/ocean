@@ -1,0 +1,182 @@
+package driver;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/backend";
+import "github.com/ocean-foundation/ocean/compiler/runtime";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+func usesPackage(p *Program, path string) bool {
+    for (_, pk := range p.checker.Packages()) { if (pk.std && pk.path == path) return true; }
+    return false;
+}
+
+func generate(p *Program) (string, bool) {
+    opts: backend.Options;
+    opts.library = p.isLibrary;
+    opts.usesThreads = p.checker.UsesThreads();
+    opts.wasm = targetWasm();
+    ir, ok := backend.Generate(p.checker, p.checker.Packages(), p.build.Root(), opts);
+    p.usesFFI = util.Contains(ir, "@oc_cvar_call(");
+    return ir, ok;
+}
+
+func optLevel() string {
+    o, ok := util.Getenv("OCEAN_OPT");
+    if (ok && o != "") return "-O" + o;
+    return "-O1";
+}
+
+// runtimeSources writes the runtime C files needed by a program into dir.
+func runtimeSources(p *Program, dir string) []string {
+    files := make([]string);
+    core := dir + "/ocean_core.c";
+    util.WriteFile(core, runtime.Core());
+    files.append(core);
+    if (p.checker.UsesThreads()) {
+        th := dir + "/ocean_threads.c";
+        util.WriteFile(th, runtime.Threads());
+        files.append(th);
+    }
+    if (p.usesFFI) {
+        ff := dir + "/ocean_ffi.c";
+        util.WriteFile(ff, runtime.Ffi());
+        files.append(ff);
+    }
+    if (usesPackage(p, "os/exec")) {
+        pr := dir + "/ocean_process.c";
+        util.WriteFile(pr, runtime.Process());
+        files.append(pr);
+    }
+    return files;
+}
+
+func clangRun(args []string) bool {
+    st, out := util.RunCapture(args.array());
+    if (st.Failed || st.Code != 0) {
+        util.Stderr(out);
+        util.Stderr("backend error: clang failed to compile or link LLVM IR\n");
+        return false;
+    }
+    return true;
+}
+
+// compileProgram produces an executable or relocatable object at output.
+func compileProgram(p *Program, ir string, output string, staticLink bool) bool {
+    dir, ok := util.MakeTempDir("ocean-build-");
+    if (!ok) { util.Stderr("ocean: cannot create temporary directory\n"); return false; }
+    irPath := dir + "/program.ll";
+    if (!util.WriteFile(irPath, ir)) { util.Stderr("ocean: could not create IR file\n"); util.RemoveAll(dir); return false; }
+    rts := runtimeSources(p, dir);
+    staged := output + ".ocean-tmp";
+    args := []string{"clang", optLevel(), "-w", "-Wno-override-module"};
+    if (p.isLibrary) {
+        objs := make([]string);
+        all := make([]string);
+        all.append(irPath);
+        all.append(rts...);
+        for (i, f := range all) {
+            obj := dir + "/part" + util.Itoa(i) + ".o";
+            cargs := []string{"clang", optLevel(), "-w", "-Wno-override-module", "-ffunction-sections", "-fdata-sections", "-DOC_LIBRARY", "-c"};
+            if (util.HasSuffix(f, ".ll")) cargs.append("-x", "ir");
+            else cargs.append("-x", "c");
+            cargs.append(f, "-o", obj);
+            if (!clangRun(cargs)) { util.RemoveAll(dir); return false; }
+            objs.append(obj);
+        }
+        largs := []string{"clang", "-r", "-nostdlib", "-o", staged};
+        largs.append(objs...);
+        if (!clangRun(largs)) { util.RemoveAll(dir); return false; }
+    } else {
+        args.append("-x", "ir", irPath, "-x", "c");
+        args.append(rts...);
+        args.append("-o", staged);
+        if (p.checker.UsesThreads()) args.append("-pthread");
+        if (p.usesFFI) args.append("-lffi");
+        if (staticLink) args.append("-static");
+        if (!clangRun(args)) { util.RemoveAll(dir); util.Remove(staged); return false; }
+    }
+    util.RemoveAll(dir);
+    if (!util.Rename(staged, output)) { util.Stderr("ocean: could not write " + output + "\n"); util.Remove(staged); return false; }
+    return true;
+}
+
+// selfContainedIR merges the runtime into the program module for --emit-llvm.
+func selfContainedIR(p *Program, ir string) (string, bool) {
+    dir, ok := util.MakeTempDir("ocean-ir-");
+    if (!ok) return ir, true;
+    irPath := dir + "/program.ll";
+    util.WriteFile(irPath, ir);
+    parts := make([]string);
+    parts.append(irPath);
+    for (i, f := range runtimeSources(p, dir)) {
+        out := dir + "/rt" + util.Itoa(i) + ".ll";
+        if (!clangRun([]string{"clang", "-O1", "-w", "-S", "-emit-llvm", "-x", "c", f, "-o", out})) { util.RemoveAll(dir); return ir, true; }
+        parts.append(out);
+    }
+    merged := dir + "/merged.ll";
+    largs := []string{"llvm-link", "-S", "-o", merged};
+    largs.append(parts...);
+    st, _ := util.RunCapture(largs.array());
+    if (st.Failed || st.Code != 0) { util.RemoveAll(dir); return ir, true; }
+    text, rok := util.ReadFile(merged);
+    util.RemoveAll(dir);
+    if (!rok) return ir, true;
+    return text, true;
+}
+
+func checkBackend(p *Program) bool {
+    ir, ok := generate(p);
+    if (!ok) return true;
+    dir, dok := util.MakeTempDir("ocean-check-");
+    if (!dok) return true;
+    out := dir + "/check.out";
+    built := compileProgram(p, ir, out, false);
+    util.RemoveAll(dir);
+    return !built;
+}
+
+func emitAndLink(p *Program, o *BuildOptions) int {
+    ir, ok := generate(p);
+    if (!ok) return 1;
+    if (o.emit) {
+        out := o.output == "" ? "a.ll" : o.output;
+        full, _ := selfContainedIR(p, ir);
+        if (!util.WriteFile(out, full)) { util.Stderr("ocean: could not save IR\n"); return 1; }
+        return 0;
+    }
+    if (o.run) {
+        dir, dok := util.MakeTempDir(".ocean-run-");
+        if (!dok) { util.Stderr("ocean run: temporary directory\n"); return 1; }
+        exe := dir + "/program";
+        if (!compileProgram(p, ir, exe, o.staticLink)) { util.RemoveAll(dir); return 1; }
+        argv := make([]string);
+        argv.append(exe);
+        argv.append(o.programArgs...);
+        st := util.RunForeground(argv.array());
+        util.RemoveAll(dir);
+        if (st.Signal > 0) util.Stderr("ocean run: program terminated by signal " + util.Itoa(st.Signal) + " (" + util.SignalName(st.Signal) + ")\n");
+        return st.Code;
+    }
+    out := o.output;
+    if (out == "") {
+        if (p.isLibrary) out = p.name + ".o";
+        else { b := util.Base(p.dir); out = b == "" ? "main" : b; }
+    }
+    for (_, pk := range p.checker.Packages()) {
+        for (_, src := range pk.files) {
+            if (src.abs != "" && sameFile(out, src.abs)) { util.Stderr("ocean: output would overwrite an input file\n"); return 1; }
+        }
+    }
+    return compileProgram(p, ir, out, o.staticLink) ? 0 : 1;
+}
+
+func sameFile(a string, b string) bool {
+    x, ok1 := util.Realpath(a);
+    y, ok2 := util.Realpath(b);
+    return ok1 && ok2 && x == y;
+}
+
+func unusedAst(p *ast.Package) bool { return (p -> int) == 0; }
+
+func Generate(p *Program) (string, bool) { return generate(p); }
+func NewDiagsQuiet() *diag.List { d := newDiags(); return d; }

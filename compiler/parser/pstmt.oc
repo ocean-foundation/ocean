@@ -1,0 +1,468 @@
+package parser;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+func block(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Block);
+    if (!accept(p, scanner.Kind.LBrace)) { err(p, "Expected block start"); return n; }
+    for (!is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
+        before := p.pos;
+        s := statement(p);
+        n.list.append(s);
+        if (p.failed) {
+            if (!p.recover || p.trial > 0) return n;
+            p.failed = false;
+            recoverStmt(p, before);
+        }
+    }
+    if (!accept(p, scanner.Kind.RBrace)) err(p, "Expected end of block");
+    return finish(p, n);
+}
+
+// recoverStmt skips to the next statement boundary in editor recovery mode.
+func recoverStmt(p *Parser, before int) {
+    if (p.pos <= before) next(p);
+    depth := 0;
+    for (!is(p, scanner.Kind.EOF)) {
+        k := tk(p);
+        if (k == scanner.Kind.LBrace) depth++;
+        if (k == scanner.Kind.RBrace) { if (depth == 0) return; depth--; }
+        if (k == scanner.Kind.Semi && depth == 0) { next(p); return; }
+        next(p);
+    }
+}
+
+func semi(p *Parser, msg string) {
+    if (!accept(p, scanner.Kind.Semi)) err(p, msg);
+}
+
+// simpleOrDecl parses an initializer that may be a variable declaration.
+func simpleOrDecl(p *Parser) *ast.Node {
+    if ((is(p, scanner.Kind.Ident) || is(p, scanner.Kind.Blank)) && isDeclStart(p)) return varDecl(p);
+    e := expr(p);
+    s := nodeAt(p, ast.NK.ExprStmt, e);
+    s.a = e;
+    return s;
+}
+
+func statement(p *Parser) *ast.Node {
+    p.depth++;
+    if (p.depth > 1500) { err(p, "Parser nesting limit exceeded"); p.depth--; return node(p, ast.NK.Bad); }
+    s := statement1(p);
+    p.depth--;
+    return s;
+}
+
+func statement1(p *Parser) *ast.Node {
+    k := tk(p);
+    if (k == scanner.Kind.LBrace) return block(p);
+    if (k == scanner.Kind.Semi) { n := node(p, ast.NK.Empty); next(p); return n; }
+    if (k == scanner.Kind.KwIf) return ifStmt(p);
+    if (k == scanner.Kind.KwFor) return forStmt(p);
+    if (k == scanner.Kind.KwSwitch) return switchStmt(p);
+    if (k == scanner.Kind.KwMatch) return matchStmt(p);
+    if (k == scanner.Kind.KwReturn) return returnStmt(p);
+    if (k == scanner.Kind.KwPanic) {
+        n := node(p, ast.NK.Panic);
+        next(p);
+        n.a = assignExpr(p);
+        semi(p, "Expected semicolon after panic message");
+        return finish(p, n);
+    }
+    if (isIdent(p, "forward") && peek(p, 1) == scanner.Kind.KwPanic) {
+        n := node(p, ast.NK.Forward);
+        next(p); next(p);
+        n.a = statement(p);
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.KwDefer) {
+        n := node(p, ast.NK.Defer);
+        next(p);
+        e := expr(p);
+        if (e.kind != ast.NK.Call) { errNode(p, e, "Expected function call after defer"); return n; }
+        n.a = e;
+        semi(p, "Expected semicolon after defer");
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.KwBreak || k == scanner.Kind.KwContinue) {
+        n := node(p, k == scanner.Kind.KwBreak ? ast.NK.Break : ast.NK.Continue);
+        next(p);
+        if (is(p, scanner.Kind.Ident)) { n.name = tok(p).text; next(p); }
+        semi(p, "Expected semicolon after branch");
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.KwGoto) {
+        n := node(p, ast.NK.Goto);
+        next(p);
+        if (!is(p, scanner.Kind.Ident)) { err(p, "Expected goto label"); return n; }
+        n.name = tok(p).text;
+        next(p);
+        semi(p, "Expected semicolon after branch");
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.KwFallthrough) {
+        n := node(p, ast.NK.Fallthrough);
+        next(p);
+        semi(p, "Expected semicolon after branch");
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.KwAsm) return asmStmt(p);
+    if (k == scanner.Kind.KwFunc && peek(p, 1) == scanner.Kind.Ident) {
+        n := funcDecl(p);
+        return n;
+    }
+    if (k == scanner.Kind.KwType || k == scanner.Kind.KwStruct || k == scanner.Kind.KwEnum ||
+        (k == scanner.Kind.KwInterface && peek(p, 1) == scanner.Kind.Ident)) {
+        return declaration(p, false);
+    }
+    if (k == scanner.Kind.KwExtern && peek(p, 1) != scanner.Kind.Dot) {
+        err(p, "Extern declarations are only allowed at file scope");
+        return node(p, ast.NK.Bad);
+    }
+    if (k == scanner.Kind.KwImport) { err(p, "Unexpected 'import', expected expression"); return node(p, ast.NK.Bad); }
+    if (k == scanner.Kind.Ident || k == scanner.Kind.Blank) {
+        if (isDeclStart(p)) {
+            d := varDecl(p);
+            semi(p, "Expected semicolon");
+            return d;
+        }
+        if (k == scanner.Kind.Ident && peek(p, 1) == scanner.Kind.Colon) {
+            n := node(p, ast.NK.Labeled);
+            n.name = tok(p).text;
+            next(p); next(p);
+            if (is(p, scanner.Kind.RBrace)) { err(p, "Unexpected '}', expected expression"); return n; }
+            n.a = statement(p);
+            return finish(p, n);
+        }
+    }
+    e := expr(p);
+    s := nodeAt(p, ast.NK.ExprStmt, e);
+    s.a = e;
+    semi(p, "Expected semicolon");
+    return finish(p, s);
+}
+
+func ifStmt(p *Parser) *ast.Node {
+    n := node(p, ast.NK.If);
+    next(p);
+    if (!accept(p, scanner.Kind.LParen)) { err(p, "Expected condition for if statement"); return n; }
+    if (is(p, scanner.Kind.RParen)) { err(p, "Expected expression for if condition"); return n; }
+    first := simpleOrDecl(p);
+    if (accept(p, scanner.Kind.Semi)) {
+        n.a = first;
+        n.b = expr(p);
+    } else {
+        if (first.kind != ast.NK.ExprStmt) { err(p, "Expected semicolon"); return n; }
+        n.b = first.a;
+    }
+    if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected right paren"); return n; }
+    n.c = statement(p);
+    if (accept(p, scanner.Kind.KwElse)) n.d = statement(p);
+    return finish(p, n);
+}
+
+func isRangeHeader(p *Parser) bool {
+    i := 0;
+    for (;;) {
+        k := peek(p, i);
+        if (k != scanner.Kind.Ident && k != scanner.Kind.Blank) return false;
+        i++;
+        if (peek(p, i) == scanner.Kind.Comma) { i++; continue; }
+        break;
+    }
+    return peek(p, i) == scanner.Kind.Colon && peek(p, i + 1) == scanner.Kind.Assign && peek(p, i + 2) == scanner.Kind.KwRange;
+}
+
+func forStmt(p *Parser) *ast.Node {
+    n := node(p, ast.NK.For);
+    next(p);
+    if (!accept(p, scanner.Kind.LParen)) { err(p, "Expected start of for loop header"); return n; }
+    if (isRangeHeader(p)) {
+        r := nodeAt(p, ast.NK.ForRange, n);
+        for (;;) {
+            id := node(p, is(p, scanner.Kind.Blank) ? ast.NK.Blank : ast.NK.Ident);
+            id.name = tok(p).text;
+            next(p);
+            finish(p, id);
+            r.list.append(id);
+            if (!accept(p, scanner.Kind.Comma)) break;
+        }
+        if (len(r.list) > 2) { err(p, "Expected one or two range bindings"); return r; }
+        next(p); next(p); next(p); // : = range
+        r.a = expr(p);
+        if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected end of for loop header"); return r; }
+        r.d = statement(p);
+        return finish(p, r);
+    }
+    if (is(p, scanner.Kind.KwDefer)) {
+        next(p);
+        n.flag = true; n.flag2 = true;
+        n.b = expr(p);
+        if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected end of for loop header"); return n; }
+        n.d = statement(p);
+        return finish(p, n);
+    }
+    if (!is(p, scanner.Kind.Semi)) {
+        if (is(p, scanner.Kind.RParen)) { err(p, "Expected expression for for condition"); return n; }
+        first := simpleOrDecl(p);
+        if (accept(p, scanner.Kind.RParen)) {
+            if (first.kind != ast.NK.ExprStmt) { err(p, "Expected semicolon after for condition"); return n; }
+            n.flag2 = true;
+            n.b = first.a;
+            n.d = statement(p);
+            return finish(p, n);
+        }
+        n.a = first;
+    }
+    if (!accept(p, scanner.Kind.Semi)) { err(p, "Expected semicolon after for condition"); return n; }
+    if (accept(p, scanner.Kind.KwDefer)) n.flag = true;
+    if (!is(p, scanner.Kind.Semi)) n.b = expr(p);
+    if (!accept(p, scanner.Kind.Semi)) { err(p, "Expected semicolon after for condition"); return n; }
+    if (!is(p, scanner.Kind.RParen)) n.c = expr(p);
+    if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected end of for loop header"); return n; }
+    n.d = statement(p);
+    return finish(p, n);
+}
+
+func isTypeGuard(n *ast.Node) bool { return n.kind == ast.NK.TypeGuard; }
+
+func switchStmt(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Switch);
+    next(p);
+    typeSwitch := false;
+    if (accept(p, scanner.Kind.LParen)) {
+        n.flag2 = true;
+        if (!is(p, scanner.Kind.RParen)) {
+            first := simpleOrDecl(p);
+            if (accept(p, scanner.Kind.Semi)) {
+                if ((first.kind == ast.NK.ExprStmt && isTypeGuard(first.a)) ||
+                    (first.kind == ast.NK.VarDecl && len(first.list2) == 1 && isTypeGuard(first.list2[0]))) {
+                    errNode(p, first, "Type guard cannot be a switch initializer"); return n;
+                }
+                n.a = first;
+                if (!is(p, scanner.Kind.RParen)) first = simpleOrDecl(p);
+                else first = zero(*ast.Node);
+            }
+            if (!ast.Nil(first)) {
+                if (first.kind == ast.NK.VarDecl) {
+                    if (len(first.list) == 1 && ast.Nil(first.a) && len(first.list2) == 1 && isTypeGuard(first.list2[0])) {
+                        typeSwitch = true;
+                        n.name = first.list[0].name;
+                        n.nameLine = first.list[0].line; n.nameCol = first.list[0].col;
+                        n.b = first.list2[0].a;
+                    } else { errNode(p, first, "Expected switch expression or a single type-switch binding"); return n; }
+                } else if (isTypeGuard(first.a)) {
+                    typeSwitch = true;
+                    n.b = first.a.a;
+                } else n.b = first.a;
+            }
+        }
+        if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected end of switch expression"); return n; }
+    }
+    if (typeSwitch) n.kind = ast.NK.TypeSwitch;
+    if (!accept(p, scanner.Kind.LBrace)) { err(p, "Expected switch body"); return n; }
+    sawDefault := false;
+    for (!is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
+        c := node(p, ast.NK.Case);
+        if (accept(p, scanner.Kind.KwDefault)) {
+            if (sawDefault) { errNode(p, c, "Duplicate switch default"); return n; }
+            sawDefault = true;
+            c.flag = true;
+        } else if (accept(p, scanner.Kind.KwCase)) {
+            for (;;) {
+                c.list.append(typeSwitch ? constraint(p) : ternary(p));
+                if (p.failed) return n;
+                if (!accept(p, scanner.Kind.Comma)) break;
+            }
+        } else { err(p, "Expected case or default in switch"); return n; }
+        if (!accept(p, scanner.Kind.Colon)) { err(p, "Expected colon after switch case"); return n; }
+        for (!is(p, scanner.Kind.KwCase) && !is(p, scanner.Kind.KwDefault) && !is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
+            c.list2.append(statement(p));
+            if (p.failed) return n;
+        }
+        finish(p, c);
+        n.list.append(c);
+    }
+    // fallthrough placement
+    for (i, c := range n.list) {
+        for (j, s := range c.list2) {
+            if (s.kind == ast.NK.Fallthrough && (j != len(c.list2) - 1 || i == len(n.list) - 1)) {
+                errNode(p, s, "Fallthrough must end a non-final switch case"); return n;
+            }
+        }
+    }
+    if (!accept(p, scanner.Kind.RBrace)) { err(p, "Expected closing switch brace"); return n; }
+    return finish(p, n);
+}
+
+func matchStmt(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Match);
+    next(p);
+    if (!accept(p, scanner.Kind.LParen)) { err(p, "Expected match subject in parentheses"); return n; }
+    n.a = expr(p);
+    if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected closing match parenthesis"); return n; }
+    if (!accept(p, scanner.Kind.LBrace)) { err(p, "Expected match body"); return n; }
+    for (!is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
+        arm := node(p, ast.NK.Arm);
+        arm.a = pattern(p);
+        if (p.failed) return n;
+        if (!accept(p, scanner.Kind.FatArrow)) { err(p, "Expected => after match pattern"); return n; }
+        arm.b = statement(p);
+        accept(p, scanner.Kind.Semi);
+        finish(p, arm);
+        n.list.append(arm);
+        if (p.failed) return n;
+    }
+    expect(p, scanner.Kind.RBrace, "Expected end of block");
+    return finish(p, n);
+}
+
+// pattern: dotted reference with optional type arguments, then optional bindings.
+func pattern(p *Parser) *ast.Node {
+    pt := node(p, ast.NK.Pattern);
+    if (!is(p, scanner.Kind.Ident)) { err(p, "Expected identifier"); return pt; }
+    ref := node(p, ast.NK.Ident);
+    ref.name = tok(p).text;
+    next(p);
+    finish(p, ref);
+    if (is(p, scanner.Kind.Lt)) {
+        args, ok := tryTypeArgs(p);
+        if (ok) { inst := nodeAt(p, ast.NK.Inst, ref); inst.a = ref; inst.list = args; ref = finish(p, inst); }
+    }
+    for (is(p, scanner.Kind.Dot) && peek(p, 1) == scanner.Kind.Ident) {
+        m := nodeAt(p, ast.NK.Member, ref);
+        next(p);
+        m.name = tok(p).text; m.nameLine = tok(p).line; m.nameCol = tok(p).col;
+        next(p);
+        m.a = ref;
+        ref = finish(p, m);
+        if (is(p, scanner.Kind.Lt)) {
+            args, ok := tryTypeArgs(p);
+            if (ok) { inst := nodeAt(p, ast.NK.Inst, ref); inst.a = ref; inst.list = args; ref = finish(p, inst); }
+        }
+    }
+    pt.a = ref;
+    if (accept(p, scanner.Kind.LParen)) {
+        pt.ival = 1;
+        for (!is(p, scanner.Kind.RParen) && !is(p, scanner.Kind.EOF)) {
+            if (!is(p, scanner.Kind.Ident) && !is(p, scanner.Kind.Blank)) { err(p, "Expected identifier"); return pt; }
+            b := node(p, is(p, scanner.Kind.Blank) ? ast.NK.Blank : ast.NK.Ident);
+            b.name = tok(p).text;
+            next(p);
+            finish(p, b);
+            pt.list.append(b);
+            if (!accept(p, scanner.Kind.Comma)) break;
+        }
+        if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected comma or closing parenthesis"); return pt; }
+    } else if (is(p, scanner.Kind.LBrace)) {
+        next(p);
+        pt.ival = 2;
+        for (!is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
+            if (!is(p, scanner.Kind.Ident)) { err(p, "Expected identifier"); return pt; }
+            b := node(p, ast.NK.Entry);
+            b.name = tok(p).text; // binding name
+            b.text = tok(p).text; // field name
+            next(p);
+            if (accept(p, scanner.Kind.Assign)) {
+                if (!is(p, scanner.Kind.Ident)) { err(p, "Expected identifier"); return pt; }
+                b.text = tok(p).text;
+                next(p);
+            }
+            finish(p, b);
+            pt.list.append(b);
+            if (!accept(p, scanner.Kind.Comma)) break;
+        }
+        if (!accept(p, scanner.Kind.RBrace)) { err(p, "Expected end of block"); return pt; }
+    }
+    return finish(p, pt);
+}
+
+func returnStmt(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Return);
+    next(p);
+    if (is(p, scanner.Kind.KwPanic)) {
+        n.kind = ast.NK.ReturnPanic;
+        next(p);
+        n.a = assignExpr(p);
+        semi(p, "Expected semicolon after panic message");
+        return finish(p, n);
+    }
+    if (is(p, scanner.Kind.RBrace)) return finish(p, n);
+    if (accept(p, scanner.Kind.Semi)) return finish(p, n);
+    for (;;) {
+        n.list.append(assignExpr(p));
+        if (p.failed) return n;
+        if (!accept(p, scanner.Kind.Comma)) break;
+        if (is(p, scanner.Kind.Semi) || is(p, scanner.Kind.RBrace)) { err(p, "Expected return value after comma"); return n; }
+    }
+    if (is(p, scanner.Kind.RBrace)) return finish(p, n);
+    semi(p, "Expected semicolon after return values");
+    return finish(p, n);
+}
+
+func asmStmt(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Asm);
+    next(p);
+    if (!is(p, scanner.Kind.Ident)) { err(p, "Expected asm architecture (x86_64, aarch64, riscv64, wasm)"); return n; }
+    arch := tok(p).text;
+    if (arch != "x86_64" && arch != "aarch64" && arch != "riscv64" && arch != "wasm") {
+        err(p, "Unknown asm architecture; expected x86_64, aarch64, riscv64, or wasm"); return n;
+    }
+    n.name = arch;
+    next(p);
+    if (accept(p, scanner.Kind.Slash)) {
+        if (!is(p, scanner.Kind.Ident)) { err(p, "Expected asm platform after '/'"); return n; }
+        plat := tok(p).text;
+        if (plat != "linux" && plat != "macos" && plat != "windows") { err(p, "Unknown asm platform; expected linux, macos, or windows"); return n; }
+        n.text = plat;
+        next(p);
+    }
+    if (!is(p, scanner.Kind.AsmBody)) { err(p, "Expected required '{ ... }' asm block"); return n; }
+    body := tok(p);
+    n.text2 = body.text;
+    next(p);
+    accept(p, scanner.Kind.Semi);
+    asmOperands(p, n, body);
+    return finish(p, n);
+}
+
+// asmOperands collects ${name} operands outside strings and comments.
+func asmOperands(p *Parser, n *ast.Node, body *scanner.Token) {
+    s := body.text;
+    hash := n.name != "aarch64";
+    i := 0; quote: i8 = 0;
+    names: map[string]bool;
+    for (i < len(s)) {
+        c := s[i];
+        nx: i8 = i + 1 < len(s) ? s[i + 1] : 0->i8;
+        if (quote != 0) {
+            if (c == '\\') i++;
+            else if (c == quote) quote = 0;
+            i++; continue;
+        }
+        if (c == '/' && nx == '/' || (c == '#' && hash)) { for (i < len(s) && s[i] != '\n') i++; continue; }
+        if (c == '/' && nx == '*') { i += 2; for (i + 1 < len(s) && !(s[i] == '*' && s[i + 1] == '/')) i++; i += 2; continue; }
+        if (c == '"' || c == '\'') { quote = c; i++; continue; }
+        if (c == '$' && nx == '{') {
+            j := i + 2;
+            start := j;
+            for (j < len(s) && (s[j] == '_' || (s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= '0' && s[j] <= '9' && j > start) || ((s[j]->int) & 255) >= 128)) j++;
+            if (j == start) { errTok(p, body, body.col, "Expected variable name in asm ${name} operand"); return; }
+            if (j >= len(s) || s[j] != '}') { errTok(p, body, body.col, "Expected '}' after asm operand name"); return; }
+            name := s[start:j];
+            _, seen := names[name];
+            if (!seen) {
+                names[name] = true;
+                id := new(ast.Node);
+                id.kind = ast.NK.Ident; id.src = p.src; id.name = name; id.line = body.line; id.col = body.col; id.ival = i;
+                n.list.append(id);
+            }
+            i = j + 1; continue;
+        }
+        i++;
+    }
+    if (n.name == "wasm" && len(n.list) > 0) { errNode(p, n, "Wasm asm blocks do not yet support scalar operands"); return; }
+    if ((n.name == "aarch64" || n.name == "riscv64") && len(n.list) > 4) {
+        errNode(p, n, "AArch64 and RISC-V asm blocks support at most four distinct scalar operands");
+    }
+}

@@ -1,0 +1,514 @@
+package scanner;
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+enum Kind {
+    EOF, Ident, Int, Float, Str, Blank, AsmBody,
+    KwAny, KwAs, KwAsm, KwBreak, KwCase, KwContinue, KwDefault, KwDefer, KwElse, KwEnum,
+    KwExtern, KwFallthrough, KwFor, KwFunc, KwGoto, KwIf, KwImport, KwInterface, KwMatch,
+    KwMixed, KwNull, KwPackage, KwPanic, KwRange, KwReturn, KwStruct, KwSwitch, KwType,
+    KwVarint, KwVaruint,
+    LBrace, RBrace, LParen, RParen, LBrack, RBrack, Semi, Comma, Dot, Colon, Question,
+    Arrow, FatArrow,
+    Plus, Minus, Star, Slash, Percent, Caret, Amp, Pipe, Tilde, Bang,
+    Lt, Gt, Shl, Shr, AndAnd, OrOr, EqEq, NotEq, LtEq, GtEq,
+    Assign, PlusEq, MinusEq, StarEq, SlashEq, PercentEq, CaretEq, AmpEq, PipeEq, ShlEq, ShrEq,
+    PlusPlus, MinusMinus
+}
+
+struct Token {
+    kind Kind;
+    text string;     // lexeme; decoded bytes for strings; body for asm
+    line int;
+    col int;
+    off int;         // byte offset of the token start
+    end int;         // byte offset just past the token
+    isChar bool;     // character literal (kind Int)
+    charValue int;
+    raw bool;        // raw string literal
+}
+
+keywords: map[string]Kind = {
+    "any": Kind.KwAny, "as": Kind.KwAs, "asm": Kind.KwAsm, "break": Kind.KwBreak, "case": Kind.KwCase,
+    "continue": Kind.KwContinue, "default": Kind.KwDefault, "defer": Kind.KwDefer, "else": Kind.KwElse,
+    "enum": Kind.KwEnum, "extern": Kind.KwExtern, "fallthrough": Kind.KwFallthrough, "for": Kind.KwFor,
+    "func": Kind.KwFunc, "goto": Kind.KwGoto, "if": Kind.KwIf, "import": Kind.KwImport,
+    "interface": Kind.KwInterface, "match": Kind.KwMatch, "mixed": Kind.KwMixed, "null": Kind.KwNull,
+    "package": Kind.KwPackage, "panic": Kind.KwPanic, "range": Kind.KwRange, "return": Kind.KwReturn,
+    "struct": Kind.KwStruct, "switch": Kind.KwSwitch, "type": Kind.KwType, "varint": Kind.KwVarint,
+    "varuint": Kind.KwVaruint
+};
+
+func IsKeyword(s string) bool { _, ok := keywords[s]; return ok; }
+
+func KindText(k Kind) string {
+    switch (k) {
+    case Kind.EOF: return "end of file";
+    case Kind.Ident: return "identifier";
+    case Kind.Int: return "integer literal";
+    case Kind.Float: return "float literal";
+    case Kind.Str: return "string literal";
+    case Kind.Blank: return "_";
+    case Kind.AsmBody: return "assembly body";
+    case Kind.LBrace: return "{";
+    case Kind.RBrace: return "}";
+    case Kind.LParen: return "(";
+    case Kind.RParen: return ")";
+    case Kind.LBrack: return "[";
+    case Kind.RBrack: return "]";
+    case Kind.Semi: return ";";
+    case Kind.Comma: return ",";
+    case Kind.Dot: return ".";
+    case Kind.Colon: return ":";
+    case Kind.Question: return "?";
+    case Kind.Arrow: return "->";
+    case Kind.FatArrow: return "=>";
+    case Kind.Plus: return "+";
+    case Kind.Minus: return "-";
+    case Kind.Star: return "*";
+    case Kind.Slash: return "/";
+    case Kind.Percent: return "%";
+    case Kind.Caret: return "^";
+    case Kind.Amp: return "&";
+    case Kind.Pipe: return "|";
+    case Kind.Tilde: return "~";
+    case Kind.Bang: return "!";
+    case Kind.Lt: return "<";
+    case Kind.Gt: return ">";
+    case Kind.Shl: return "<<";
+    case Kind.Shr: return ">>";
+    case Kind.AndAnd: return "&&";
+    case Kind.OrOr: return "||";
+    case Kind.EqEq: return "==";
+    case Kind.NotEq: return "!=";
+    case Kind.LtEq: return "<=";
+    case Kind.GtEq: return ">=";
+    case Kind.Assign: return "=";
+    case Kind.PlusEq: return "+=";
+    case Kind.MinusEq: return "-=";
+    case Kind.StarEq: return "*=";
+    case Kind.SlashEq: return "/=";
+    case Kind.PercentEq: return "%=";
+    case Kind.CaretEq: return "^=";
+    case Kind.AmpEq: return "&=";
+    case Kind.PipeEq: return "|=";
+    case Kind.ShlEq: return "<<=";
+    case Kind.ShrEq: return ">>=";
+    case Kind.PlusPlus: return "++";
+    case Kind.MinusMinus: return "--";
+    }
+    for (name, kw := range keywords) { if (kw == k) return name; }
+    return "?";
+}
+
+struct Scanner {
+    src string;
+    file string;
+    pos int;
+    line int;
+    col int;
+    toks []*Token;
+    diags *diag.List;
+    failed bool;
+    recover bool;
+    // start of the current token
+    tline int;
+    tcol int;
+    toff int;
+}
+
+func charAt(s *Scanner, i int) i8 {
+    if (i >= len(s.src)) return 0;
+    return s.src[i];
+}
+func cur(s *Scanner) i8 { return charAt(s, s.pos); }
+func peek(s *Scanner) i8 { return charAt(s, s.pos + 1); }
+func advance(s *Scanner) {
+    if (s.pos < len(s.src)) {
+        if (s.src[s.pos] == '\n') { s.line++; s.col = 1; } else s.col++;
+        s.pos++;
+    }
+}
+func errAt(s *Scanner, line int, col int, msg string) {
+    s.diags.Error(s.file, line, col, "scanner", msg);
+    s.failed = true;
+}
+func errHere(s *Scanner, msg string) { errAt(s, s.line, s.col, msg); }
+
+func push(s *Scanner, k Kind, text string) *Token {
+    t := new(Token);
+    t.kind = k; t.text = text; t.line = s.tline; t.col = s.tcol; t.off = s.toff; t.end = s.pos;
+    s.toks.append(t);
+    return t;
+}
+
+func op(s *Scanner, k Kind, n int) {
+    for (i := 0; i < n; i++) advance(s);
+    push(s, k, KindText(k));
+}
+
+// DecodeUTF8 strictly decodes one scalar at s[i]; returns (value, length) or (0, 0).
+func DecodeUTF8(src string, i int) (int, int) {
+    if (i >= len(src)) return 0, 0;
+    b0 := (src[i] -> int) & 255;
+    if (b0 < 128) return b0, b0 == 0 ? 0 : 1;
+    n := 0;
+    if (b0 >= 194 && b0 <= 223) n = 2;
+    else if (b0 >= 224 && b0 <= 239) n = 3;
+    else if (b0 >= 240 && b0 <= 244) n = 4;
+    if (n == 0) return 0, 0;
+    c := b0 & ((1 << (7 - n)) - 1);
+    for (k := 1; k < n; k++) {
+        if (i + k >= len(src)) return 0, 0;
+        b := (src[i + k] -> int) & 255;
+        if ((b & 192) != 128) return 0, 0;
+        c = (c << 6) | (b & 63);
+    }
+    if (c > 1114111 || (c >= 55296 && c <= 57343) || (n == 2 && c < 128) || (n == 3 && c < 2048) || (n == 4 && c < 65536)) return 0, 0;
+    return c, n;
+}
+
+func EncodeUTF8(b *util.Buf, c int) {
+    if (c < 128) { b.Addc(c -> i8); return; }
+    if (c < 2048) { b.Addc((192 | (c >> 6)) -> i8); }
+    else if (c < 65536) { b.Addc((224 | (c >> 12)) -> i8); b.Addc((128 | ((c >> 6) & 63)) -> i8); }
+    else { b.Addc((240 | (c >> 18)) -> i8); b.Addc((128 | ((c >> 12) & 63)) -> i8); b.Addc((128 | ((c >> 6) & 63)) -> i8); }
+    b.Addc((128 | (c & 63)) -> i8);
+}
+
+func hexVal(c i8) int {
+    if (c >= '0' && c <= '9') return (c - '0') -> int;
+    if (c >= 'a' && c <= 'f') return (c - 'a') -> int + 10;
+    if (c >= 'A' && c <= 'F') return (c - 'A') -> int + 10;
+    return 99;
+}
+func isDigitBase(c i8, hex bool) bool { return (c >= '0' && c <= '9') || (hex && hexVal(c) < 16); }
+func isAlnum(c i8) bool { return util.IsLetter(c) || c == '_' || util.IsDigit(c); }
+
+// scanNum reads between minn and maxn digits of base starting at the current char.
+// The scanner is left on the last digit. Returns -1 after reporting an error.
+func scanNum(s *Scanner, minn int, maxn int, base int, hex bool) int {
+    value := 0; count := 0;
+    for (;;) {
+        c := cur(s);
+        if (!isDigitBase(c, hex) || hexVal(c) >= base) break;
+        value = value * base + hexVal(c);
+        count++;
+        p := peek(s);
+        if (count == maxn || !isDigitBase(p, hex) || hexVal(p) >= base) break;
+        advance(s);
+    }
+    if (count < minn || value > 255) { errHere(s, "Invalid escape sequence"); return -1; }
+    return value;
+}
+
+// scanChar decodes one (possibly escaped) character at the current position,
+// leaving the scanner on its last byte. Returns (value, isUnicodeEscapeOrMultibyte).
+func scanChar(s *Scanner) (int, bool) {
+    c := cur(s);
+    if (c == '\n') { errHere(s, "newline encountered while scanning char"); return -1, false; }
+    if (c == '\\') {
+        advance(s);
+        e := cur(s);
+        if (e == 'a') return 7, false;
+        if (e == 'b') return 8, false;
+        if (e == 'e') return 27, false;
+        if (e == 'f') return 12, false;
+        if (e == 'n') return 10, false;
+        if (e == 'r') return 13, false;
+        if (e == 't') return 9, false;
+        if (e == 'v') return 11, false;
+        if (e == '\\' || e == '\'' || e == '"' || e == '?') return e -> int, false;
+        if (e == '\n') return 10, false;
+        if (e == 'x') { advance(s); return scanNum(s, 2, 2, 16, true), false; }
+        if (e == 'u' || e == 'U') {
+            count := e == 'u' ? 4 : 8;
+            value := 0; bad := false;
+            for (i := 0; i < count; i++) {
+                advance(s);
+                d := cur(s);
+                if (hexVal(d) >= 16) { bad = true; break; }
+                value = (value << 4) | hexVal(d);
+            }
+            if (bad || value > 1114111 || (value >= 55296 && value <= 57343)) { errHere(s, "Invalid Unicode escape sequence"); return -1, true; }
+            return value, true;
+        }
+        return scanNum(s, 1, 3, 8, false), false;
+    }
+    v, n := DecodeUTF8(s.src, s.pos);
+    if (n == 0) { errHere(s, "Invalid UTF-8 encoding"); return -1, false; }
+    for (i := 1; i < n; i++) advance(s);
+    return v, n > 1;
+}
+
+func scanString(s *Scanner) {
+    b: util.Buf;
+    for (;;) {
+        advance(s);
+        c := cur(s);
+        if (c == 0 && s.pos >= len(s.src) || c == 0) { errHere(s, "End of file inside string literal"); return; }
+        if (c == '\n') { errHere(s, "Unescaped newline inside string literal"); return; }
+        if (c == '"') break;
+        utf8 := ((c -> int) & 255) >= 128 || (c == '\\' && (peek(s) == 'u' || peek(s) == 'U'));
+        v, _ := scanChar(s);
+        if (s.failed) return;
+        if (!utf8 || v < 128) b.Addc(v -> i8);
+        else EncodeUTF8(&b, v);
+    }
+    advance(s);
+    push(s, Kind.Str, b.String());
+}
+
+func scanRaw(s *Scanner) {
+    start := s.pos + 1;
+    for (;;) {
+        advance(s);
+        c := cur(s);
+        if (c == 0) { errAt(s, s.tline, s.tcol, "Unterminated raw string"); return; }
+        if (c == '`') break;
+    }
+    text := s.src[start:s.pos];
+    advance(s);
+    t := push(s, Kind.Str, text);
+    t.raw = true;
+}
+
+func numberError(s *Scanner) {
+    errAt(s, s.tline, s.tcol, "invalid numeric digit, exponent, or integer literal exceeding 8388608 bits");
+}
+
+func scanNumber(s *Scanner) {
+    start := s.pos; at := start; base := 10; floating := false;
+    src := s.src;
+    if (charAt(s, at) == '0') {
+        n := charAt(s, at + 1);
+        if (n == 'x' || n == 'X') base = 16;
+        else if (n == 'b' || n == 'B') base = 2;
+        else if (n == 'o' || n == 'O') base = 8;
+        if (base != 10) at += 2;
+    }
+    digits := at;
+    for (isDigitBase(charAt(s, at), base == 16)) {
+        if (hexVal(charAt(s, at)) >= base) { numberError(s); return; }
+        at++;
+    }
+    if (at == digits) { numberError(s); return; }
+    intDigits := at - digits;
+    if (charAt(s, at) == '.' && isDigitBase(charAt(s, at + 1), base == 16)) {
+        floating = true; at++;
+        for (isDigitBase(charAt(s, at), base == 16)) {
+            if (hexVal(charAt(s, at)) >= base) { numberError(s); return; }
+            at++;
+        }
+    }
+    if (base == 10 && (charAt(s, at) == 'e' || charAt(s, at) == 'E')) {
+        floating = true; at++;
+        if (charAt(s, at) == '+' || charAt(s, at) == '-') at++;
+        if (!util.IsDigit(charAt(s, at))) { numberError(s); return; }
+        for (util.IsDigit(charAt(s, at))) at++;
+    }
+    if (isAlnum(charAt(s, at))) { numberError(s); return; }
+    // Magnitude limit: 8388608 bits.
+    if (!floating) {
+        bits := 0;
+        if (base == 16) bits = intDigits * 4; else if (base == 8) bits = intDigits * 3; else if (base == 2) bits = intDigits;
+        else bits = (intDigits * 3322) / 1000;
+        if (bits > 8388608 + 4) {
+            // Precise check for values right at the boundary is done by the literal parser.
+            numberError(s); return;
+        }
+    }
+    text := src[start:at];
+    if (floating && (base == 10 || base == 16)) {
+        if (!FloatFinite(text)) { numberError(s); return; }
+    }
+    for (s.pos < at) advance(s);
+    push(s, floating ? Kind.Float : Kind.Int, text);
+}
+
+func asmHeader(s *Scanner) bool {
+    n := len(s.toks);
+    if (n >= 2 && s.toks[n - 2].kind == Kind.KwAsm && s.toks[n - 1].kind == Kind.Ident) return true;
+    return n >= 4 && s.toks[n - 4].kind == Kind.KwAsm && s.toks[n - 3].kind == Kind.Ident &&
+        s.toks[n - 2].kind == Kind.Slash && s.toks[n - 1].kind == Kind.Ident;
+}
+
+func scanAsm(s *Scanner) {
+    n := len(s.toks);
+    arch := s.toks[n - 2].kind == Kind.Slash ? s.toks[n - 3].text : s.toks[n - 1].text;
+    hash := arch != "aarch64";
+    start := s.pos + 1;
+    depth := 1; quote: i8 = 0; lineC := false; blockC := false;
+    advance(s);
+    for (s.pos < len(s.src) && cur(s) != 0) {
+        c := cur(s); nx := peek(s);
+        if (lineC) { if (c == '\n') lineC = false; advance(s); continue; }
+        if (blockC) {
+            if (c == '*' && nx == '/') { advance(s); blockC = false; }
+            advance(s); continue;
+        }
+        if (quote != 0) {
+            if (c == '\\' && nx != 0) advance(s);
+            else if (c == quote) quote = 0;
+            advance(s); continue;
+        }
+        if (c == '/' && nx == '/') { lineC = true; advance(s); }
+        else if (c == '/' && nx == '*') { blockC = true; advance(s); }
+        else if (c == '#' && hash) lineC = true;
+        else if (c == '"' || c == '\'') quote = c;
+        else if (c == '{') depth++;
+        else if (c == '}') {
+            depth--;
+            if (depth == 0) {
+                body := s.src[start:s.pos];
+                advance(s);
+                push(s, Kind.AsmBody, body);
+                return;
+            }
+        }
+        advance(s);
+    }
+    errAt(s, s.tline, s.tcol, "Unterminated asm block");
+}
+
+func blockComment(s *Scanner) {
+    depth := 0;
+    for (;;) {
+        c := cur(s);
+        if (c == 0) { errAt(s, s.tline, s.tcol, "Unterminated block comment"); return; }
+        if (c == '/' && peek(s) == '*') { advance(s); depth++; }
+        else if (c == '*' && peek(s) == '/') {
+            advance(s);
+            depth--;
+            if (depth == 0) { advance(s); return; }
+        }
+        advance(s);
+    }
+}
+
+func next(s *Scanner) {
+    s.tline = s.line; s.tcol = s.col; s.toff = s.pos;
+    c := cur(s);
+    p := peek(s);
+    if (c == '{') {
+        if (asmHeader(s)) { scanAsm(s); return; }
+        op(s, Kind.LBrace, 1); return;
+    }
+    if (c == '}') { op(s, Kind.RBrace, 1); return; }
+    if (c == '(') { op(s, Kind.LParen, 1); return; }
+    if (c == ')') { op(s, Kind.RParen, 1); return; }
+    if (c == '[') { op(s, Kind.LBrack, 1); return; }
+    if (c == ']') { op(s, Kind.RBrack, 1); return; }
+    if (c == '"') { scanString(s); return; }
+    if (c == ';') { op(s, Kind.Semi, 1); return; }
+    if (c == '`') { scanRaw(s); return; }
+    if (c == ',') { op(s, Kind.Comma, 1); return; }
+    if (c == '.') { op(s, Kind.Dot, 1); return; }
+    if (c == '=') {
+        if (p == '>') { op(s, Kind.FatArrow, 2); return; }
+        if (p == '=') { op(s, Kind.EqEq, 2); return; }
+        op(s, Kind.Assign, 1); return;
+    }
+    if (c == '*') { if (p == '=') op(s, Kind.StarEq, 2); else op(s, Kind.Star, 1); return; }
+    if (c == '%') { if (p == '=') op(s, Kind.PercentEq, 2); else op(s, Kind.Percent, 1); return; }
+    if (c == '^') { if (p == '=') op(s, Kind.CaretEq, 2); else op(s, Kind.Caret, 1); return; }
+    if (c == '~') { op(s, Kind.Tilde, 1); return; }
+    if (c == ':') { op(s, Kind.Colon, 1); return; }
+    if (c == '?') { op(s, Kind.Question, 1); return; }
+    if (c == '+') {
+        if (p == '=') op(s, Kind.PlusEq, 2); else if (p == '+') op(s, Kind.PlusPlus, 2); else op(s, Kind.Plus, 1);
+        return;
+    }
+    if (c == '-') {
+        if (p == '>') op(s, Kind.Arrow, 2); else if (p == '=') op(s, Kind.MinusEq, 2);
+        else if (p == '-') op(s, Kind.MinusMinus, 2); else op(s, Kind.Minus, 1);
+        return;
+    }
+    if (c == '|') {
+        if (p == '=') op(s, Kind.PipeEq, 2); else if (p == '|') op(s, Kind.OrOr, 2); else op(s, Kind.Pipe, 1);
+        return;
+    }
+    if (c == '&') {
+        if (p == '=') op(s, Kind.AmpEq, 2); else if (p == '&') op(s, Kind.AndAnd, 2); else op(s, Kind.Amp, 1);
+        return;
+    }
+    if (c == '/') {
+        if (p == '=') { op(s, Kind.SlashEq, 2); return; }
+        if (p == '/') { for (cur(s) != '\n' && cur(s) != 0) advance(s); return; }
+        if (p == '*') { blockComment(s); return; }
+        op(s, Kind.Slash, 1); return;
+    }
+    if (c == '<') {
+        if (p == '=') { op(s, Kind.LtEq, 2); return; }
+        if (p == '<') { if (charAt(s, s.pos + 2) == '=') op(s, Kind.ShlEq, 3); else op(s, Kind.Shl, 2); return; }
+        op(s, Kind.Lt, 1); return;
+    }
+    if (c == '>') {
+        if (p == '=') { op(s, Kind.GtEq, 2); return; }
+        if (p == '>') { if (charAt(s, s.pos + 2) == '=') op(s, Kind.ShrEq, 3); else op(s, Kind.Shr, 2); return; }
+        op(s, Kind.Gt, 1); return;
+    }
+    if (c == '!') { if (p == '=') op(s, Kind.NotEq, 2); else op(s, Kind.Bang, 1); return; }
+    if (c == '\'') {
+        advance(s);
+        f := cur(s);
+        if (f == 0 || f == '\n' || f == '\'') { errAt(s, s.tline, s.tcol, "Invalid character literal"); return; }
+        v, _ := scanChar(s);
+        if (s.failed) return;
+        advance(s);
+        if (cur(s) != '\'') { errAt(s, s.tline, s.tcol, "Expected closing quote after character literal"); return; }
+        advance(s);
+        t := push(s, Kind.Int, s.src[s.toff:s.pos]);
+        t.isChar = true; t.charValue = v;
+        return;
+    }
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { advance(s); return; }
+    if (util.IsDigit(c)) { scanNumber(s); return; }
+    v, n := DecodeUTF8(s.src, s.pos);
+    if (n == 0 || !IsIdentStart(v)) {
+        errHere(s, "Unexpected or invalid character or UTF-8 encoding in identifier");
+        return;
+    }
+    end := s.pos + n;
+    for (;;) {
+        v2, n2 := DecodeUTF8(s.src, end);
+        if (n2 == 0 || !IsIdentContinue(v2)) break;
+        end += n2;
+    }
+    for (s.pos < end) advance(s);
+    text := s.src[s.toff:end];
+    if (text == "_") { push(s, Kind.Blank, text); return; }
+    kw, ok := keywords[text];
+    if (ok) push(s, kw, text); else push(s, Kind.Ident, text);
+}
+
+// Scan tokenizes src. In strict mode the first error stops scanning.
+// In recovery mode (editor), errors are skipped and scanning continues.
+func Scan(file string, src string, diags *diag.List, recover bool) ([]*Token, bool) {
+    s := new(Scanner);
+    s.src = src; s.file = file; s.line = 1; s.col = 1; s.diags = diags; s.recover = recover;
+    anyError := false;
+    for (;;) {
+        if (s.pos >= len(src) || cur(s) == 0) {
+            s.tline = s.line; s.tcol = s.col; s.toff = s.pos;
+            push(s, Kind.EOF, "EOF");
+            break;
+        }
+        before := s.pos;
+        next(s);
+        if (s.failed) {
+            anyError = true;
+            if (!recover) break;
+            s.failed = false;
+            if (s.pos == before) advance(s);
+        }
+    }
+    return s.toks, !anyError;
+}
+
+// IsExported reports whether an identifier begins with an uppercase letter.
+func IsExported(name string) bool {
+    v, n := DecodeUTF8(name, 0);
+    if (n == 0) return false;
+    return IsUpper(v);
+}

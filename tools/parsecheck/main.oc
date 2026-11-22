@@ -1,0 +1,26 @@
+package main;
+import "os";
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/parser";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+func main() int {
+    args := os.Args();
+    bad := 0;
+    for (i := 1; i < len(args); i++) {
+        text, ok := util.ReadFile(args[i]);
+        if (!ok) { util.Stderr("cannot read " + args[i] + "\n"); bad++; continue; }
+        d := diag.NewList();
+        d.AddSource(args[i], text);
+        src := new(ast.Source); src.path = args[i]; src.text = text;
+        toks, sok := scanner.Scan(args[i], text, d, false);
+        if (!sok) { bad++; continue; }
+        src.tokens = toks;
+        _, pok := parser.ParseFile(src, d, false);
+        if (!pok) bad++;
+    }
+    util.Stdout(util.Itoa(len(args) - 1) + " files, " + util.Itoa(bad) + " failed\n");
+    return bad > 0 ? 1 : 0;
+}

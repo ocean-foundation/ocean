@@ -1,0 +1,593 @@
+package backend;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+func typeOf(g *Gen, n *ast.Node) *ast.Type { return sub(g, n.ty); }
+
+// ---- scalar conversions ----
+
+func intConv(g *Gen, val string, from *ast.Type, to *ast.Type) string {
+    f := under(from); t := under(to);
+    if (f.bits == t.bits) return val;
+    r := tmp(g);
+    if (f.bits < t.bits) emit(g, r + " = " + (f.signed ? "sext " : "zext ") + ll(f) + " " + val + " to " + ll(t));
+    else emit(g, r + " = trunc " + ll(f) + " " + val + " to " + ll(t));
+    return r;
+}
+
+// numConv converts between numeric/bool scalars (explicit cast semantics).
+func numConv(g *Gen, val string, from *ast.Type, to *ast.Type) string {
+    f := under(from); t := under(to);
+    if (f.kind == ast.TK.Int && t.kind == ast.TK.Int) return intConv(g, val, f, t);
+    r := tmp(g);
+    if (f.kind == ast.TK.Int && t.kind == ast.TK.Float) { emit(g, r + " = " + (f.signed ? "sitofp " : "uitofp ") + ll(f) + " " + val + " to " + ll(t)); return r; }
+    if (f.kind == ast.TK.Float && t.kind == ast.TK.Int) { emit(g, r + " = " + (t.signed ? "fptosi " : "fptoui ") + ll(f) + " " + val + " to " + ll(t)); return r; }
+    if (f.kind == ast.TK.Float && t.kind == ast.TK.Float) {
+        if (f.bits == t.bits) return val;
+        emit(g, r + " = " + (f.bits < t.bits ? "fpext " : "fptrunc ") + ll(f) + " " + val + " to " + ll(t));
+        return r;
+    }
+    if (f.kind == ast.TK.Bool && t.kind == ast.TK.Int) { emit(g, r + " = zext i1 " + val + " to " + ll(t)); return r; }
+    if (f.kind == ast.TK.Bool && t.kind == ast.TK.Float) { emit(g, r + " = uitofp i1 " + val + " to " + ll(t)); return r; }
+    if (f.kind == ast.TK.Int && t.kind == ast.TK.Bool) { emit(g, r + " = icmp ne " + ll(f) + " " + val + ", 0"); return r; }
+    if (f.kind == ast.TK.Float && t.kind == ast.TK.Bool) { emit(g, r + " = fcmp une " + ll(f) + " " + val + ", 0.0"); return r; }
+    if (f.kind == ast.TK.Bool && t.kind == ast.TK.Bool) return val;
+    return val;
+}
+
+func nullPtr() string { return "inttoptr (i64 1 to ptr)"; }
+
+// box converts a concrete value to an interface pair (deep copy into a box).
+func box(g *Gen, v V) V {
+    t := under(v.t);
+    if (t.kind == ast.TK.Interface || t.kind == ast.TK.Union) return v;
+    if (v.t.kind == ast.TK.Null) return mkV("zeroinitializer", check.TAny());
+    d := desc(g, v.t);
+    p := spill(g, v);
+    data := tmp(g);
+    emit(g, data + " = call ptr @oc_box(ptr " + d + ", ptr " + p + ")");
+    return pair(g, d, data, check.TAny());
+}
+
+func pair(g *Gen, a string, b string, t *ast.Type) V {
+    r1 := tmp(g); r2 := tmp(g);
+    emit(g, r1 + " = insertvalue {ptr, ptr} poison, ptr " + a + ", 0");
+    emit(g, r2 + " = insertvalue {ptr, ptr} " + r1 + ", ptr " + b + ", 1");
+    return freshV(r2, t);
+}
+func extract(g *Gen, v string, i int) string {
+    r := tmp(g);
+    emit(g, r + " = extractvalue {ptr, ptr} " + v + ", " + itoa(i));
+    return r;
+}
+
+// conv applies implicit assignment conversion of v to dest.
+func conv(g *Gen, v V, dest0 *ast.Type) V {
+    dest := sub(g, dest0);
+    t := v.t;
+    if (nilT(t) || nilT(dest)) return v;
+    if (check.Identical(t, dest)) return v;
+    ud := under(dest); ut := under(t);
+    if (t.kind == ast.TK.Null) {
+        if (ud.kind == ast.TK.Interface || ud.kind == ast.TK.Union || ud.kind == ast.TK.Func) return mkV("zeroinitializer", dest);
+        if (ud.kind == ast.TK.Enum) return zeroV(g, dest);
+        return mkV(nullPtr(), dest);
+    }
+    if (ud.kind == ast.TK.Interface || ud.kind == ast.TK.Union) {
+        if (ut.kind == ast.TK.Interface || ut.kind == ast.TK.Union) { v.t = dest; return v; }
+        if (ud.kind == ast.TK.Union && !inUnion(g, t, ud)) {
+            w := widenTarget(g, t, ud);
+            if (!nilT(w)) {
+                nv := mkV(numConv(g, v.r, t, w), w);
+                b := box(g, nv); b.t = dest; return b;
+            }
+        }
+        b := box(g, v);
+        b.t = dest;
+        return b;
+    }
+    if (ut.kind == ast.TK.Int && ud.kind == ast.TK.Int) return mkV(intConv(g, v.r, ut, ud), dest);
+    if (ut.kind == ast.TK.Float && ud.kind == ast.TK.Float) return mkV(numConv(g, v.r, ut, ud), dest);
+    if (ut.kind == ast.TK.String && ud.kind == ast.TK.Dyn) {
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_arr_copy(ptr " + v.r + ", ptr " + desc(g, check.TI8()) + ")");
+        return freshV(r, dest);
+    }
+    if (ut.kind == ast.TK.Dyn && ud.kind == ast.TK.String) {
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_arr_copy(ptr " + v.r + ", ptr " + desc(g, check.TI8()) + ")");
+        return freshV(r, dest);
+    }
+    if (ut.kind == ast.TK.Array && ud.kind == ast.TK.Array) {
+        if (ut.len >= 0 && ud.len < 0) {
+            r := tmp(g);
+            emit(g, r + " = call ptr @oc_block_copy(ptr " + v.r + ", ptr " + desc(g, ud.elem) + ")");
+            return freshV(r, dest);
+        }
+        if (ut.len < 0 && ud.len >= 0) {
+            p := alloca(g, dest);
+            memcpy(g, p, v.r, sizeOf(g, dest));
+            return mkV(p, dest);
+        }
+        v.t = dest; return v;
+    }
+    if (ut.kind == ast.TK.Buffer && ud.kind == ast.TK.Buffer) {
+        if (ut.len > 0 && ud.len <= 0) { v2 := mkV(v.r, dest); return v2; }
+        v.t = dest; return v;
+    }
+    if (ud.kind == ast.TK.Ptr || ud.kind == ast.TK.Buffer) { v.t = dest; return v; }
+    if (ud.kind == ast.TK.Dyn && ut.kind == ast.TK.Dyn) { v.t = dest; return v; }
+    v.t = dest;
+    return v;
+}
+
+func inUnion(g *Gen, t *ast.Type, u *ast.Type) bool {
+    for (i, term := range u.terms) {
+        if (u.tilde[i]) { if (check.Identical(under(t), under(term))) return true; continue; }
+        if (check.Identical(t, term)) return true;
+    }
+    return false;
+}
+func widenTarget(g *Gen, t *ast.Type, u *ast.Type) *ast.Type {
+    a := under(t);
+    for (i, term := range u.terms) {
+        if (u.tilde[i]) continue;
+        x := under(term);
+        if (a.kind == ast.TK.Int && x.kind == ast.TK.Int && ((a.signed == x.signed && x.bits >= a.bits) || (!a.signed && x.signed && x.bits > a.bits))) return term;
+        if (a.kind == ast.TK.Float && x.kind == ast.TK.Float && x.bits >= a.bits) return term;
+    }
+    return zero(*ast.Type);
+}
+
+// genAs evaluates n converted to dest, as an owned value (copied when needed).
+func genAs(g *Gen, n *ast.Node, dest *ast.Type) V {
+    v := genExpr(g, n);
+    v = conv(g, v, dest);
+    return copyV(g, v);
+}
+
+// ---- storage ----
+
+func globalRef(g *Gen, s *ast.Symbol) string {
+    name, ok := g.globalNames[s.id];
+    if (ok) return name;
+    pk := "";
+    if (!nilPkgB(s.pkg)) pk = s.pkg.name + ".";
+    name = "@\"g." + mangle(pk + s.name + "." + itoa(s.id)) + "\"";
+    g.globalNames[s.id] = name;
+    return name;
+}
+
+func storageOf(g *Gen, s *ast.Symbol, at *ast.Node) string {
+    if (s.global) return globalRef(g, s);
+    p, ok := g.fn.locals[s.id];
+    if (ok) return p;
+    fail(g, at, "variable has no storage: " + s.name);
+    return "null";
+}
+
+// ---- constants ----
+
+func floatHex(v float) string {
+    raw := &v;
+    bits := *((raw -> (*void)) -> (*uint));
+    return "0x" + hex16(bits);
+}
+func hex16(bits uint) string {
+    out := make([]i8);
+    for (i := 15; i >= 0; i--) {
+        d := ((bits >> ((i * 4) -> uint)) & 15->uint) -> int;
+        out.append("0123456789ABCDEF"[d]);
+    }
+    return out -> string;
+}
+
+func floatConst(g *Gen, text string, t *ast.Type) string {
+    if (under(t).bits == 32) { f := scanner.ParseF32(text); return floatHex(f -> float); }
+    return floatHex(scanner.ParseF64(text));
+}
+
+func intLitV(g *Gen, n *ast.Node, t *ast.Type) V {
+    dec := g.c.LiteralDecimal(n);
+    u := under(t);
+    if (u.kind == ast.TK.Float) {
+        if (u.bits == 32) { f := scanner.ParseF32(dec); return mkV(floatHex(f -> float), t); }
+        return mkV(floatHex(scanner.ParseF64(dec)), t);
+    }
+    if (u.kind == ast.TK.Bool) return mkV(dec == "0" ? "false" : "true", t);
+    if (u.kind == ast.TK.Ptr || u.kind == ast.TK.Buffer) return mkV("inttoptr (i64 " + dec + " to ptr)", t);
+    if (u.kind != ast.TK.Int) return mkV(dec, check.TInt());
+    // wrap literal values that exceed the destination width (explicit casts)
+    return mkV(dec, t);
+}
+
+// ---- expressions ----
+
+func genExpr(g *Gen, n *ast.Node) V {
+    t := typeOf(g, n);
+    switch (n.kind) {
+    case ast.NK.IntLit: return intLitV(g, n, t);
+    case ast.NK.FloatLit: return mkV(floatConst(g, n.text, t), t);
+    case ast.NK.StrLit: return mkV(strConst(g, n.text), t);
+    case ast.NK.Null: return mkV(nullPtr(), t);
+    case ast.NK.Ident: return genIdent(g, n, t);
+    case ast.NK.Member: return genMember(g, n, t);
+    case ast.NK.Unary: return genUnary(g, n, t);
+    case ast.NK.Binary: return genBinary(g, n, t);
+    case ast.NK.PostInc: return genInc(g, n, n.a, true);
+    case ast.NK.Assign: return genAssign(g, n);
+    case ast.NK.MultiAssign: genMultiAssign(g, n); return mkV("", check.TVoid());
+    case ast.NK.Ternary: return genTernary(g, n, t);
+    case ast.NK.Comma:
+        last: V;
+        for (_, x := range n.list) last = genExpr(g, x);
+        return last;
+    case ast.NK.Call: return genCall(g, n, t);
+    case ast.NK.Index: return genIndex(g, n, t);
+    case ast.NK.Slice: return genSlice(g, n, t);
+    case ast.NK.Assert: return genAssert(g, n, t);
+    case ast.NK.Inst:
+        if (n.sem == ast.Sem.FuncValue) return funcValue(g, n.sym, n.targs, t);
+    case ast.NK.Composite: return genComposite(g, n, t);
+    case ast.NK.Cast: return genCast(g, n, t);
+    case ast.NK.FuncLit: return genFuncLit(g, n, t);
+    case ast.NK.Zero: return zeroV(g, t);
+    case ast.NK.New:
+        et := sub(g, n.tyAlt);
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_alloc(i64 " + itoa(sizeOf(g, et)) + ")");
+        if (needsInit(g, et)) emit(g, "call void @oc_zero(ptr " + r + ", ptr " + desc(g, et) + ")");
+        return freshV(r, t);
+    case ast.NK.Make: return freshV("null", t);
+    case ast.NK.Sizeof:
+        st := sub(g, n.tyAlt);
+        return mkV(itoa(sizeOf(g, st)), t);
+    case ast.NK.TArray:
+        et := sub(g, n.tyAlt);
+        cnt := genAs(g, n.b, check.TInt());
+        r := tmp(g);
+        if (needsInit(g, et)) emit(g, r + " = call ptr @oc_arr_new_init(i64 " + cnt.r + ", ptr " + desc(g, et) + ", i64 " + itoa(site(g, n)) + ")");
+        else emit(g, r + " = call ptr @oc_arr_new(i64 " + cnt.r + ", i64 " + itoa(sizeOf(g, et)) + ", i64 " + itoa(site(g, n)) + ")");
+        return freshV(r, t);
+    case ast.NK.TBuffer:
+        et := sub(g, n.tyAlt);
+        cnt := genAs(g, n.b, check.TInt());
+        bytes := tmp(g);
+        emit(g, bytes + " = mul i64 " + cnt.r + ", " + itoa(sizeOf(g, et)));
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_alloc(i64 " + bytes + ")");
+        return freshV(r, t);
+    }
+    fail(g, n, "unsupported expression");
+    return mkV("undef", t);
+}
+
+func funcValue(g *Gen, s *ast.Symbol, targs []*ast.Type, t *ast.Type) V {
+    name := funcRef(g, s, targs);
+    return pair(g, name, "null", t);
+}
+
+func genIdent(g *Gen, n *ast.Node, t *ast.Type) V {
+    switch (n.sem) {
+    case ast.Sem.LocalVar, ast.Sem.GlobalVar:
+        return load(g, t, storageOf(g, n.sym, n));
+    case ast.Sem.FuncValue: return funcValue(g, n.sym, make([]*ast.Type), t);
+    case ast.Sem.BuiltinName:
+        if (n.name == "true") return mkV("true", t);
+        return mkV("false", t);
+    }
+    fail(g, n, "unsupported identifier " + n.name);
+    return mkV("undef", t);
+}
+
+// ---- addresses ----
+
+func fieldPlace(g *Gen, st *ast.Type, idx int) *check.FieldPlace {
+    l := g.c.StructLayoutOf(under(st));
+    return l.places[idx];
+}
+
+// structBase returns the address of the struct storage behind a member base.
+// derefChain loads through pointer-to-pointer levels until one pointer remains.
+func derefChain(g *Gen, v V) V {
+    for (v.t.kind == ast.TK.Ptr && v.t.elem.kind == ast.TK.Ptr) v = load(g, v.t.elem, v.r);
+    return v;
+}
+
+func structBase(g *Gen, base *ast.Node) (string, *ast.Type) {
+    bt := typeOf(g, base);
+    if (bt.kind == ast.TK.Ptr) {
+        v := derefChain(g, genExpr(g, base));
+        return v.r, v.t.elem;
+    }
+    if (isLvalue(base)) return addrOf(g, base), bt;
+    v := genExpr(g, base);
+    return spill(g, v), bt;
+}
+
+func isLvalue(n *ast.Node) bool {
+    switch (n.kind) {
+    case ast.NK.Ident: return n.sem == ast.Sem.LocalVar || n.sem == ast.Sem.GlobalVar;
+    case ast.NK.Member: return n.sem == ast.Sem.Field || (n.sem == ast.Sem.PkgMember && !nilS(n.sym) && n.sym.kind == ast.SK.Var);
+    case ast.NK.Index: return true;
+    case ast.NK.Unary: return n.op == scanner.Kind.Star;
+    }
+    return false;
+}
+
+// addrOf computes the storage address of an lvalue.
+func addrOf(g *Gen, n *ast.Node) string {
+    switch (n.kind) {
+    case ast.NK.Ident:
+        return storageOf(g, n.sym, n);
+    case ast.NK.Member:
+        if (n.sem == ast.Sem.PkgMember) return globalRef(g, n.sym);
+        if (n.sem == ast.Sem.Field) {
+            p, st := structBase(g, n.a);
+            return gep(g, p, fieldPlace(g, st, n.ival).offset);
+        }
+    case ast.NK.Index: return indexAddr(g, n, false);
+    case ast.NK.Unary:
+        if (n.op == scanner.Kind.Star) {
+            v := genExpr(g, n.a);
+            return v.r;
+        }
+    }
+    // temporaries: materialize on the heap so the address stays valid
+    v := genExpr(g, n);
+    t := typeOf(g, n);
+    r := tmp(g);
+    emit(g, r + " = call ptr @oc_alloc(i64 " + itoa(sizeOf(g, t)) + ")");
+    store(g, t, r, v);
+    return r;
+}
+
+// ---- members ----
+
+func readBitfield(g *Gen, base string, place *check.FieldPlace, ft *ast.Type) V {
+    u := under(ft);
+    unitT := "i" + itoa(sizeBits(place.unitBits));
+    p := gep(g, base, place.offset);
+    w := tmp(g);
+    emit(g, w + " = load " + unitT + ", ptr " + p);
+    sh := w;
+    if (place.bitOffset > 0) { sh = tmp(g); emit(g, sh + " = lshr " + unitT + " " + w + ", " + itoa(place.bitOffset)); }
+    tr := tmp(g);
+    fieldT := "i" + itoa(place.bits);
+    if (sizeBits(place.unitBits) == place.bits) tr = sh;
+    else emit(g, tr + " = trunc " + unitT + " " + sh + " to " + fieldT);
+    if (u.kind == ast.TK.Bool) {
+        if (place.bits == 1) return mkV(tr, ft);
+        b := tmp(g); emit(g, b + " = icmp ne " + fieldT + " " + tr + ", 0"); return mkV(b, ft);
+    }
+    if (place.bits == u.bits) return mkV(tr, ft);
+    r := tmp(g);
+    emit(g, r + " = " + (u.signed ? "sext " : "zext ") + fieldT + " " + tr + " to " + ll(u));
+    return mkV(r, ft);
+}
+
+func sizeBits(bits int) int { return ((bits + 7) / 8) * 8 > 0 ? intStorageBits(bits) : 8; }
+func intStorageBits(bits int) int {
+    if (bits <= 8) return 8; if (bits <= 16) return 16; if (bits <= 32) return 32; return 64;
+}
+
+// writeBitfield stores v into a bitfield and returns the stored (re-extended) value.
+func writeBitfield(g *Gen, base string, place *check.FieldPlace, ft *ast.Type, v V) V {
+    u := under(ft);
+    ub := intStorageBits(place.unitBits);
+    unitT := "i" + itoa(ub);
+    fieldT := "i" + itoa(place.bits);
+    p := gep(g, base, place.offset);
+    val := v.r;
+    srcT := ll(u);
+    if (u.kind == ast.TK.Bool) srcT = "i1";
+    nb := 1;
+    if (u.kind != ast.TK.Bool) nb = u.bits;
+    fv := val;
+    if (nb > place.bits) { fv = tmp(g); emit(g, fv + " = trunc " + srcT + " " + val + " to " + fieldT); }
+    else if (nb < place.bits) { fv = tmp(g); emit(g, fv + " = zext " + srcT + " " + val + " to " + fieldT); }
+    wide := fv;
+    if (place.bits < ub) { wide = tmp(g); emit(g, wide + " = zext " + fieldT + " " + fv + " to " + unitT); }
+    if (place.bitOffset > 0) { s := tmp(g); emit(g, s + " = shl " + unitT + " " + wide + ", " + itoa(place.bitOffset)); wide = s; }
+    old := tmp(g);
+    emit(g, old + " = load " + unitT + ", ptr " + p);
+    mask := maskString(place.bitOffset, place.bits, ub);
+    cleared := tmp(g);
+    emit(g, cleared + " = and " + unitT + " " + old + ", " + mask);
+    nw := tmp(g);
+    emit(g, nw + " = or " + unitT + " " + cleared + ", " + wide);
+    emit(g, "store " + unitT + " " + nw + ", ptr " + p);
+    return readBitfield(g, base, place, ft);
+}
+
+// maskString gives the inverted field mask as a decimal constant.
+func maskString(off int, bits int, width int) string {
+    // build as unsigned 64-bit then reinterpret
+    m: uint = 0;
+    for (i := 0; i < bits; i++) m = m | ((1->uint) << ((off + i)->uint));
+    inv := ~m;
+    if (width < 64) inv = inv & (((1->uint) << (width->uint)) - 1->uint);
+    v := inv -> int;
+    if (width < 64) {
+        // sign interpretation within width
+        if (((v >> (width - 1)) & 1) != 0) v = v - (1 << width);
+    }
+    return itoa(v);
+}
+
+func arrayDataPtr(g *Gen, v V) string {
+    u := under(v.t);
+    if (u.kind == ast.TK.Array) return gep(g, v.r, g.c.ArrayDataOffset(u.elem));
+    r := tmp(g);
+    emit(g, r + " = call ptr @oc_arr_data(ptr " + v.r + ")");
+    return r;
+}
+
+// collectionLen returns the element count of an array/dyn/string/map/buffer.
+func collectionLen(g *Gen, v V) string {
+    u := under(v.t);
+    switch (u.kind) {
+    case ast.TK.Dyn, ast.TK.String:
+        r := tmp(g); emit(g, r + " = call i64 @oc_arr_len(ptr " + v.r + ")"); return r;
+    case ast.TK.Map:
+        r := tmp(g); emit(g, r + " = call i64 @oc_map_len(ptr " + v.r + ")"); return r;
+    case ast.TK.Array:
+        if (u.len >= 0) return itoa(u.len);
+        h := tmp(g); emit(g, h + " = load i64, ptr " + v.r);
+        es := sizeOf(g, u.elem);
+        if (es == 0) return "0";
+        r := tmp(g); emit(g, r + " = udiv i64 " + h + ", " + itoa(es)); return r;
+    case ast.TK.Buffer:
+        if (u.len > 0) return itoa(u.len);
+    }
+    return "0";
+}
+
+func genMember(g *Gen, n *ast.Node, t *ast.Type) V {
+    switch (n.sem) {
+    case ast.Sem.PkgMember:
+        if (n.sym.kind == ast.SK.Var) return load(g, t, globalRef(g, n.sym));
+        if (n.sym.kind == ast.SK.Func) return funcValue(g, n.sym, make([]*ast.Type), t);
+    case ast.Sem.Field:
+        p, st := structBase(g, n.a);
+        return load(g, t, gep(g, p, fieldPlace(g, st, n.ival).offset));
+    case ast.Sem.BitField:
+        p, st := structBase(g, n.a);
+        return readBitfield(g, p, fieldPlace(g, st, n.ival), t);
+    case ast.Sem.ArrayLength:
+        v := genExpr(g, n.a);
+        if (v.t.kind == ast.TK.Ptr) v = load(g, v.t.elem, v.r);
+        return mkV(collectionLen(g, v), t);
+    case ast.Sem.ArrayCapacity:
+        v := genExpr(g, n.a);
+        if (v.t.kind == ast.TK.Ptr) v = load(g, v.t.elem, v.r);
+        r := tmp(g); emit(g, r + " = call i64 @oc_arr_cap(ptr " + v.r + ")");
+        return mkV(r, t);
+    case ast.Sem.ArraySize:
+        v := genExpr(g, n.a);
+        if (v.t.kind == ast.TK.Ptr) v = load(g, v.t.elem, v.r);
+        u := under(v.t);
+        if (u.kind == ast.TK.Array) { r := tmp(g); emit(g, r + " = load i64, ptr " + v.r); return mkV(r, t); }
+        l := collectionLen(g, v);
+        es := u.kind == ast.TK.String ? 1 : sizeOf(g, u.elem);
+        r := tmp(g); emit(g, r + " = mul i64 " + l + ", " + itoa(es));
+        return mkV(r, t);
+    case ast.Sem.ArrayData:
+        bt := typeOf(g, n.a);
+        if (bt.kind == ast.TK.Ptr) {
+            pv := genExpr(g, n.a);
+            v := load(g, bt.elem, pv.r);
+            return mkV(arrayDataPtr(g, v), t);
+        }
+        if (under(bt).kind == ast.TK.Array && isLvalue(n.a)) {
+            p := addrOf(g, n.a);
+            return mkV(gep(g, p, g.c.ArrayDataOffset(under(bt).elem)), t);
+        }
+        v := genExpr(g, n.a);
+        if (under(v.t).kind == ast.TK.String) {
+            r := tmp(g); emit(g, r + " = call ptr @oc_str_cdata(ptr " + v.r + ")"); return mkV(r, t);
+        }
+        return mkV(arrayDataPtr(g, v), t);
+    case ast.Sem.EnumUnit, ast.Sem.EnumSelector:
+        et := t;
+        p := alloca(g, et);
+        setTag(g, et, p, n.ival);
+        return freshV(p, et);
+    case ast.Sem.EnumFixed:
+        et := t;
+        p := alloca(g, et);
+        setTag(g, et, p, n.ival);
+        vs := g.c.VariantsOf(under(et));
+        v := vs[n.ival];
+        val := genAs(g, v.fixedValue, v.fixedType);
+        store(g, v.fixedType, gep(g, p, g.c.EnumPayloadOffset(under(et))), val);
+        return freshV(p, et);
+    case ast.Sem.TypeName:
+        fail(g, n, "a type is not a value");
+    }
+    fail(g, n, "unsupported member access");
+    return mkV("undef", t);
+}
+
+func setTag(g *Gen, et *ast.Type, p string, tag int) {
+    if (needsInit(g, et)) { emit(g, "call void @oc_set_tag(ptr " + p + ", i64 " + itoa(tag) + ", ptr " + desc(g, et) + ")"); return; }
+    memset0(g, p, sizeOf(g, et));
+    emit(g, "store i64 " + itoa(tag) + ", ptr " + p);
+}
+
+// ---- unary ----
+
+func genUnary(g *Gen, n *ast.Node, t *ast.Type) V {
+    switch (n.op) {
+    case scanner.Kind.Minus:
+        if (g.c.IsIntLiteral(n)) return intLitV(g, n, t);
+        v := conv(g, genExpr(g, n.a), t);
+        r := tmp(g);
+        if (under(t).kind == ast.TK.Float) emit(g, r + " = fneg " + ll(t) + " " + v.r);
+        else emit(g, r + " = sub " + ll(t) + " 0, " + v.r);
+        return mkV(r, t);
+    case scanner.Kind.Bang:
+        v := genExpr(g, n.a);
+        r := tmp(g); emit(g, r + " = xor i1 " + v.r + ", true");
+        return mkV(r, t);
+    case scanner.Kind.Tilde:
+        v := genExpr(g, n.a);
+        r := tmp(g); emit(g, r + " = xor " + ll(t) + " " + v.r + ", -1");
+        return mkV(r, t);
+    case scanner.Kind.Star:
+        v := genExpr(g, n.a);
+        return load(g, t, v.r);
+    case scanner.Kind.Amp:
+        return mkV(addrOf(g, n.a), t);
+    case scanner.Kind.PlusPlus, scanner.Kind.MinusMinus:
+        return genInc(g, n, n.a, false);
+    }
+    fail(g, n, "unsupported unary operator");
+    return mkV("undef", t);
+}
+
+// genInc implements ++/-- (postfix yields the old value).
+func genInc(g *Gen, n *ast.Node, target *ast.Node, post bool) V {
+    t := typeOf(g, target);
+    up := n.op == scanner.Kind.PlusPlus;
+    if (target.kind == ast.NK.Member && target.sem == ast.Sem.BitField) {
+        p, st := structBase(g, target.a);
+        place := fieldPlace(g, st, target.ival);
+        old := readBitfield(g, p, place, t);
+        nv := tmp(g);
+        emit(g, nv + " = " + (up ? "add " : "sub ") + ll(t) + " " + old.r + ", 1");
+        stored := writeBitfield(g, p, place, t, mkV(nv, t));
+        return post ? old : stored;
+    }
+    p := lvalueAddr(g, target);
+    old := load(g, t, p);
+    nv := tmp(g);
+    u := under(t);
+    if (u.kind == ast.TK.Ptr) {
+        checkNullPtr(g, old.r);
+        emit(g, nv + " = getelementptr inbounds i8, ptr " + old.r + ", i64 " + (up ? "" : "-") + itoa(sizeOf(g, u.elem)));
+    } else if (u.kind == ast.TK.Float) emit(g, nv + " = " + (up ? "fadd " : "fsub ") + ll(t) + " " + old.r + ", 1.0");
+    else emit(g, nv + " = " + (up ? "add " : "sub ") + ll(t) + " " + old.r + ", 1");
+    store(g, t, p, mkV(nv, t));
+    return post ? old : mkV(nv, t);
+}
+
+func checkNullPtr(g *Gen, p string) {
+    c := tmp(g);
+    emit(g, c + " = icmp eq ptr " + p + ", " + nullPtr());
+    bad := newLabel(g, "null"); ok := newLabel(g, "nonnull");
+    condBr(g, c, bad, ok);
+    label(g, bad);
+    term(g, "call void @llvm.trap()\n  unreachable");
+    label(g, ok);
+}
+
+// lvalueAddr gives a writable address (map entries are inserted when absent).
+func lvalueAddr(g *Gen, n *ast.Node) string {
+    if (n.kind == ast.NK.Index) {
+        bt := under(typeOf(g, n.a));
+        if (bt.kind == ast.TK.Map) return mapSlot(g, n);
+    }
+    return addrOf(g, n);
+}

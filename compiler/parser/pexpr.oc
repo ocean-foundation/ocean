@@ -1,0 +1,525 @@
+package parser;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/legacy";
+
+func isAssignOp(k scanner.Kind) bool {
+    switch (k) {
+    case scanner.Kind.Assign, scanner.Kind.PlusEq, scanner.Kind.MinusEq, scanner.Kind.StarEq, scanner.Kind.SlashEq,
+         scanner.Kind.PercentEq, scanner.Kind.CaretEq, scanner.Kind.AmpEq, scanner.Kind.PipeEq,
+         scanner.Kind.ShlEq, scanner.Kind.ShrEq: return true;
+    }
+    return false;
+}
+
+func precedence(k scanner.Kind) int {
+    switch (k) {
+    case scanner.Kind.OrOr: return 1;
+    case scanner.Kind.AndAnd: return 2;
+    case scanner.Kind.Pipe: return 3;
+    case scanner.Kind.Caret: return 4;
+    case scanner.Kind.Amp: return 5;
+    case scanner.Kind.EqEq, scanner.Kind.NotEq: return 6;
+    case scanner.Kind.Lt, scanner.Kind.LtEq, scanner.Kind.Gt, scanner.Kind.GtEq: return 7;
+    case scanner.Kind.Shl, scanner.Kind.Shr: return 8;
+    case scanner.Kind.Plus, scanner.Kind.Minus: return 9;
+    case scanner.Kind.Star, scanner.Kind.Slash, scanner.Kind.Percent: return 10;
+    }
+    return 0;
+}
+
+func validTarget(n *ast.Node) bool {
+    k := n.kind;
+    return k == ast.NK.Ident || k == ast.NK.Blank || k == ast.NK.Index || k == ast.NK.Member || k == ast.NK.Unary || k == ast.NK.Inst;
+}
+
+// expr parses a full expression including comma lists, rewriting
+// `a, b = x, y` into a simultaneous assignment.
+func expr(p *Parser) *ast.Node {
+    first := assignExpr(p);
+    if (!is(p, scanner.Kind.Comma)) return first;
+    items := make([]*ast.Node);
+    items.append(first);
+    for (accept(p, scanner.Kind.Comma)) items.append(assignExpr(p));
+    for (i := 0; i < len(items); i++) {
+        it := items[i];
+        if (it.kind == ast.NK.Assign && it.op == scanner.Kind.Assign && i > 0) {
+            ok := true;
+            for (j := 0; j < i; j++) { if (!validTarget(items[j])) ok = false; }
+            if (!ok || !validTarget(it.a)) break;
+            m := nodeAt(p, ast.NK.MultiAssign, items[0]);
+            for (j := 0; j < i; j++) m.list.append(items[j]);
+            m.list.append(it.a);
+            m.list2.append(it.b);
+            for (j := i + 1; j < len(items); j++) m.list2.append(items[j]);
+            m.end = items[len(items) - 1].end;
+            return m;
+        }
+    }
+    c := nodeAt(p, ast.NK.Comma, first);
+    c.list = items;
+    return finish(p, c);
+}
+
+func assignExpr(p *Parser) *ast.Node {
+    lhs := ternary(p);
+    if (isAssignOp(tk(p))) {
+        n := nodeAt(p, ast.NK.Assign, lhs);
+        n.op = tk(p);
+        n.line = tok(p).line; n.col = tok(p).col;
+        n.nameLine = lhs.line; n.nameCol = lhs.col;
+        next(p);
+        n.a = lhs;
+        n.b = assignExpr(p);
+        // Report assignments at the target, matching ocean-c.
+        n.line = lhs.line; n.col = lhs.col;
+        return finish(p, n);
+    }
+    return lhs;
+}
+
+func ternary(p *Parser) *ast.Node {
+    c := binary(p, 1);
+    if (!is(p, scanner.Kind.Question)) return c;
+    n := nodeAt(p, ast.NK.Ternary, c);
+    next(p);
+    n.a = c;
+    first := assignExpr(p);
+    if (is(p, scanner.Kind.Comma)) {
+        cm := nodeAt(p, ast.NK.Comma, first);
+        cm.list.append(first);
+        for (accept(p, scanner.Kind.Comma)) cm.list.append(assignExpr(p));
+        first = finish(p, cm);
+    }
+    n.b = first;
+    if (!accept(p, scanner.Kind.Colon)) { err(p, "Expected colon for else case in ternary expression"); return n; }
+    n.c = ternary(p);
+    return finish(p, n);
+}
+
+func additive(p *Parser) *ast.Node { return binary(p, 9); }
+
+func binary(p *Parser, minPrec int) *ast.Node {
+    lhs := unary(p);
+    for (!p.failed) {
+        op := tk(p);
+        prec := precedence(op);
+        if (prec == 0 || prec < minPrec) break;
+        n := node(p, ast.NK.Binary);
+        n.op = op;
+        next(p);
+        n.a = lhs;
+        n.b = binary(p, prec + 1);
+        n.off = lhs.off;
+        lhs = finish(p, n);
+    }
+    return lhs;
+}
+
+func unary(p *Parser) *ast.Node {
+    k := tk(p);
+    if (k == scanner.Kind.Minus || k == scanner.Kind.Bang || k == scanner.Kind.Tilde || k == scanner.Kind.Star ||
+        k == scanner.Kind.Amp || k == scanner.Kind.PlusPlus || k == scanner.Kind.MinusMinus || k == scanner.Kind.Plus) {
+        if (k == scanner.Kind.Plus) { err(p, "Unexpected '+', expected expression"); return node(p, ast.NK.Bad); }
+        n := node(p, ast.NK.Unary);
+        n.op = k;
+        next(p);
+        p.depth++;
+        if (p.depth > 2000) { err(p, "Parser nesting limit exceeded"); return n; }
+        n.a = unary(p);
+        p.depth--;
+        return finish(p, n);
+    }
+    return postfix(p, primary(p));
+}
+
+func isBuiltinTypeName(s string) bool {
+    return s == "int" || s == "i8" || s == "i16" || s == "i32" || s == "i64" || s == "uint" || s == "u8" ||
+        s == "u16" || s == "u32" || s == "u64" || s == "float" || s == "f32" || s == "f64" || s == "bool" ||
+        s == "string";
+}
+
+func followsTypeArgs(p *Parser) bool {
+    k := tk(p);
+    if (p.split > 0) return false;
+    return k == scanner.Kind.LParen || k == scanner.Kind.LBrace || k == scanner.Kind.LBrack || k == scanner.Kind.Semi ||
+        k == scanner.Kind.Comma || k == scanner.Kind.RParen || k == scanner.Kind.RBrack || k == scanner.Kind.RBrace ||
+        k == scanner.Kind.Dot || k == scanner.Kind.FatArrow || k == scanner.Kind.EOF;
+}
+
+func tryTypeArgs(p *Parser) ([]*ast.Node, bool) {
+    m := save(p);
+    p.trial++;
+    args := typeArgs(p);
+    ok := !p.failed && followsTypeArgs(p);
+    p.trial--;
+    if (ok) return args, true;
+    restore(p, m);
+    return args, false;
+}
+
+// fixEligible: expression-level T[n] is rewritten for built-in types, known
+// declared/imported types, enclosing type parameters, and generic instances.
+func fixEligible(p *Parser, n *ast.Node) bool {
+    if (n.kind == ast.NK.Inst || n.kind == ast.NK.TBuffer) return true;
+    if (n.kind == ast.NK.Ident) {
+        if (isBuiltinTypeName(n.name)) return true;
+        _, ok := p.known[n.name];
+        if (ok) return true;
+        for (_, t := range p.typeParamNames) { if (t == n.name) return true; }
+        return false;
+    }
+    if (n.kind == ast.NK.Member && n.a.kind == ast.NK.Ident) {
+        _, ok := p.known[n.a.name + "." + n.name];
+        return ok;
+    }
+    return false;
+}
+
+func compositeAllowed(p *Parser, n *ast.Node) bool {
+    return n.kind == ast.NK.Ident || n.kind == ast.NK.Member || n.kind == ast.NK.Inst;
+}
+
+func postfix(p *Parser, n *ast.Node) *ast.Node {
+    for (!p.failed) {
+        k := tk(p);
+        if (k == scanner.Kind.Dot) {
+            if (ellipsis(p)) break;
+            if (peek(p, 1) == scanner.Kind.LParen) {
+                next(p); next(p);
+                if (is(p, scanner.Kind.KwType)) {
+                    g := nodeAt(p, ast.NK.TypeGuard, n);
+                    g.a = n;
+                    next(p);
+                    if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected closing type assertion parenthesis"); return g; }
+                    n = finish(p, g);
+                    continue;
+                }
+                a := nodeAt(p, ast.NK.Assert, n);
+                a.a = n;
+                a.line = tok(p).line; a.col = tok(p).col;
+                a.b = typ(p);
+                if (is(p, scanner.Kind.LBrace)) { a.flag = true; a.list = compositeBody(p); }
+                if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected closing type assertion parenthesis"); return a; }
+                n = finish(p, a);
+                continue;
+            }
+            if (peek(p, 1) != scanner.Kind.Ident) { next(p); err(p, "Expected member name after dot"); return n; }
+            m := nodeAt(p, ast.NK.Member, n);
+            next(p);
+            m.name = tok(p).text; m.nameLine = tok(p).line; m.nameCol = tok(p).col;
+            next(p);
+            m.a = n;
+            n = finish(p, m);
+            continue;
+        }
+        if (k == scanner.Kind.LBrack) {
+            // Removed postfix syntax in expressions.
+            if (p.fix && fixEligible(p, n)) {
+                st := indexOfNodeStart(p, n);
+                r := legacy.TypeRewrite(&p.toks, st, p.src.text, true);
+                if (r.ok) { recordFix(p, st, r); continue; }
+            }
+            if (peek(p, 1) == scanner.Kind.RBrack) {
+                r := legacy.TypeRewrite(&p.toks, indexOfNodeStart(p, n), p.src.text, true);
+                if (r.ok) errNode(p, n, legacy.Message(r.text, r.kinds));
+                else err(p, "Unexpected ']', expected expression");
+                return n;
+            }
+            if ((n.kind == ast.NK.Ident && isBuiltinTypeName(n.name)) || n.kind == ast.NK.Inst || n.kind == ast.NK.TBuffer) {
+                r := legacy.TypeRewrite(&p.toks, indexOfNodeStart(p, n), p.src.text, true);
+                if (r.ok) { errNode(p, n, legacy.Message(r.text, r.kinds)); return n; }
+            }
+            next(p);
+            if (is(p, scanner.Kind.Colon)) {
+                s := nodeAt(p, ast.NK.Slice, n);
+                s.a = n;
+                next(p);
+                if (!is(p, scanner.Kind.RBrack)) s.c = expr(p);
+                if (!accept(p, scanner.Kind.RBrack)) { err(p, "Expected closing array dimension bracket"); return s; }
+                n = finish(p, s);
+                continue;
+            }
+            idx := expr(p);
+            if (accept(p, scanner.Kind.Colon)) {
+                s := nodeAt(p, ast.NK.Slice, n);
+                s.a = n; s.b = idx;
+                if (!is(p, scanner.Kind.RBrack)) s.c = expr(p);
+                if (!accept(p, scanner.Kind.RBrack)) { err(p, "Expected closing array dimension bracket"); return s; }
+                n = finish(p, s);
+                continue;
+            }
+            ix := nodeAt(p, ast.NK.Index, n);
+            ix.a = n; ix.b = idx;
+            // ocean-c reports index errors at the bracket
+            ix.line = n.line; ix.col = n.col;
+            if (!accept(p, scanner.Kind.RBrack)) { err(p, "Expected closing array dimension bracket"); return ix; }
+            n = finish(p, ix);
+            continue;
+        }
+        if (k == scanner.Kind.Lt && (n.kind == ast.NK.Ident || n.kind == ast.NK.Member)) {
+            args, ok := tryTypeArgs(p);
+            if (ok) {
+                inst := nodeAt(p, ast.NK.Inst, n);
+                inst.a = n; inst.list = args;
+                n = finish(p, inst);
+                continue;
+            }
+            break;
+        }
+        if (k == scanner.Kind.LParen) {
+            c := nodeAt(p, ast.NK.Call, n);
+            c.a = n;
+            c.line = tok(p).line; c.col = tok(p).col;
+            next(p);
+            for (!is(p, scanner.Kind.RParen) && !is(p, scanner.Kind.EOF)) {
+                arg := assignExpr(p);
+                c.list.append(arg);
+                if (ellipsis(p)) {
+                    skipEllipsis(p);
+                    c.flag = true;
+                    if (!is(p, scanner.Kind.RParen) && !(is(p, scanner.Kind.Comma) && peek(p, 1) == scanner.Kind.RParen)) { err(p, "Expanded argument must be last"); return c; }
+                }
+                if (!accept(p, scanner.Kind.Comma)) break;
+            }
+            if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected comma or closing parenthesis"); return c; }
+            n = finish(p, c);
+            continue;
+        }
+        if (k == scanner.Kind.LBrace && compositeAllowed(p, n)) {
+            c := nodeAt(p, ast.NK.Composite, n);
+            c.a = n;
+            c.list = compositeBody(p);
+            n = finish(p, c);
+            continue;
+        }
+        if (k == scanner.Kind.Arrow) {
+            c := nodeAt(p, ast.NK.Cast, n);
+            c.line = tok(p).line; c.col = tok(p).col;
+            next(p);
+            c.a = n;
+            c.b = castTarget(p);
+            n = finish(p, c);
+            continue;
+        }
+        if (k == scanner.Kind.PlusPlus || k == scanner.Kind.MinusMinus) {
+            pi := nodeAt(p, ast.NK.PostInc, n);
+            pi.op = k;
+            next(p);
+            pi.a = n;
+            n = finish(p, pi);
+            continue;
+        }
+        break;
+    }
+    return n;
+}
+
+// indexOfNodeStart finds the token index where node n begins.
+func indexOfNodeStart(p *Parser, n *ast.Node) int {
+    for (i := p.pos; i >= 0; i--) { if (p.toks[i].off == n.off) return i; }
+    return p.pos;
+}
+
+func castTarget(p *Parser) *ast.Node {
+    k := tk(p);
+    if (k == scanner.Kind.LParen) {
+        next(p);
+        t := typ(p);
+        if (!accept(p, scanner.Kind.RParen)) err(p, "Expected closing parenthesis after cast type");
+        return t;
+    }
+    if (k == scanner.Kind.KwVarint || k == scanner.Kind.KwVaruint) return varintType(p);
+    if (k == scanner.Kind.LBrack) return arrayType(p);
+    if (k == scanner.Kind.Ident && tok(p).text == "buffer") return bufferType(p, true);
+    if (k == scanner.Kind.Ident || k == scanner.Kind.KwAny) {
+        n := node(p, ast.NK.Ident);
+        n.name = tok(p).text;
+        next(p);
+        return finish(p, n);
+    }
+    err(p, "Expected cast type; multi-token types require parentheses");
+    return node(p, ast.NK.Bad);
+}
+
+func compositeBody(p *Parser) []*ast.Node {
+    out := make([]*ast.Node);
+    next(p); // {
+    keyed := 0; positional := 0;
+    for (!is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
+        e := node(p, ast.NK.Entry);
+        v := assignExpr(p);
+        if (accept(p, scanner.Kind.Colon)) {
+            e.a = v; e.b = assignExpr(p); keyed++;
+        } else { e.b = v; positional++; }
+        if (keyed > 0 && positional > 0) { errNode(p, e, "Cannot mix keyed and positional literal entries"); return out; }
+        finish(p, e);
+        out.append(e);
+        if (p.failed) return out;
+        if (!accept(p, scanner.Kind.Comma)) {
+            if (is(p, scanner.Kind.RBrace)) break;
+            err(p, "Expected comma between literal entries");
+            return out;
+        }
+    }
+    if (!accept(p, scanner.Kind.RBrace)) err(p, "Expected comma between literal entries");
+    return out;
+}
+
+func parenType(p *Parser, k ast.NK, msg string) *ast.Node {
+    n := node(p, k);
+    next(p); // name
+    next(p); // (
+    n.a = typ(p);
+    if (!accept(p, scanner.Kind.RParen)) err(p, msg);
+    return finish(p, n);
+}
+
+// tryParenType checks whether '(' Type ')' follows the current name.
+func tryParenType(p *Parser) bool {
+    m := save(p);
+    next(p); next(p);
+    p.trial++;
+    typ(p);
+    ok := !p.failed && is(p, scanner.Kind.RParen);
+    p.trial--;
+    restore(p, m);
+    return ok;
+}
+
+func primary(p *Parser) *ast.Node {
+    k := tk(p);
+    t := tok(p);
+    if (k == scanner.Kind.Ident) {
+        name := t.text;
+        if (peek(p, 1) == scanner.Kind.LParen) {
+            if (name == "zero") return parenType(p, ast.NK.Zero, "Expected closing parenthesis after zero type");
+            if (name == "new" && tryParenType(p)) return parenType(p, ast.NK.New, "Expected right paren");
+            if (name == "make") {
+                k2 := peek(p, 2);
+                if (k2 == scanner.Kind.LBrack || (k2 == scanner.Kind.Ident && peekTok(p, 2).text == "map")) return parenType(p, ast.NK.Make, "Expected right paren");
+            }
+            if (name == "sizeof") {
+                n := node(p, ast.NK.Sizeof);
+                if (tryParenType(p)) {
+                    next(p); next(p);
+                    n.a = typ(p);
+                    next(p);
+                    return finish(p, n);
+                }
+                next(p); next(p);
+                n.a = expr(p);
+                if (!accept(p, scanner.Kind.RParen)) err(p, "Expected right paren");
+                return finish(p, n);
+            }
+        }
+        if (name == "buffer" && peek(p, 1) == scanner.Kind.Lt) {
+            m := save(p);
+            p.trial++;
+            b := bufferType(p, true);
+            ok := !p.failed && (!ast.Nil(b.b) || is(p, scanner.Kind.LBrace));
+            p.trial--;
+            if (ok) {
+                if (is(p, scanner.Kind.LBrace)) {
+                    c := nodeAt(p, ast.NK.Composite, b);
+                    c.a = b;
+                    c.list = compositeBody(p);
+                    return finish(p, c);
+                }
+                return b;
+            }
+            restore(p, m);
+        }
+        if (name == "map" && peek(p, 1) == scanner.Kind.LBrack) {
+            mt := mapType(p);
+            if (is(p, scanner.Kind.LBrace)) {
+                c := nodeAt(p, ast.NK.Composite, mt);
+                c.a = mt;
+                c.list = compositeBody(p);
+                return finish(p, c);
+            }
+            return mt;
+        }
+        n := node(p, ast.NK.Ident);
+        n.name = name;
+        next(p);
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.KwAny) {
+        n := node(p, ast.NK.Ident);
+        n.name = "any";
+        next(p);
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.Blank) { n := node(p, ast.NK.Blank); n.name = "_"; next(p); return finish(p, n); }
+    if (k == scanner.Kind.Int) {
+        n := node(p, ast.NK.IntLit);
+        n.text = t.text; n.flag = t.isChar; n.ival = t.charValue;
+        next(p);
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.Float) { n := node(p, ast.NK.FloatLit); n.text = t.text; next(p); return finish(p, n); }
+    if (k == scanner.Kind.Str) { n := node(p, ast.NK.StrLit); n.text = t.text; next(p); return finish(p, n); }
+    if (k == scanner.Kind.KwNull) { n := node(p, ast.NK.Null); next(p); return finish(p, n); }
+    if (k == scanner.Kind.LParen) {
+        next(p);
+        e := expr(p);
+        if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected right paren"); return e; }
+        e.flag3 = true; // parenthesized
+        return e;
+    }
+    if (k == scanner.Kind.KwExtern) {
+        n := node(p, ast.NK.ExternRef);
+        next(p);
+        if (!accept(p, scanner.Kind.Dot)) { err(p, "Expected '.' after extern in an expression"); return n; }
+        if (!is(p, scanner.Kind.Ident)) { err(p, "Expected extern function name after extern."); return n; }
+        n.name = tok(p).text;
+        next(p);
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.KwFunc) {
+        n := node(p, ast.NK.FuncLit);
+        next(p);
+        if (!is(p, scanner.Kind.LParen)) { err(p, "Expected function parameter list"); return n; }
+        n.list = paramList(p, true, "parameter");
+        if (len(n.list) > 0 && n.list[len(n.list) - 1].flag) n.flag = true;
+        n.list2 = results(p);
+        if (!is(p, scanner.Kind.LBrace)) { err(p, "Expected function body"); return n; }
+        p.funcDepth++;
+        n.b = block(p);
+        p.funcDepth--;
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.LBrace) {
+        n := node(p, ast.NK.Composite);
+        n.list = compositeBody(p);
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.KwMixed || k == scanner.Kind.KwInterface) {
+        ty := typ(p);
+        if (is(p, scanner.Kind.LBrace)) {
+            c := nodeAt(p, ast.NK.Composite, ty);
+            c.a = ty;
+            c.list = compositeBody(p);
+            return finish(p, c);
+        }
+        return ty;
+    }
+    if (k == scanner.Kind.KwVarint || k == scanner.Kind.KwVaruint) return varintType(p);
+    if (k == scanner.Kind.Star && false) return typ(p);
+    if (k == scanner.Kind.LBrack) {
+        ty := arrayType(p);
+        if (is(p, scanner.Kind.LBrace)) {
+            c := nodeAt(p, ast.NK.Composite, ty);
+            c.a = ty;
+            c.list = compositeBody(p);
+            return finish(p, c);
+        }
+        if (ty.kind == ast.NK.TSlice && p.depth == 0) { /* checked by caller context */ }
+        return ty;
+    }
+    if (k == scanner.Kind.KwFunc) return funcType(p);
+    if (k == scanner.Kind.EOF) { err(p, "Unexpected end of file, expected expression"); return node(p, ast.NK.Bad); }
+    err(p, "Unexpected '" + (k == scanner.Kind.Ident ? t.text : scanner.KindText(k)) + "', expected expression");
+    return node(p, ast.NK.Bad);
+}

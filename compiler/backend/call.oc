@@ -1,0 +1,548 @@
+package backend;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+// argList evaluates call arguments for an Ocean function type.
+func argList(g *Gen, n *ast.Node, ft *ast.Type) string {
+    params := make([]*ast.Type);
+    for (_, p := range ft.params) params.append(sub(g, p));
+    vals := make([]V);
+    if (n.flag2) {
+        // one multi-result call supplies all arguments
+        tv := genExpr(g, n.list[0]);
+        rts := under(tv.t).results;
+        for (i, rt := range rts) vals.append(load(g, rt, gep(g, tv.r, tupleOffset(g, rts, i))));
+        out := "";
+        fixed := len(params);
+        if (ft.variadic) fixed--;
+        for (i := 0; i < fixed; i++) out += ", " + argText(g, copyV(g, conv(g, vals[i], params[i])));
+        if (ft.variadic) {
+            extra := make([]V);
+            for (i := fixed; i < len(vals); i++) extra.append(vals[i]);
+            out += ", ptr " + packVariadic(g, params[len(params) - 1], extra, zero(*ast.Node)).r;
+        }
+        return out;
+    }
+    out := "";
+    fixed := len(params);
+    if (ft.variadic) fixed--;
+    for (i := 0; i < fixed && i < len(n.list); i++) {
+        v := argValue(g, n.list[i], params[i]);
+        out += ", " + argText(g, v);
+    }
+    if (ft.variadic) {
+        vt := params[len(params) - 1];
+        extra := make([]V);
+        spread := zero(*ast.Node);
+        for (i := fixed; i < len(n.list); i++) {
+            if (n.flag && i == len(n.list) - 1) { spread = n.list[i]; break; }
+            extra.append(genAs(g, n.list[i], under(vt).elem));
+        }
+        out += ", ptr " + packVariadic(g, vt, extra, spread).r;
+    }
+    return out;
+}
+
+// argValue evaluates one argument. Sized buffers are raw storage passed by
+// address (the callee aliases the caller's elements); others are owned copies.
+func argValue(g *Gen, a *ast.Node, pt *ast.Type) V {
+    u := under(pt);
+    if (u.kind == ast.TK.Buffer && u.len > 0) {
+        if (isLvalue(a)) return mkV(addrOf(g, a), pt);
+        return genExpr(g, a);
+    }
+    return genAs(g, a, pt);
+}
+
+func argText(g *Gen, v V) string {
+    if (isAgg(v.t)) return "ptr " + v.r;
+    return ll(v.t) + " " + v.r;
+}
+
+// packVariadic builds the fresh array received by a variadic parameter.
+func packVariadic(g *Gen, vt *ast.Type, items []V, spread *ast.Node) V {
+    elem := under(vt).elem;
+    es := sizeOf(g, elem);
+    arr := tmp(g);
+    emit(g, arr + " = call ptr @oc_arr_new(i64 " + itoa(len(items)) + ", i64 " + itoa(es) + ", i64 0)");
+    if (len(items) > 0) {
+        data := tmp(g);
+        emit(g, data + " = call ptr @oc_arr_data(ptr " + arr + ")");
+        for (i, it := range items) store(g, elem, gep(g, data, i * es), conv(g, it, elem));
+    }
+    if (nilN(spread)) return freshV(arr, vt);
+    sv := genExpr(g, spread);
+    su := under(sv.t);
+    sd := arrayDataPtr(g, sv);
+    sn := collectionLen(g, sv);
+    se := su.elem;
+    if (check.Identical(se, elem)) {
+        slot := spill(g, mkV(arr, vt));
+        emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + itoa(len(items)) + ", ptr " + sd + ", i64 " + sn + ", ptr " + desc(g, elem) + ", i64 0)");
+        r := tmp(g); emit(g, r + " = load ptr, ptr " + slot);
+        return freshV(r, vt);
+    }
+    // spread of concrete elements into an interface parameter: box each
+    slot := spill(g, mkV(arr, vt));
+    idx := alloca(g, check.TInt());
+    emit(g, "store i64 0, ptr " + idx);
+    head := newLabel(g, "spread"); body := newLabel(g, "spreadbody"); done := newLabel(g, "spreaddone");
+    br(g, head);
+    label(g, head);
+    i := tmp(g); emit(g, i + " = load i64, ptr " + idx);
+    c := tmp(g); emit(g, c + " = icmp slt i64 " + i + ", " + sn);
+    condBr(g, c, body, done);
+    label(g, body);
+    ep := gepDyn(g, sd, i, sizeOf(g, se));
+    ev := conv(g, load(g, se, ep), elem);
+    dst := tmp(g);
+    emit(g, dst + " = call ptr @oc_arr_push(ptr " + slot + ", i64 " + itoa(es) + ")");
+    store(g, elem, dst, ev);
+    i2 := tmp(g); emit(g, i2 + " = add i64 " + i + ", 1");
+    emit(g, "store i64 " + i2 + ", ptr " + idx);
+    br(g, head);
+    label(g, done);
+    r := tmp(g); emit(g, r + " = load ptr, ptr " + slot);
+    return freshV(r, vt);
+}
+
+// emitCall performs the call and returns its result value.
+func emitCall(g *Gen, n *ast.Node, callee string, ft *ast.Type, lead string, args string, t *ast.Type) V {
+    results := make([]*ast.Type);
+    for (_, r := range ft.results) results.append(sub(g, r));
+    setSite(g, n);
+    call := "(ptr " + lead;
+    res: V;
+    res.t = t;
+    if (resultAgg(g, results)) {
+        st := resultStorage(g, results);
+        slot := alloca(g, st);
+        call += ", ptr " + slot;
+        res.r = slot; res.fresh = true; res.t = st;
+        if (len(results) == 1) res.t = results[0];
+    }
+    call += args + ")";
+    rl := retLL(g, results);
+    if (rl == "void") { emit(g, "call void " + callee + call); if (!resultAgg(g, results)) { res.r = ""; res.t = check.TVoid(); } }
+    else { r := tmp(g); emit(g, r + " = call " + rl + " " + callee + call); res.r = r; res.fresh = true; res.t = results[0]; }
+    return res;
+}
+
+func genCall(g *Gen, n *ast.Node, t *ast.Type) V {
+    switch (n.sem) {
+    case ast.Sem.CallFunc, ast.Sem.CallIntrinsic:
+        if (n.sem == ast.Sem.CallIntrinsic && n.text != "") return genIntrinsic(g, n, t);
+        s := n.sym;
+        ft := s.ty;
+        targs := n.targs;
+        if (len(targs) > 0) ft = check.Subst(ft, check.MakeEnv(s.typeParams, targs));
+        name := funcRef(g, s, targs);
+        args := argList(g, n, ft);
+        return emitCall(g, n, name, ft, "null", args, t);
+    case ast.Sem.CallMethod: return genMethodCall(g, n, t);
+    case ast.Sem.CallIface: return genIfaceCall(g, n, t);
+    case ast.Sem.CallParamMethod: return genParamMethodCall(g, n, t);
+    case ast.Sem.CallValue:
+        fv := genExpr(g, n.a);
+        ft := under(fv.t);
+        fn := extract(g, fv.r, 0);
+        env := extract(g, fv.r, 1);
+        c := tmp(g); emit(g, c + " = icmp eq ptr " + fn + ", null");
+        bad := newLabel(g, "nofn"); ok := newLabel(g, "fn");
+        condBr(g, c, bad, ok);
+        label(g, bad);
+        setSite(g, n);
+        emit(g, "call void @oc_uninit_func(i64 " + itoa(site(g, n)) + ")");
+        term(g, "unreachable");
+        label(g, ok);
+        args := argList(g, n, ft);
+        return emitCall(g, n, fn, ft, env, args, t);
+    case ast.Sem.CallExtern: return genExternCall(g, n, t);
+    case ast.Sem.CallBuiltin: return genBuiltin(g, n, t);
+    case ast.Sem.CallEnum: return genEnumCall(g, n, t);
+    }
+    fail(g, n, "unsupported call");
+    return mkV("undef", t);
+}
+
+func memberOf(n *ast.Node) *ast.Node { if (n.a.kind == ast.NK.Inst) return n.a.a; return n.a; }
+
+func receiverArg(g *Gen, recv *ast.Node, m *ast.Symbol, base *ast.Type) string {
+    rt := typeOf(g, recv);
+    if (m.recvPtr) {
+        if (rt.kind == ast.TK.Ptr) { v := derefChain(g, genExpr(g, recv)); return "ptr " + v.r; }
+        return "ptr " + addrOf(g, recv);
+    }
+    v: V;
+    if (rt.kind == ast.TK.Ptr) { pv := derefChain(g, genExpr(g, recv)); v = copyV(g, load(g, pv.t.elem, pv.r)); }
+    else v = copyV(g, genExpr(g, recv));
+    if (isAgg(base)) return "ptr " + spill(g, v);
+    return ll(base) + " " + v.r;
+}
+
+func genMethodCall(g *Gen, n *ast.Node, t *ast.Type) V {
+    mem := memberOf(n);
+    m := n.sym;
+    rt := typeOf(g, mem.a);
+    base := rt;
+    for (base.kind == ast.TK.Ptr) base = base.elem;
+    name := methodRef(g, m, base, n.targs);
+    env := check.MakeEnv(m.recvParams, base.args).Extend(m.typeParams, n.targs);
+    ft := check.Subst(m.ty, env);
+    recv := receiverArg(g, mem.a, m, base);
+    args := ", " + recv + argList(g, n, ft);
+    return emitCall(g, n, name, ft, "null", args, t);
+}
+
+func genParamMethodCall(g *Gen, n *ast.Node, t *ast.Type) V {
+    mem := memberOf(n);
+    rt := typeOf(g, mem.a);
+    base := rt;
+    if (base.kind == ast.TK.Ptr) base = base.elem;
+    if (base.kind == ast.TK.Interface) return genIfaceCall(g, n, t);
+    mr := g.c.FindMethod(base, mem.text);
+    if (!mr.ok) {
+        // pointer type argument: methods of the pointee
+        if (base.kind == ast.TK.Ptr) mr = g.c.FindMethod(base.elem, mem.text);
+        if (!mr.ok) { fail(g, n, "no method " + mem.text + " for " + check.TypeString(base)); return mkV("undef", t); }
+        base = base.elem;
+    }
+    m := mr.sym;
+    name := methodRef(g, m, base, n.targs);
+    env := check.MakeEnv(m.recvParams, base.args).Extend(m.typeParams, n.targs);
+    ft := check.Subst(m.ty, env);
+    recv := receiverArg(g, mem.a, m, base);
+    args := ", " + recv + argList(g, n, ft);
+    return emitCall(g, n, name, ft, "null", args, t);
+}
+
+func genIfaceCall(g *Gen, n *ast.Node, t *ast.Type) V {
+    mem := memberOf(n);
+    iv := genExpr(g, mem.a);
+    if (iv.t.kind == ast.TK.Ptr) iv = load(g, iv.t.elem, iv.r);
+    ft := sub(g, mem.ty);
+    if (n.a.kind == ast.NK.Inst) ft = sub(g, n.a.ty);
+    if (len(n.targs) > 0 && !nilT(ft)) {
+        // generic interface methods are not dispatched dynamically yet
+    }
+    d := extract(g, iv.r, 0);
+    data := extract(g, iv.r, 1);
+    setSite(g, n);
+    fn := tmp(g);
+    emit(g, fn + " = call ptr @oc_method(ptr " + d + ", ptr " + methodName(g, mem.text) + ", i64 " + itoa(site(g, n)) + ")");
+    args := ", ptr " + data + argList(g, n, ft);
+    return emitCall(g, n, fn, ft, "null", args, t);
+}
+
+// ---- externs ----
+
+func cParam(t *ast.Type) string {
+    u := under(t);
+    if (u.kind == ast.TK.Bool) return "i1 zeroext";
+    if (u.kind == ast.TK.Int && u.bits < 32) return ll(u) + (u.signed ? " signext" : " zeroext");
+    return ll(u);
+}
+func cRet(results []*ast.Type) string {
+    if (len(results) == 0) return "void";
+    return cParam(results[0]);
+}
+
+func genExternCall(g *Gen, n *ast.Node, t *ast.Type) V {
+    s := n.sym;
+    ft := s.ty;
+    sig := cRet(ft.results) + " (";
+    for (i, p := range ft.params) { if (i > 0) sig += ", "; sig += cParam(p); }
+    if (ft.variadic) sig += len(ft.params) > 0 ? ", ..." : "...";
+    sig += ")";
+    declareExtern(g, s);
+    if (ft.variadic && needsFFI(g, n, ft)) return genFFICall(g, n, t);
+    args := "";
+    temps := make([]string);
+    for (i, a := range n.list) {
+        if (n.flag && i == len(n.list) - 1 && ft.variadic) { fail(g, a, "expanding arrays into C variadic calls is not supported"); break; }
+        v: V;
+        if (i < len(ft.params)) {
+            v = conv(g, genExpr(g, a), ft.params[i]);
+            if (a.kind == ast.NK.Member && a.sem == ast.Sem.ArrayData && under(typeOf(g, a.a)).kind == ast.TK.String) temps.append(v.r);
+            if (args != "") args += ", ";
+            args += cParam(ft.params[i]) + " " + v.r;
+            continue;
+        }
+        v = genExpr(g, a);
+        v = promoteVariadic(g, v);
+        if (args != "") args += ", ";
+        args += ll(v.t) + " " + v.r;
+    }
+    setSite(g, n);
+    res: V;
+    res.t = t;
+    callee := ft.variadic ? sig + " @\"" + s.name + "\"" : cRet(ft.results) + " @\"" + s.name + "\"";
+    if (len(ft.results) == 0) emit(g, "call " + callee + "(" + args + ")");
+    else { r := tmp(g); emit(g, r + " = call " + callee + "(" + args + ")"); res.r = r; res.t = ft.results[0]; }
+    for (_, tp := range temps) emit(g, "call void @oc_free(ptr " + tp + ")");
+    return res;
+}
+
+func needsFFI(g *Gen, n *ast.Node, ft *ast.Type) bool {
+    if (n.flag) return true;
+    for (i := len(ft.params); i < len(n.list); i++) {
+        k := under(typeOf(g, n.list[i])).kind;
+        if (k == ast.TK.Interface || k == ast.TK.Union) return true;
+    }
+    return false;
+}
+
+// slotKind classifies a C argument for oc_cvar_call.
+func slotKind(t *ast.Type) int {
+    u := under(t);
+    if (u.kind == ast.TK.Void) return 0;
+    if (u.kind == ast.TK.Float) return u.bits == 32 ? 4 : 3;
+    if (u.kind == ast.TK.Int) { if (u.bits <= 8) return 6; if (u.bits <= 16) return 7; if (u.bits <= 32) return 1; return 2; }
+    if (u.kind == ast.TK.Bool) return 6;
+    return 5;
+}
+
+func slotBits(g *Gen, v V) string {
+    u := under(v.t);
+    r := tmp(g);
+    if (u.kind == ast.TK.Float) {
+        d := v.r;
+        if (u.bits == 32) { d = tmp(g); emit(g, d + " = fpext float " + v.r + " to double"); }
+        emit(g, r + " = bitcast double " + d + " to i64");
+        if (u.bits == 32) { r2 := tmp(g); x := tmp(g); emit(g, x + " = bitcast float " + v.r + " to i32"); emit(g, r2 + " = zext i32 " + x + " to i64"); return r2; }
+        return r;
+    }
+    if (u.kind == ast.TK.Int) return intConv(g, v.r, u, u.signed ? check.TInt() : check.TUint());
+    if (u.kind == ast.TK.Bool) { emit(g, r + " = zext i1 " + v.r + " to i64"); return r; }
+    emit(g, r + " = ptrtoint ptr " + v.r + " to i64");
+    return r;
+}
+
+// genFFICall performs a C variadic call through libffi.
+func genFFICall(g *Gen, n *ast.Node, t *ast.Type) V {
+    s := n.sym;
+    ft := s.ty;
+    nfixed := len(ft.params);
+    kinds := allocaBytes(g, 8 * (nfixed + 1), 8);
+    vals := allocaBytes(g, 8 * (nfixed + 1), 8);
+    temps := make([]string);
+    for (i := 0; i < nfixed; i++) {
+        a := n.list[i];
+        v := conv(g, genExpr(g, a), ft.params[i]);
+        if (a.kind == ast.NK.Member && a.sem == ast.Sem.ArrayData && under(typeOf(g, a.a)).kind == ast.TK.String) temps.append(v.r);
+        emit(g, "store i64 " + itoa(slotKind(ft.params[i])) + ", ptr " + gep(g, kinds, i * 8));
+        emit(g, "store i64 " + slotBits(g, v) + ", ptr " + gep(g, vals, i * 8));
+    }
+    anyT := check.TAny();
+    extras := alloca(g, check.DynOf(anyT));
+    emit(g, "store ptr null, ptr " + extras);
+    for (i := nfixed; i < len(n.list); i++) {
+        a := n.list[i];
+        if (n.flag && i == len(n.list) - 1) {
+            sv := genExpr(g, a);
+            su := under(sv.t);
+            boxed := "";
+            if (su.kind == ast.TK.Dyn && check.IsInterface(su.elem)) boxed = sv.r;
+            else {
+                b := tmp(g);
+                emit(g, b + " = call ptr @oc_box_elements(ptr " + desc(g, sv.t) + ", ptr " + spill(g, sv) + ")");
+                boxed = b;
+            }
+            l := tmp(g); emit(g, l + " = call i64 @oc_arr_len(ptr " + boxed + ")");
+            emit(g, "call void @oc_arr_insert_from(ptr " + extras + ", i64 " + itoa(i - nfixed) + ", ptr " + arrayDataPtr(g, mkV(boxed, check.DynOf(anyT))) + ", i64 " + l + ", ptr " + desc(g, anyT) + ", i64 0)");
+            continue;
+        }
+        bv := box(g, conv(g, genExpr(g, a), anyT));
+        slot := tmp(g);
+        emit(g, slot + " = call ptr @oc_arr_push(ptr " + extras + ", i64 16)");
+        emit(g, "store {ptr, ptr} " + bv.r + ", ptr " + slot);
+    }
+    ex := tmp(g); emit(g, ex + " = load ptr, ptr " + extras);
+    rk := len(ft.results) == 0 ? 0 : slotKind(ft.results[0]);
+    declare(g, "@oc_cvar_call", "declare i64 @oc_cvar_call(ptr, i64, i64, i64, ptr, ptr, ptr)");
+    setSite(g, n);
+    r := tmp(g);
+    emit(g, r + " = call i64 @oc_cvar_call(ptr @\"" + s.name + "\", i64 " + itoa(rk) + ", i64 " + itoa(nfixed) + ", i64 " + itoa(nfixed) + ", ptr " + kinds + ", ptr " + vals + ", ptr " + ex + ")");
+    for (_, tp := range temps) emit(g, "call void @oc_free(ptr " + tp + ")");
+    res: V; res.t = t;
+    if (len(ft.results) == 0) return res;
+    rt := ft.results[0];
+    u := under(rt);
+    if (u.kind == ast.TK.Int) return mkV(intConv(g, r, check.TInt(), u), rt);
+    if (u.kind == ast.TK.Float) {
+        d := tmp(g); emit(g, d + " = bitcast i64 " + r + " to double");
+        if (u.bits == 32) { x := tmp(g); emit(g, x + " = fptrunc double " + d + " to float"); return mkV(x, rt); }
+        return mkV(d, rt);
+    }
+    if (u.kind == ast.TK.Bool) { b := tmp(g); emit(g, b + " = icmp ne i64 " + r + ", 0"); return mkV(b, rt); }
+    p := tmp(g); emit(g, p + " = inttoptr i64 " + r + " to ptr");
+    return mkV(p, rt);
+}
+
+func declareExtern(g *Gen, s *ast.Symbol) {
+    ft := s.ty;
+    dsig := cRet(ft.results) + " @\"" + s.name + "\"(";
+    for (i, p := range ft.params) { if (i > 0) dsig += ", "; dsig += cParam(p); }
+    if (ft.variadic) dsig += len(ft.params) > 0 ? ", ..." : "...";
+    dsig += ")";
+    declare(g, "@\"" + s.name + "\"", "declare " + dsig);
+}
+
+func promoteVariadic(g *Gen, v V) V {
+    u := under(v.t);
+    if (u.kind == ast.TK.Bool) { r := tmp(g); emit(g, r + " = zext i1 " + v.r + " to i32"); return mkV(r, check.TI32()); }
+    if (u.kind == ast.TK.Int && u.bits < 32) { return mkV(intConv(g, v.r, u, u.signed ? check.TI32() : uintT(32)), check.TI32()); }
+    if (u.kind == ast.TK.Int && u.bits != 32 && u.bits != 64) {
+        w := u.bits < 32 ? 32 : 64;
+        nt := ast.NewType(ast.TK.Int); nt.bits = w; nt.signed = u.signed;
+        return mkV(intConv(g, v.r, u, nt), nt);
+    }
+    if (u.kind == ast.TK.Float && u.bits == 32) { r := tmp(g); emit(g, r + " = fpext float " + v.r + " to double"); return mkV(r, check.TFloat()); }
+    if (u.kind == ast.TK.String) { r := tmp(g); emit(g, r + " = call ptr @oc_str_cdata(ptr " + v.r + ")"); return mkV(r, check.TVoidPtr()); }
+    return v;
+}
+func uintT(bits int) *ast.Type { t := ast.NewType(ast.TK.Int); t.bits = bits; return t; }
+
+// ---- builtins ----
+
+// arraySlot returns the address of the dynamic array a method mutates.
+func arraySlot(g *Gen, recv *ast.Node) string {
+    rt := typeOf(g, recv);
+    if (rt.kind == ast.TK.Ptr) return genExpr(g, recv).r;
+    return lvalueAddr(g, recv);
+}
+
+func genBuiltin(g *Gen, n *ast.Node, t *ast.Type) V {
+    name := n.text;
+    if (name == "len") {
+        v := genExpr(g, n.list[0]);
+        return mkV(collectionLen(g, v), t);
+    }
+    if (name == "free") {
+        a := n.list[0];
+        at := under(typeOf(g, a));
+        if (at.kind == ast.TK.Dyn) { emit(g, "call void @oc_arr_free(ptr " + lvalueAddr(g, a) + ")"); return mkV("", t); }
+        if (at.kind == ast.TK.String) { genExpr(g, a); return mkV("", t); }
+        v := genExpr(g, a);
+        emit(g, "call void @oc_free(ptr " + v.r + ")");
+        return mkV("", t);
+    }
+    if (name == "delete") {
+        mt := under(typeOf(g, n.list[0]));
+        slot := lvalueAddr(g, n.list[0]);
+        k := genAs(g, n.list[1], mt.key);
+        emit(g, "call void @oc_map_delete(ptr " + slot + ", ptr " + spill(g, k) + ", ptr " + desc(g, mt.key) + ")");
+        return mkV("", t);
+    }
+    if (name == "recover") {
+        out := alloca(g, check.TAny());
+        emit(g, "call void @oc_recover(ptr " + out + ")");
+        return load(g, check.TAny(), out);
+    }
+    mem := n.a;
+    recv := mem.a;
+    rt := under(typeOf(g, recv));
+    if (rt.kind == ast.TK.Ptr) rt = under(rt.elem);
+    elem := rt.kind == ast.TK.String ? check.TI8() : rt.elem;
+    es := sizeOf(g, elem);
+    if (name == "array") {
+        v := genExpr(g, recv);
+        if (v.t.kind == ast.TK.Ptr) v = load(g, v.t.elem, v.r);
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_arr_to_block(ptr " + v.r + ", ptr " + desc(g, elem) + ")");
+        return freshV(r, t);
+    }
+    if (name == "pop" || name == "remove") {
+        slot := arraySlot(g, recv);
+        out := alloca(g, elem);
+        if (name == "pop") emit(g, "call void @oc_arr_pop(ptr " + slot + ", i64 " + itoa(es) + ", ptr " + out + ", i64 " + itoa(site(g, n)) + ")");
+        else {
+            idx := genAs(g, n.list[0], check.TInt());
+            emit(g, "call void @oc_arr_remove(ptr " + slot + ", i64 " + idx.r + ", i64 " + itoa(es) + ", ptr " + out + ", i64 " + itoa(site(g, n)) + ")");
+        }
+        v := load(g, elem, out);
+        v.fresh = true;
+        return v;
+    }
+    // append / prepend / add: evaluate every argument first
+    start := 0;
+    index := "";
+    if (name == "add") { start = 1; index = genAs(g, n.list[0], check.TInt()).r; }
+    vals := make([]V);
+    spread: V;
+    hasSpread := false;
+    for (i := start; i < len(n.list); i++) {
+        if (n.flag && i == len(n.list) - 1) { spread = genExpr(g, n.list[i]); hasSpread = true; break; }
+        vals.append(genAs(g, n.list[i], elem));
+    }
+    slot := arraySlot(g, recv);
+    if (name == "append") { l := tmp(g); cur := tmp(g); emit(g, cur + " = load ptr, ptr " + slot); emit(g, l + " = call i64 @oc_arr_len(ptr " + cur + ")"); index = l; }
+    if (name == "prepend") index = "0";
+    if (len(vals) > 0) {
+        p := tmp(g);
+        emit(g, p + " = call ptr @oc_arr_insert(ptr " + slot + ", i64 " + index + ", i64 " + itoa(len(vals)) + ", i64 " + itoa(es) + ", i64 " + itoa(site(g, n)) + ")");
+        for (i, v := range vals) store(g, elem, gep(g, p, i * es), v);
+        if (hasSpread) { ni := tmp(g); emit(g, ni + " = add i64 " + index + ", " + itoa(len(vals))); index = ni; }
+    }
+    if (hasSpread) {
+        su := under(spread.t);
+        sd := ""; sn := "";
+        if (su.kind == ast.TK.String) { sd = arrayDataPtr(g, spread); sn = collectionLen(g, spread); }
+        else { sd = arrayDataPtr(g, spread); sn = collectionLen(g, spread); }
+        se := su.kind == ast.TK.String ? check.TI8() : su.elem;
+        if (check.Identical(se, elem)) {
+            emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + index + ", ptr " + sd + ", i64 " + sn + ", ptr " + desc(g, elem) + ", i64 " + itoa(site(g, n)) + ")");
+        } else {
+            fail(g, n, "spread element conversion is not supported here");
+        }
+    }
+    return mkV("", t);
+}
+
+func genEnumCall(g *Gen, n *ast.Node, t *ast.Type) V {
+    et := t;
+    p := alloca(g, et);
+    setTag(g, et, p, n.ival);
+    vs := g.c.VariantsOf(under(et));
+    v := vs[n.ival];
+    fs := g.c.VariantFields(v);
+    l := g.c.VariantLayout(under(et), n.ival);
+    base := gep(g, p, g.c.EnumPayloadOffset(under(et)));
+    for (i, a := range n.list) {
+        val := genAs(g, a, fs[i].ty);
+        store(g, fs[i].ty, gep(g, base, l.places[i].offset), val);
+    }
+    return freshV(p, et);
+}
+
+func genIntrinsic(g *Gen, n *ast.Node, t *ast.Type) V {
+    name := n.text;
+    if (name == "compilerThreadSpawn") {
+        f := genExpr(g, n.list[0]);
+        fn := extract(g, f.r, 0); env := extract(g, f.r, 1);
+        r := tmp(g);
+        emit(g, r + " = call i64 @ocean_threads_spawn(ptr " + fn + ", ptr " + env + ")");
+        return mkV(r, t);
+    }
+    if (name == "compilerThreadReturn") {
+        emit(g, "call void @ocean_runtime_thread_return()");
+        return mkV("", t);
+    }
+    v := box(g, conv(g, genExpr(g, n.list[0]), check.TAny()));
+    d := extract(g, v.r, 0); data := extract(g, v.r, 1);
+    if (name == "compilerReflectFields") {
+        r := tmp(g); emit(g, r + " = call ptr @oc_reflect_fields(ptr " + d + ", ptr " + data + ")");
+        return freshV(r, t);
+    }
+    if (name == "compilerReflectEnumVariant") {
+        r := tmp(g); emit(g, r + " = call ptr @oc_reflect_enum_variant(ptr " + d + ", ptr " + data + ")");
+        return freshV(r, t);
+    }
+    fnName := name == "compilerReflectIsStruct" ? "@oc_reflect_is_struct" : "@oc_reflect_is_enum";
+    r := tmp(g); emit(g, r + " = call i64 " + fnName + "(ptr " + d + ")");
+    c := tmp(g); emit(g, c + " = icmp ne i64 " + r + ", 0");
+    return mkV(c, t);
+}
+
+func unusedKind(k scanner.Kind) bool { return k == scanner.Kind.EOF; }

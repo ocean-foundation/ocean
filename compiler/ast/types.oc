@@ -1,0 +1,178 @@
+package ast;
+
+// Semantic types.
+enum TK {
+    Invalid, Void, Bool, Int, Float, String,
+    Ptr,        // elem (Void for *void)
+    Array,      // elem, len >= 0 static, -1 runtime-sized, -2 erased (array<T>)
+    Dyn,        // elem, mixed
+    Buffer,     // elem (nil = family `buffer`), len > 0 static, -1 runtime-sized, -2 unsized
+    Map,        // key, elem
+    Func,       // params, results, variadic
+    Struct,     // sym, args
+    Enum,       // sym, args
+    Interface,  // sym (nil for literal), args, methods
+    Named,      // defined type: sym
+    Param,      // type parameter: sym
+    Union,      // terms/tilde (type list value or constraint)
+    Null,       // type of `null`
+    UntypedInt,
+    UntypedFloat,
+    Tuple,      // results of multi-value calls
+    Family      // bare generic struct/enum name (sym), used as constraint
+}
+
+struct Method {
+    name string;
+    ty *Type;          // Func type (without receiver)
+    typeParams []*Symbol;
+    sym *Symbol;       // declaring method symbol for concrete types
+}
+
+struct Type {
+    kind TK;
+    bits int;
+    signed bool;
+    varw bool;
+    elem *Type;
+    key *Type;
+    len int;
+    isMixed bool;
+    params []*Type;
+    results []*Type;
+    variadic bool;
+    sym *Symbol;
+    args []*Type;
+    terms []*Type;
+    tilde []bool;
+    methods []*Method;
+    lenNode *Node;     // runtime dimension expression
+    cache string;      // cached display text
+    key2 string;       // cached canonical key
+    id int;
+}
+
+enum SK { Var, Func, Extern, Struct, Enum, Interface, TypeDef, Alias, BuiltinType, Package, TypeParam, Label, BuiltinFunc }
+
+struct FieldInfo {
+    name string;
+    ty *Type;
+    bits int;
+    valueParam bool;
+    node *Node;
+}
+
+struct VariantInfo {
+    name string;
+    vkind int;          // 0 unit, 1 tuple, 2 record, 3 fixed
+    types []*Type;      // tuple types
+    fields []*FieldInfo;// record fields
+    fixedType *Type;
+    fixedValue *Node;
+    index int;
+    node *Node;
+}
+
+struct Symbol {
+    kind SK;
+    name string;
+    node *Node;
+    pkg *Package;
+    src *Source;
+    ty *Type;
+    global bool;
+    param bool;
+    result bool;
+    captured bool;
+    immutable bool;
+    exported bool;
+    methods map[string]*Symbol;
+    methodList []*Symbol;
+    recvPtr bool;
+    owner *Symbol;          // method: receiver type symbol
+    recvParams []*Symbol;   // method: receiver type parameters
+    typeParams []*Symbol;
+    fields []*FieldInfo;
+    variants []*VariantInfo;
+    ifaceMethods []*Method;
+    constraint *Type;
+    importPkg *Package;
+    state int;              // 0 unresolved, 1 resolving, 2 resolved
+    id int;
+    builtin bool;           // Result/Optional and their methods
+    used bool;
+    freed bool;
+    depth int;
+    scopeLevel int;
+    declIndex int;
+    mangled string;
+    intrinsic string;
+    decl *Node;             // global var: its VarDecl
+    self *Type;             // type symbols: the declared (named) type
+    local bool;             // declared in a function body
+    scope *Scope;           // resolution scope for local type declarations
+    fixedVariant int;
+}
+
+struct Scope {
+    parent *Scope;
+    names map[string]*Symbol;
+    order []*Symbol;
+    fn *Node;               // enclosing function/literal
+    isFunc bool;
+    level int;
+}
+
+struct Module {
+    path string;
+    root string;
+    requires map[string]string;
+    replaces map[string]string;
+    replaceVersions map[string]string;
+}
+
+struct Package {
+    path string;        // import path
+    name string;        // declared package name
+    dir string;         // absolute directory
+    files []*Source;
+    scope *Scope;
+    imports []*Package;
+    id int;
+    std bool;
+    module *Module;
+    isRootModule bool;
+    test bool;
+    externalTest bool;
+    checked bool;
+    loading bool;
+    syms []*Symbol;     // package-level declarations in order
+    displayPath string;
+}
+
+func NewScope(parent *Scope) *Scope {
+    s := new(Scope);
+    s.parent = parent;
+    if (!NilScope(parent)) s.level = parent.level + 1;
+    return s;
+}
+func NilScope(s *Scope) bool { return (s -> int) == 0; }
+
+func (s *Scope) Lookup(name string) *Symbol {
+    for (sc := s; !NilScope(sc); sc = sc.parent) {
+        sym, ok := sc.names[name];
+        if (ok) return sym;
+    }
+    return zero(*Symbol);
+}
+func (s *Scope) LookupLocal(name string) *Symbol {
+    sym, ok := s.names[name];
+    if (ok) return sym;
+    return zero(*Symbol);
+}
+func (s *Scope) Insert(sym *Symbol) {
+    s.names[sym.name] = sym;
+    s.order.append(sym);
+}
+
+func NewType(k TK) *Type { t := new(Type); t.kind = k; return t; }

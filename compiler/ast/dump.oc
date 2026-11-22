@@ -1,0 +1,55 @@
+package ast;
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+func kindName(k NK) string {
+    switch (k) {
+    case NK.File: return "file"; case NK.Import: return "import"; case NK.Func: return "func";
+    case NK.Extern: return "extern"; case NK.Struct: return "struct"; case NK.Enum: return "enum";
+    case NK.Interface: return "interface"; case NK.TypeDecl: return "typedecl"; case NK.VarDecl: return "var";
+    case NK.Param: return "param"; case NK.TypeParam: return "tparam"; case NK.Field: return "field";
+    case NK.Variant: return "variant"; case NK.MethodSpec: return "method";
+    case NK.TPtr: return "ptr"; case NK.TArray: return "array"; case NK.TSlice: return "slice";
+    case NK.TMixed: return "mixed"; case NK.TMap: return "map"; case NK.TFunc: return "functype";
+    case NK.TBuffer: return "buffer"; case NK.TVarint: return "varint"; case NK.TInterface: return "itype";
+    case NK.TStruct: return "stype"; case NK.TUnion: return "union"; case NK.TTilde: return "tilde";
+    case NK.Ident: return "id"; case NK.Blank: return "_"; case NK.IntLit: return "int";
+    case NK.FloatLit: return "float"; case NK.StrLit: return "str"; case NK.Null: return "null";
+    case NK.Binary: return "bin"; case NK.Unary: return "un"; case NK.PostInc: return "post";
+    case NK.Assign: return "assign"; case NK.MultiAssign: return "massign"; case NK.Ternary: return "?:";
+    case NK.Comma: return "comma"; case NK.Call: return "call"; case NK.Index: return "index";
+    case NK.Slice: return "slice"; case NK.Member: return "."; case NK.Assert: return "assert";
+    case NK.TypeGuard: return "typeguard"; case NK.Inst: return "inst"; case NK.Composite: return "lit";
+    case NK.Entry: return "entry"; case NK.Cast: return "cast"; case NK.FuncLit: return "funclit";
+    case NK.ExternRef: return "externref"; case NK.Zero: return "zero"; case NK.New: return "new";
+    case NK.Make: return "make"; case NK.Sizeof: return "sizeof"; case NK.Block: return "block";
+    case NK.ExprStmt: return "expr"; case NK.If: return "if"; case NK.For: return "for";
+    case NK.ForRange: return "range"; case NK.Switch: return "switch"; case NK.TypeSwitch: return "typeswitch";
+    case NK.Case: return "case"; case NK.Match: return "match"; case NK.Arm: return "arm";
+    case NK.Pattern: return "pattern"; case NK.Return: return "return"; case NK.ReturnPanic: return "returnpanic";
+    case NK.Panic: return "panic"; case NK.Forward: return "forward"; case NK.Defer: return "defer";
+    case NK.Labeled: return "label"; case NK.Break: return "break"; case NK.Continue: return "continue";
+    case NK.Goto: return "goto"; case NK.Fallthrough: return "fallthrough"; case NK.Asm: return "asm";
+    case NK.Empty: return "empty";
+    }
+    return "bad";
+}
+
+// Dump renders a compact S-expression for tests.
+func Dump(n *Node) string {
+    if (Nil(n)) return "nil";
+    out := "(" + kindName(n.kind);
+    if (n.name != "") out += " " + n.name;
+    if (n.kind == NK.IntLit || n.kind == NK.FloatLit) out += " " + n.text;
+    if (n.kind == NK.StrLit) out += " \"" + n.text + "\"";
+    if (n.kind == NK.Binary || n.kind == NK.Unary || n.kind == NK.Assign || n.kind == NK.PostInc) out += " " + scanner.KindText(n.op);
+    if (n.flag) out += " !";
+    if (n.ival != 0 && n.kind != NK.IntLit) out += " #" + itoa(n.ival);
+    if (!Nil(n.a)) out += " " + Dump(n.a);
+    if (!Nil(n.b)) out += " " + Dump(n.b);
+    if (!Nil(n.c)) out += " " + Dump(n.c);
+    if (!Nil(n.d)) out += " " + Dump(n.d);
+    if (len(n.list) > 0) { out += " ["; for (i, x := range n.list) { if (i > 0) out += " "; out += Dump(x); } out += "]"; }
+    if (len(n.list2) > 0) { out += " {"; for (i, x := range n.list2) { if (i > 0) out += " "; out += Dump(x); } out += "}"; }
+    if (len(n.list3) > 0) { out += " <"; for (i, x := range n.list3) { if (i > 0) out += " "; out += Dump(x); } out += ">"; }
+    return out + ")";
+}

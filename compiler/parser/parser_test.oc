@@ -1,0 +1,141 @@
+package parser;
+import "testing";
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+func parse(text string) (*ast.Node, *diag.List, bool) {
+    d := diag.NewList();
+    d.live = false;
+    src := new(ast.Source);
+    src.path = "t.oc"; src.text = text;
+    toks, ok := scanner.Scan("t.oc", text, d, false);
+    if (!ok) return zero(*ast.Node), d, false;
+    src.tokens = toks;
+    f, pok := ParseFile(src, d, false);
+    return f, d, pok;
+}
+
+func body(t *testing.T, stmts string) string {
+    f, d, ok := parse("package main; func main() { " + stmts + " }");
+    if (!ok) { t.Error("parse failed: ", stmts, " :: ", d.items[0].message); return ""; }
+    b := f.list[0].b;
+    out := "";
+    for (i, s := range b.list) { if (i > 0) out += " "; out += ast.Dump(s); }
+    return out;
+}
+
+func expectBody(t *testing.T, stmts string, want string) {
+    got := body(t, stmts);
+    if (got != want) t.Error(stmts, "\n got: ", got, "\nwant: ", want);
+}
+
+func expectError(t *testing.T, text string, msg string) {
+    _, d, ok := parse(text);
+    if (ok) { t.Error("accepted: ", text); return; }
+    if (d.items[0].message != msg) t.Error(text, "\n got error: ", d.items[0].message, "\nwant: ", msg);
+}
+
+func TestPrecedence(t *testing.T) {
+    expectBody(t, "x = 1 + 2 * 3;", "(expr (assign = (id x) (bin + (int 1) (bin * (int 2) (int 3)))))");
+    expectBody(t, "x & 3 == 3;", "(expr (bin & (id x) (bin == (int 3) (int 3))))");
+    expectBody(t, "*p->float;", "(expr (un * (cast (id p) (id float))))");
+    expectBody(t, "x = y = 4;", "(expr (assign = (id x) (assign = (id y) (int 4))))");
+    expectBody(t, "c ? a : b ? d : e;", "(expr (?: (id c) (id a) (?: (id b) (id d) (id e))))");
+}
+
+func TestDeclarations(t *testing.T) {
+    expectBody(t, "x := 1;", "(var [(id x)] {(int 1)})");
+    expectBody(t, "x: []int;", "(var (slice (id int)) [(id x)])");
+    expectBody(t, "a, _ := f();", "(var [(id a) (_ _)] {(call (id f))})");
+    expectBody(t, "m: map[string][]int = {};", "(var (map (id string) (slice (id int))) [(id m)] {(lit)})");
+    expectBody(t, "L: for (;;) { break L; }", "(label L (for (block [(break L)])))");
+    expectBody(t, "x: [3][2]int;", "(var (array (array (id int) (int 2)) (int 3)) [(id x)])");
+}
+
+func TestGenericsDisambiguation(t *testing.T) {
+    expectBody(t, "f<int>(x);", "(expr (call (inst (id f) [(id int)]) [(id x)]))");
+    expectBody(t, "a < b;", "(expr (bin < (id a) (id b)))");
+    expectBody(t, "x := Box<Box<int>>{};", "(var [(id x)] {(lit (inst (id Box) [(inst (id Box) [(id int)])]))})");
+    expectBody(t, "y := a < b > c;", "(var [(id y)] {(bin > (bin < (id a) (id b)) (id c))})");
+}
+
+func TestMultiAssign(t *testing.T) {
+    expectBody(t, "a, b = b, a;", "(expr (massign [(id a) (id b)] {(id b) (id a)}))");
+}
+
+func TestControlFlow(t *testing.T) {
+    expectBody(t, "if (x := f(); x) {} else {}", "(if (var [(id x)] {(call (id f))}) (id x) (block) (block))");
+    expectBody(t, "for (i, v := range xs) {}", "(range (id xs) (block) [(id i) (id v)])");
+    expectBody(t, "for (defer c) {}", "(for ! (id c) (block))");
+    expectBody(t, "switch (v := x.(type)) { case int, ~float: default: }", "(typeswitch v (id x) [(case [(id int) (tilde (id float))]) (case !)])");
+    expectBody(t, "match (e) { E.A(x, _) => return; E => {} }", "(match (id e) [(arm (pattern #1 (. A (id E)) [(id x) (_ _)]) (return)) (arm (pattern (id E)) (block))])");
+    expectBody(t, "return panic \"x\";", "(returnpanic (str \"x\"))");
+    expectBody(t, "forward panic f();", "(forward (expr (call (id f))))");
+}
+
+func TestLiterals(t *testing.T) {
+    expectBody(t, "x := []int{1, 2};", "(var [(id x)] {(lit (slice (id int)) [(entry (int 1)) (entry (int 2))])})");
+    expectBody(t, "p := Point{x: 1};", "(var [(id p)] {(lit (id Point) [(entry (id x) (int 1))])})");
+    expectBody(t, "b := buffer<int, 4>{};", "(var [(id b)] {(lit (buffer (id int) (int 4)))})");
+    expectBody(t, "z := zero(*T);", "(var [(id z)] {(zero (ptr (id T)))})");
+    expectBody(t, "s := sizeof([]int);", "(var [(id s)] {(sizeof (slice (id int)))})");
+    expectBody(t, "v := e.(E.V{y, a = x});", "(var [(id v)] {(assert ! (id e) (. V (id E)) [(entry (id y)) (entry (assign = (id a) (id x)))])})");
+}
+
+func TestFunctions(t *testing.T) {
+    f, _, ok := parse("package p; func (b *Box<T>) Set<U any>(a, c int, rest ...string) (x, y int) { return; }");
+    if (!ok) { t.Fatal("parse"); }
+    fn := f.list[0];
+    if (fn.name != "Set" || len(fn.list) != 3 || !fn.flag || len(fn.list2) != 2 || len(fn.list4) != 1 || fn.a.name != "b") t.Error("method shape");
+    if (fn.list[1].name != "c" || ast.Dump(fn.list[1].a) != "(id int)") t.Error("group type");
+    f2, _, ok2 := parse("package p; func f(int, string) (bool, error) {} extern i32 printf(buffer<i8> fmt, ...); extern void exit(i32);");
+    if (!ok2) { t.Fatal("parse2"); }
+    if (f2.list[0].list[0].name != "" || len(f2.list[0].list2) != 2) t.Error("unnamed");
+    if (!f2.list[1].flag || len(f2.list[1].list) != 1) t.Error("extern variadic");
+    if (!ast.Nil(f2.list[2].a)) t.Error("extern void");
+}
+
+func TestTypeDecls(t *testing.T) {
+    f, _, ok := parse("package p; struct Flags(size int) { low uint : 4; x, y int; } enum E<T> { A, B(int, T), C{x int; y string}, D := 5, F: u8 = 3 } interface I { m(int) int; func n<T int | float>(T) float; } interface N { int | ~float } type ID int; type A = []int;");
+    if (!ok) { t.Fatal("parse"); }
+    s := f.list[0];
+    if (len(s.list2) != 1 || len(s.list) != 3 || s.list[0].ival != 4) t.Error("struct");
+    e := f.list[1];
+    if (len(e.list) != 5 || e.list[1].ival != 1 || e.list[2].ival != 2 || e.list[3].ival != 3 || ast.Nil(e.list[4].b)) t.Error("enum");
+    if (len(f.list[2].list) != 2 || len(f.list[2].list[1].list3) != 1) t.Error("interface");
+    if (ast.Nil(f.list[3].a)) t.Error("type list");
+    if (!f.list[5].flag) t.Error("alias");
+}
+
+func TestImports(t *testing.T) {
+    f, _, ok := parse("package p; import \"io\"; import ( h \"a/b\", \"c\" as d\n . \"e\"\n _ \"f\" )");
+    if (!ok) { t.Fatal("parse"); }
+    if (len(f.list2) != 5 || f.list2[1].name != "h" || f.list2[2].name != "d" || f.list2[3].name != "." || f.list2[4].name != "_") t.Error("imports");
+    expectError(t, "package p; import h \"x\" as y;", "Import alias specified twice");
+    expectError(t, "package p; import \"\";", "Import path must not be empty");
+}
+
+func TestLegacyErrors(t *testing.T) {
+    expectError(t, "package p; func main() { x: int[3]; }", "Square brackets go before the type for an array. Did you mean '[3]int'?");
+    expectError(t, "package p; func f(a int*) {}", "The pointer star goes before the type. Did you mean '*int'?");
+    expectError(t, "package p; struct S { b buffer<int>[4]; }", "A buffer's size is its second type argument. Did you mean 'buffer<int, 4>'?");
+    expectError(t, "package p; func main() { x := int[3]{1}; }", "Square brackets go before the type for an array. Did you mean '[3]int'?");
+    expectError(t, "package p; func main() { x: int[3][2]; }", "Square brackets go before the type for an array. Did you mean '[2][3]int'?");
+    expectError(t, "package p; func main() { x: T*[]; }", "Square brackets go before the type for an array. Did you mean '[]*T'?");
+}
+
+func TestSyntaxErrors(t *testing.T) {
+    expectError(t, "package p; func broken(x int y int) {}", "Expected comma or closing parenthesis");
+    expectError(t, "package p; func main() { x := 1 +; }", "Unexpected ';', expected expression");
+    expectError(t, "package p; func main() { if x {} }", "Expected condition for if statement");
+    expectError(t, "package p; return 1;", "Return is only allowed inside a function");
+    expectError(t, "package p; func main() { switch (x) { case 1: fallthrough; } }", "Fallthrough must end a non-final switch case");
+    expectError(t, "package p; enum E[T] { A }", "Enum type parameters require angle brackets <...>");
+    expectError(t, "package p; func f(a int, b) {}", "Cannot mix named and unnamed parameters");
+    expectError(t, "package p; func main() { asm wasm/js { nop } }", "Unknown asm platform; expected linux, macos, or windows");
+}
+
+func TestReturnBeforeBrace(t *testing.T) {
+    expectBody(t, "if (a) { return x }", "(if (id a) (block [(return [(id x)])]))");
+}

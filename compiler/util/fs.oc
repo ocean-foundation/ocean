@@ -1,0 +1,271 @@
+package util;
+
+// Thin libc wrappers. Layout offsets assume 64-bit Linux glibc (x86-64/AArch64/RISC-V64).
+extern i32 open(buffer<i8> path, i32 flags, ...);
+extern int read(i32 fd, buffer<i8> data, int count);
+extern int write(i32 fd, buffer<i8> data, int count);
+extern i32 close(i32 fd);
+extern i32 stat(buffer<i8> path, buffer<i8> st);
+extern i32 lstat(buffer<i8> path, buffer<i8> st);
+extern *void opendir(buffer<i8> path);
+extern buffer<i8> readdir(*void dir);
+extern i32 closedir(*void dir);
+extern i32 mkdir(buffer<i8> path, u32 mode);
+extern i32 unlink(buffer<i8> path);
+extern i32 rmdir(buffer<i8> path);
+extern i32 rename(buffer<i8> from, buffer<i8> to);
+extern buffer<i8> getcwd(buffer<i8> data, int size);
+extern buffer<i8> realpath(buffer<i8> path, buffer<i8> resolved);
+extern buffer<i8> getenv(buffer<i8> name);
+extern buffer<i8> mkdtemp(buffer<i8> template);
+extern i32 mkstemp(buffer<i8> template);
+extern void free(*void p);
+extern int strlen(buffer<i8> s);
+extern i32 isatty(i32 fd);
+extern i32 access(buffer<i8> path, i32 mode);
+extern i32 chmod(buffer<i8> path, u32 mode);
+extern i32 getpid();
+
+func CStr(s string) []i8 { b := s -> []i8; b.append(0); return b; }
+
+func FromC(p buffer<i8>) string {
+    if ((p -> int) == 0) return "";
+    n := extern.strlen(p);
+    out := make([]i8);
+    for (i := 0; i < n; i++) out.append(p[i]);
+    return out -> string;
+}
+
+func Getenv(name string) (string, bool) {
+    c := CStr(name);
+    p := extern.getenv(c.data);
+    if ((p -> int) == 0) return "", false;
+    return FromC(p), true;
+}
+
+func ReadFile(path string) (string, bool) {
+    c := CStr(path);
+    fd := extern.open(c.data, 0->i32);
+    if (fd < 0) return "", false;
+    out := make([]i8);
+    chunk := make([]i8);
+    for (i := 0; i < 65536; i++) chunk.append(0);
+    for (;;) {
+        n := extern.read(fd, chunk.data, 65536);
+        if (n < 0) { extern.close(fd); return "", false; }
+        if (n == 0) break;
+        out.append(chunk[0:n]...);
+    }
+    extern.close(fd);
+    return out -> string, true;
+}
+
+func WriteFd(fd i32, s string) bool {
+    if (len(s) == 0) return true;
+    b := s -> []i8;
+    off := 0;
+    for (off < len(b)) {
+        n := extern.write(fd, (&b[off]) -> (buffer<i8>), len(b) - off);
+        if (n <= 0) return false;
+        off += n;
+    }
+    return true;
+}
+
+func WriteBytesFd(fd i32, b *[]i8) bool {
+    off := 0;
+    for (off < len(*b)) {
+        n := extern.write(fd, (&(*b)[off]) -> (buffer<i8>), len(*b) - off);
+        if (n <= 0) return false;
+        off += n;
+    }
+    return true;
+}
+
+func Stdout(s string) { WriteFd(1->i32, s); }
+func Stderr(s string) { WriteFd(2->i32, s); }
+
+// WriteFile writes s to path (create/truncate) with the given mode bits.
+func WriteFileMode(path string, s string, mode int) bool {
+    c := CStr(path);
+    fd := extern.open(c.data, (64 | 512 | 1)->i32, mode->u32);
+    if (fd < 0) return false;
+    ok := WriteFd(fd, s);
+    if (extern.close(fd) != 0) ok = false;
+    return ok;
+}
+func WriteFile(path string, s string) bool { return WriteFileMode(path, s, 438); }
+
+func WriteBufFile(path string, b *Buf) bool {
+    c := CStr(path);
+    fd := extern.open(c.data, (64 | 512 | 1)->i32, 438->u32);
+    if (fd < 0) return false;
+    ok := WriteBytesFd(fd, &b.bytes);
+    if (extern.close(fd) != 0) ok = false;
+    return ok;
+}
+
+// statMode returns st_mode or -1.
+func addr(b buffer<i8>) int { return b -> int; }
+func BufAt(n int) buffer<i8> { p := n -> (*void); b := p -> (buffer<i8>); return b; }
+func statMode(path string, follow bool) int {
+    c := CStr(path);
+    st: buffer<i8, 256>;
+    r := follow ? extern.stat(c.data, st) : extern.lstat(c.data, st);
+    if (r != 0) return -1;
+    p := (addr(st) + 24) -> (*u32);
+    return (*p) -> int;
+}
+
+func StatSize(path string) int {
+    c := CStr(path);
+    st: buffer<i8, 256>;
+    if (extern.stat(c.data, st) != 0) return -1;
+    return *((addr(st) + 48) -> (*int));
+}
+
+func StatMtime(path string) int {
+    c := CStr(path);
+    st: buffer<i8, 256>;
+    if (extern.stat(c.data, st) != 0) return -1;
+    sec := *((addr(st) + 88) -> (*int));
+    nsec := *((addr(st) + 96) -> (*int));
+    return sec * 1000000000 + nsec;
+}
+
+func Exists(path string) bool { return statMode(path, true) >= 0; }
+func IsDir(path string) bool { m := statMode(path, true); return m >= 0 && (m & 61440) == 16384; }
+func IsRegular(path string) bool { m := statMode(path, true); return m >= 0 && (m & 61440) == 32768; }
+func IsSymlink(path string) bool { m := statMode(path, false); return m >= 0 && (m & 61440) == 40960; }
+func IsExecutable(path string) bool { c := CStr(path); return extern.access(c.data, 1->i32) == 0; }
+
+// ListDir returns the entry names of a directory (excluding . and ..), sorted.
+func ListDir(path string) ([]string, bool) {
+    out := make([]string);
+    c := CStr(path);
+    d := extern.opendir(c.data);
+    if ((d -> int) == 0) return out, false;
+    for (;;) {
+        e := extern.readdir(d);
+        if ((e -> int) == 0) break;
+        name := FromC(BufAt((e -> int) + 19));
+        if (name == "." || name == "..") continue;
+        out.append(name);
+    }
+    extern.closedir(d);
+    SortStrings(&out);
+    return out, true;
+}
+
+func Mkdir(path string) bool { c := CStr(path); return extern.mkdir(c.data, 511->u32) == 0; }
+func MkdirAll(path string) bool {
+    if (IsDir(path)) return true;
+    parent := Dir(path);
+    if (parent != path && parent != "" && !IsDir(parent)) { if (!MkdirAll(parent)) return false; }
+    return Mkdir(path) || IsDir(path);
+}
+func Remove(path string) bool { c := CStr(path); return extern.unlink(c.data) == 0; }
+func Rmdir(path string) bool { c := CStr(path); return extern.rmdir(c.data) == 0; }
+func Rename(from string, to string) bool { a := CStr(from); b := CStr(to); return extern.rename(a.data, b.data) == 0; }
+func Chmod(path string, mode int) bool { c := CStr(path); return extern.chmod(c.data, mode->u32) == 0; }
+
+func RemoveAll(path string) bool {
+    if (IsSymlink(path) || !IsDir(path)) return Remove(path);
+    names, _ := ListDir(path);
+    for (_, n := range names) RemoveAll(path + "/" + n);
+    return Rmdir(path);
+}
+
+func Getcwd() string {
+    b := make([]i8);
+    for (i := 0; i < 4096; i++) b.append(0);
+    p := extern.getcwd(b.data, 4096);
+    return FromC(p);
+}
+
+func Realpath(path string) (string, bool) {
+    c := CStr(path);
+    p := extern.realpath(c.data, zero(buffer<i8>));
+    if ((p -> int) == 0) return "", false;
+    s := FromC(p);
+    extern.free(p -> (*void));
+    return s, true;
+}
+
+func TempBase() string {
+    t, ok := Getenv("TMPDIR");
+    if (ok && t != "") return t;
+    return "/tmp";
+}
+
+func MakeTempDir(prefix string) (string, bool) {
+    c := CStr(TempBase() + "/" + prefix + "XXXXXX");
+    p := extern.mkdtemp(c.data);
+    if ((p -> int) == 0) return "", false;
+    return FromC(p), true;
+}
+
+func MakeTempFile(prefix string) (string, bool) {
+    c := CStr(TempBase() + "/" + prefix + "XXXXXX");
+    fd := extern.mkstemp(c.data);
+    if (fd < 0) return "", false;
+    extern.close(fd);
+    return FromC(c.data), true;
+}
+
+func IsTerminal(fd int) bool { return extern.isatty(fd->i32) != 0; }
+func Pid() int { return extern.getpid() -> int; }
+
+// Path helpers.
+func Dir(path string) string {
+    i := LastIndexByte(path, '/');
+    if (i < 0) return ".";
+    if (i == 0) return "/";
+    return path[0:i];
+}
+func Base(path string) string {
+    for (len(path) > 1 && path[len(path) - 1] == '/') path = path[0:len(path) - 1];
+    i := LastIndexByte(path, '/');
+    if (i < 0) return path;
+    return path[i + 1:];
+}
+func JoinPath(a string, b string) string {
+    if (a == "" || a == ".") return b;
+    if (len(b) > 0 && b[0] == '/') return b;
+    if (HasSuffix(a, "/")) return a + b;
+    return a + "/" + b;
+}
+
+// Clean normalizes a path lexically (., .., duplicate slashes).
+func Clean(path string) string {
+    if (path == "") return ".";
+    abs := path[0] == '/';
+    parts := Split(path, '/');
+    out := make([]string);
+    for (_, p := range parts) {
+        if (p == "" || p == ".") continue;
+        if (p == "..") {
+            if (len(out) > 0 && out[len(out) - 1] != "..") { out.pop(); continue; }
+            if (abs) continue;
+        }
+        out.append(p);
+    }
+    s := JoinList(out, "/");
+    if (abs) return "/" + s;
+    if (s == "") return ".";
+    return s;
+}
+
+func Abs(path string) string {
+    if (len(path) > 0 && path[0] == '/') return Clean(path);
+    return Clean(Getcwd() + "/" + path);
+}
+
+// Rel returns path relative to base when path is inside base; otherwise path.
+func Rel(base string, path string) string {
+    b := Clean(base); p := Clean(path);
+    if (p == b) return ".";
+    if (b == "/") return p[1:];
+    if (HasPrefix(p, b + "/")) return p[len(b) + 1:];
+    return p;
+}

@@ -1,0 +1,207 @@
+package fix;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/loader";
+import "github.com/ocean-foundation/ocean/compiler/parser";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+extern i32 chmod(buffer<i8> path, u32 mode);
+extern i32 stat(buffer<i8> path, buffer<i8> st);
+
+func quiet() *diag.List { d := diag.NewList(); d.live = false; return d; }
+
+func tokens(text string, path string) []*scanner.Token {
+    toks, _ := scanner.Scan(path, text, quiet(), true);
+    return toks;
+}
+
+func ocFiles(dir string) []string {
+    out := make([]string);
+    names, ok := util.ListDir(dir);
+    if (!ok) return out;
+    for (_, n := range names) {
+        if (len(n) < 4 || !util.HasSuffix(n, ".oc")) continue;
+        p := dir + "/" + n;
+        if (util.IsRegular(p)) out.append(p);
+    }
+    return out;
+}
+
+// directoryTypes collects declared type names (token scan) and the package name.
+func directoryTypes(dir string, qualifier string, exportedOnly bool, known map[string]bool) string {
+    pkgName := "";
+    for (_, path := range ocFiles(dir)) {
+        text, ok := util.ReadFile(path);
+        if (!ok) continue;
+        toks := tokens(text, path);
+        for (i := 0; i + 1 < len(toks); i++) {
+            t := toks[i]; nx := toks[i + 1];
+            if (t.kind == scanner.Kind.KwPackage && nx.kind == scanner.Kind.Ident && pkgName == "") pkgName = nx.text;
+            if ((t.kind == scanner.Kind.KwStruct || t.kind == scanner.Kind.KwType || t.kind == scanner.Kind.KwEnum || t.kind == scanner.Kind.KwInterface) &&
+                nx.kind == scanner.Kind.Ident && (!exportedOnly || scanner.IsExported(nx.text))) {
+                if (qualifier != "") known[qualifier + "." + nx.text] = true;
+                else known[nx.text] = true;
+            }
+        }
+    }
+    return pkgName;
+}
+
+func pathPrefix(path string, base string) bool { return util.HasPrefix(path, base) && (len(path) == len(base) || path[len(base)] == '/'); }
+
+// importDirectory resolves an import without downloading anything.
+func importDirectory(b *loader.Build, mod *ast.Module, path string) string {
+    if (!loader.ValidModulePath(path)) return "";
+    hasMod := (mod -> int) != 0;
+    if (hasMod && mod.path != "" && pathPrefix(path, mod.path)) return mod.root + path[len(mod.path):];
+    if (hasMod && util.IsDir(mod.root + "/" + path)) return mod.root + "/" + path;
+    std := b.StandardSource();
+    if (std != "" && util.IsDir(std + "/" + path)) return std + "/" + path;
+    if (!hasMod) return "";
+    matched := "";
+    for (name, _ := range mod.requires) { if (pathPrefix(path, name) && len(name) > len(matched)) matched = name; }
+    if (matched == "") return "";
+    r, replaced := mod.replaces[matched];
+    if (replaced && (r[0] == '.' || r[0] == '/')) return (r[0] == '/' ? r : mod.root + "/" + r) + path[len(matched):];
+    cache, cok := util.Getenv("OCEAN_MOD_CACHE");
+    if (!cok) { home, hok := util.Getenv("HOME"); cache = (hok ? home : "/tmp") + "/.cache/ocean/modules"; }
+    v, _ := mod.requires[matched];
+    return cache + "/" + matched + "@" + (v == "" ? "latest" : v) + path[len(matched):];
+}
+
+// fixFile rewrites one file until no legacy spans remain; returns the count or -1.
+func fixFile(path string, known map[string]bool) int {
+    text, ok := util.ReadFile(path);
+    if (!ok) { util.Stderr("ocean fix: cannot read " + path + "\n"); return -1; }
+    current := text;
+    total := 0;
+    for (pass := 0; pass < 32; pass++) {
+        src := new(ast.Source);
+        src.path = path; src.text = current;
+        src.tokens = tokens(current, path);
+        rewrites := parser.ParseForFix(src, quiet(), known);
+        if (len(rewrites) == 0) break;
+        // sort by start offset
+        for (i := 1; i < len(rewrites); i++) {
+            for (j := i; j > 0 && rewrites[j - 1].start > rewrites[j].start; j--) {
+                tmp := rewrites[j]; rewrites[j] = rewrites[j - 1]; rewrites[j - 1] = tmp;
+            }
+        }
+        b: util.Buf;
+        cursor := 0;
+        applied := 0;
+        for (_, w := range rewrites) {
+            if (w.start < cursor || w.end > len(current) || w.start > w.end) continue;
+            b.Add(current[cursor:w.start]).Add(w.text);
+            cursor = w.end;
+            applied++;
+        }
+        b.Add(current[cursor:]);
+        total += applied;
+        next := b.String();
+        if (next == current) break;
+        current = next;
+    }
+    if (total > 0 && current != text) {
+        tmp := path + ".ocean-fix-" + util.Itoa(util.Pid());
+        if (!util.WriteFile(tmp, current)) { util.Stderr("ocean fix: cannot write " + path + "\n"); util.Remove(tmp); return -1; }
+        m := statMode(path);
+        if (m >= 0) { t := util.CStr(tmp); extern.chmod(t.data, (m & 4095)->u32); }
+        if (!util.Rename(tmp, path)) { util.Stderr("ocean fix: cannot write " + path + "\n"); util.Remove(tmp); return -1; }
+    }
+    return total;
+}
+
+func statMode(path string) int {
+    st: buffer<i8, 256>;
+    c := util.CStr(path);
+    if (extern.stat(c.data, st) != 0) return -1;
+    p := stPtr(st);
+    return (*p) -> int;
+}
+func stPtr(b buffer<i8>) *u32 { return ((b -> int) + 24) -> (*u32); }
+
+func fixDirectory(b *loader.Build, dir string) bool {
+    known: map[string]bool;
+    directoryTypes(dir, "", false, known);
+    mod := b.FindModule(dir);
+    files := ocFiles(dir);
+    // exported types of imported packages, under each file's import name
+    for (_, path := range files) {
+        text, ok := util.ReadFile(path);
+        if (!ok) continue;
+        toks := tokens(text, path);
+        for (i := 0; i < len(toks); i++) {
+            if (toks[i].kind != scanner.Kind.KwImport) continue;
+            j := i + 1;
+            group := j < len(toks) && toks[j].kind == scanner.Kind.LParen;
+            if (group) j++;
+            for (j < len(toks)) {
+                alias := ""; hasAlias := false;
+                k := toks[j].kind;
+                if (k == scanner.Kind.Ident || k == scanner.Kind.Blank || k == scanner.Kind.Dot) { alias = toks[j].text; hasAlias = true; j++; }
+                if (j >= len(toks) || toks[j].kind != scanner.Kind.Str) break;
+                importPath := toks[j].text;
+                j++;
+                if (j + 1 < len(toks) && toks[j].kind == scanner.Kind.KwAs) { alias = toks[j + 1].text; hasAlias = true; j += 2; }
+                location := importDirectory(b, mod, importPath);
+                if (location != "" && util.IsDir(location) && (!hasAlias || alias != "_")) {
+                    ignored: map[string]bool;
+                    declared := directoryTypes(location, "", true, ignored);
+                    slash := util.LastIndexByte(importPath, '/');
+                    qualifier := hasAlias ? alias : (declared != "" ? declared : (slash >= 0 ? importPath[slash + 1:] : importPath));
+                    directoryTypes(location, qualifier == "." ? "" : qualifier, true, known);
+                }
+                if (j < len(toks) && (toks[j].kind == scanner.Kind.Comma || toks[j].kind == scanner.Kind.Semi)) j++;
+                if (!group || (j < len(toks) && toks[j].kind == scanner.Kind.RParen)) break;
+            }
+        }
+    }
+    failed := false;
+    for (_, path := range files) {
+        changed := fixFile(path, known);
+        if (changed < 0) failed = true;
+        else if (changed > 0) util.Stdout("ocean fix: " + loader.RelativeSourcePath(path) + ": " + util.Itoa(changed) + " type" + (changed == 1 ? "" : "s") + " rewritten\n");
+    }
+    return failed;
+}
+
+func fixTree(b *loader.Build, dir string) bool {
+    names, ok := util.ListDir(dir);
+    if (!ok) return true;
+    hasSource := false;
+    children := make([]string);
+    for (_, n := range names) {
+        if (len(n) > 3 && util.HasSuffix(n, ".oc")) hasSource = true;
+        if (n[0] == '.' || n == "vendor" || n == "node_modules") continue;
+        p := dir + "/" + n;
+        if (util.IsDir(p) && !util.IsSymlink(p)) children.append(p);
+    }
+    failed := false;
+    if (hasSource) failed = fixDirectory(b, dir) || failed;
+    for (_, c := range children) failed = fixTree(b, c) || failed;
+    return failed;
+}
+
+// Main implements `ocean fix [location...]`.
+func Main(locations []string) int {
+    b := loader.NewBuild(quiet());
+    failed := false;
+    if (len(locations) == 0) locations.append(".");
+    for (_, original := range locations) {
+        location := original;
+        recursive := util.HasSuffix(location, "...") && (len(location) == 3 || location[len(location) - 4] == '/');
+        if (recursive) location = len(location) > 3 ? location[0:len(location) - 4] : "";
+        if (location == "") location = ".";
+        path, ok := util.Realpath(location);
+        if (!ok) { util.Stderr("ocean fix: location does not exist: " + original + "\n"); failed = true; continue; }
+        if (!util.IsDir(path)) {
+            if (!util.HasSuffix(path, ".oc")) { util.Stderr("ocean fix: expected an Ocean file or package directory: " + original + "\n"); failed = true; continue; }
+            path = util.Dir(path);
+        }
+        if (recursive) failed = fixTree(b, path) || failed;
+        else failed = fixDirectory(b, path) || failed;
+    }
+    return failed ? 1 : 0;
+}

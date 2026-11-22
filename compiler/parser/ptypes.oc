@@ -1,0 +1,184 @@
+package parser;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+// constraint = ['~'] Type { '|' ['~'] Type }
+func constraint(p *Parser) *ast.Node {
+    first := term(p);
+    if (!is(p, scanner.Kind.Pipe)) return first;
+    u := nodeAt(p, ast.NK.TUnion, first);
+    u.list.append(first);
+    for (accept(p, scanner.Kind.Pipe)) u.list.append(term(p));
+    return finish(p, u);
+}
+
+func term(p *Parser) *ast.Node {
+    if (is(p, scanner.Kind.Tilde)) {
+        n := node(p, ast.NK.TTilde);
+        next(p);
+        n.a = typ(p);
+        return finish(p, n);
+    }
+    return typ(p);
+}
+
+func typeArgs(p *Parser) []*ast.Node {
+    out := make([]*ast.Node);
+    next(p); // '<'
+    for (!p.failed) {
+        if (tk(p) == scanner.Kind.Gt || tk(p) == scanner.Kind.Shr) break;
+        out.append(typ(p));
+        if (!accept(p, scanner.Kind.Comma)) break;
+    }
+    if (!closeAngle(p)) err(p, "Expected closing type argument angle");
+    return out;
+}
+
+func varintType(p *Parser) *ast.Node {
+    n := node(p, ast.NK.TVarint);
+    n.flag = is(p, scanner.Kind.KwVarint);
+    signed := n.flag;
+    next(p);
+    if (!accept(p, scanner.Kind.LParen)) { err(p, "Expected '(' after varint"); return n; }
+    if (!is(p, scanner.Kind.Int) || tok(p).isChar) { err(p, "varint width must be an integer literal from 1 through 8388608"); return n; }
+    w := smallInt(tok(p).text);
+    if (w < 1 || w > 8388608) { err(p, "varint width must be an integer literal from 1 through 8388608"); return n; }
+    n.ival = w;
+    next(p);
+    if (!accept(p, scanner.Kind.RParen)) {
+        err(p, signed ? "Expected closing parenthesis after varint width" : "Expected closing parenthesis after varuint width");
+    }
+    return finish(p, n);
+}
+
+func funcType(p *Parser) *ast.Node {
+    n := node(p, ast.NK.TFunc);
+    next(p);
+    if (!is(p, scanner.Kind.LParen)) { err(p, "Expected function signature type"); return n; }
+    n.list = paramList(p, true, "parameter");
+    if (len(n.list) > 0 && n.list[len(n.list) - 1].flag) n.flag = true;
+    n.list2 = results(p);
+    return finish(p, n);
+}
+
+func typ(p *Parser) *ast.Node {
+    p.depth++;
+    if (p.depth > 400) { err(p, "Type nesting limit exceeded"); p.depth--; return node(p, ast.NK.Bad); }
+    n := typ1(p);
+    p.depth--;
+    return n;
+}
+
+func typ1(p *Parser) *ast.Node {
+    k := tk(p);
+    if (k == scanner.Kind.Star) {
+        n := node(p, ast.NK.TPtr);
+        next(p);
+        n.a = typ(p);
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.LBrack) return arrayType(p);
+    if (k == scanner.Kind.KwMixed) {
+        n := node(p, ast.NK.TMixed);
+        next(p);
+        if (!is(p, scanner.Kind.LBrack) || peek(p, 1) != scanner.Kind.RBrack) { err(p, "mixed must precede a dynamic array type"); return n; }
+        n.a = arrayType(p);
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.KwVarint || k == scanner.Kind.KwVaruint) return varintType(p);
+    if (k == scanner.Kind.KwFunc) return funcType(p);
+    if (k == scanner.Kind.KwInterface) {
+        n := node(p, ast.NK.TInterface);
+        next(p);
+        interfaceBody(p, n);
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.KwStruct) {
+        n := node(p, ast.NK.TStruct);
+        next(p);
+        if (!accept(p, scanner.Kind.LBrace)) { err(p, "Expected composite type body"); return n; }
+        empty: map[string]bool;
+        fieldDecls(p, n, empty);
+        expect(p, scanner.Kind.RBrace, "Expected end of block");
+        return finish(p, n);
+    }
+    if (k == scanner.Kind.Ident && tok(p).text == "buffer") return bufferType(p, false);
+    if (k == scanner.Kind.Ident && tok(p).text == "map" && peek(p, 1) == scanner.Kind.LBrack) return mapType(p);
+    if (k == scanner.Kind.Ident || k == scanner.Kind.KwAny) return namedType(p);
+    err(p, "Expected type name");
+    return node(p, ast.NK.Bad);
+}
+
+func namedType(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Ident);
+    n.name = tok(p).text;
+    next(p);
+    finish(p, n);
+    for (is(p, scanner.Kind.Dot) && peek(p, 1) == scanner.Kind.Ident) {
+        m := nodeAt(p, ast.NK.Member, n);
+        next(p);
+        m.name = tok(p).text; m.nameLine = tok(p).line; m.nameCol = tok(p).col;
+        next(p);
+        m.a = n;
+        n = finish(p, m);
+    }
+    if (is(p, scanner.Kind.Lt)) {
+        inst := nodeAt(p, ast.NK.Inst, n);
+        inst.a = n;
+        inst.list = typeArgs(p);
+        n = finish(p, inst);
+        for (is(p, scanner.Kind.Dot) && peek(p, 1) == scanner.Kind.Ident) {
+            m := nodeAt(p, ast.NK.Member, n);
+            next(p);
+            m.name = tok(p).text; m.nameLine = tok(p).line; m.nameCol = tok(p).col;
+            next(p);
+            m.a = n;
+            n = finish(p, m);
+        }
+    }
+    return n;
+}
+
+func mapType(p *Parser) *ast.Node {
+    n := node(p, ast.NK.TMap);
+    next(p); // map
+    next(p); // [
+    if (is(p, scanner.Kind.RBrack)) { err(p, "Expected map key type"); return n; }
+    n.a = typ(p);
+    if (!accept(p, scanner.Kind.RBrack)) { err(p, "Expected closing map bracket"); return n; }
+    n.b = typ(p);
+    return finish(p, n);
+}
+
+// arrayType parses '[' ']' T, '[' dim ']' T, or '[' '...' ']' T.
+func arrayType(p *Parser) *ast.Node {
+    start := node(p, ast.NK.TSlice);
+    next(p);
+    if (accept(p, scanner.Kind.RBrack)) {
+        start.a = typ(p);
+        return finish(p, start);
+    }
+    n := nodeAt(p, ast.NK.TArray, start);
+    if (ellipsis(p)) {
+        skipEllipsis(p);
+        n.flag = true;
+        if (!accept(p, scanner.Kind.RBrack)) { err(p, "Expected closing bracket after inferred array length"); return n; }
+    } else {
+        n.b = ternary(p);
+        if (!accept(p, scanner.Kind.RBrack)) { err(p, "Expected closing array dimension bracket"); return n; }
+    }
+    n.a = typ(p);
+    return finish(p, n);
+}
+
+// bufferType parses buffer [ '<' Type [ ',' size ] '>' ].
+func bufferType(p *Parser, expr bool) *ast.Node {
+    n := node(p, ast.NK.TBuffer);
+    next(p);
+    if (!is(p, scanner.Kind.Lt)) return finish(p, n);
+    next(p);
+    n.a = typ(p);
+    if (accept(p, scanner.Kind.Comma)) n.b = additive(p);
+    if (!closeAngle(p)) { err(p, "Expected '>' after buffer type arguments"); return n; }
+    return finish(p, n);
+}

@@ -1,0 +1,187 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+
+// Field placement within a struct: byte offset of its storage unit, and for
+// bitfields the bit offset/width within that unit.
+struct FieldPlace { offset int; unitBits int; bitOffset int; bits int; unit int; }
+
+struct StructLayout { size int; align int; places []*FieldPlace; units []int; unitOffsets []int; }
+
+func structLayout(c *Checker, fields []*ast.FieldInfo) *StructLayout {
+    l := new(StructLayout);
+    off := 0; maxAlign := 1;
+    i := 0;
+    for (i < len(fields)) {
+        f := fields[i];
+        if (f.bits > 0) {
+            // gather a run of bitfields packed into one unit (<= 64 bits)
+            total := 0;
+            start := i;
+            for (i < len(fields) && fields[i].bits > 0 && total + fields[i].bits <= 64) { total += fields[i].bits; i++; }
+            a := intAlign(total); sz := intSize(total);
+            off = align(off, a);
+            if (a > maxAlign) maxAlign = a;
+            bitPos := 0;
+            unit := len(l.units);
+            for (j := start; j < i; j++) {
+                p := new(FieldPlace);
+                p.offset = off; p.unitBits = total; p.bitOffset = bitPos; p.bits = fields[j].bits; p.unit = unit;
+                bitPos += fields[j].bits;
+                l.places.append(p);
+            }
+            l.units.append(total);
+            l.unitOffsets.append(off);
+            off += sz;
+            continue;
+        }
+        a := c.AlignOf(f.ty); sz := c.SizeOf(f.ty);
+        off = align(off, a);
+        if (a > maxAlign) maxAlign = a;
+        p := new(FieldPlace);
+        p.offset = off; p.unit = -1;
+        l.places.append(p);
+        off += sz;
+        i++;
+    }
+    if (off == 0) off = 1;
+    l.size = align(off, maxAlign);
+    l.align = maxAlign;
+    return l;
+}
+
+func (c *Checker) StructLayoutOf(t *ast.Type) *StructLayout {
+    key := TypeKey(t);
+    l, ok := c.layoutMemo[key];
+    if (ok) return l;
+    l = structLayout(c, c.FieldsOf(t));
+    c.layoutMemo[key] = l;
+    return l;
+}
+// FieldsLayout lays out an anonymous field list (tuples, variant payloads), memoized by key.
+func (c *Checker) FieldsLayout(key string, fields []*ast.FieldInfo) *StructLayout {
+    l, ok := c.layoutMemo[key];
+    if (ok) return l;
+    l = structLayout(c, fields);
+    c.layoutMemo[key] = l;
+    return l;
+}
+
+// payload layout of an enum variant as a struct of its fields
+func (c *Checker) VariantFields(v *ast.VariantInfo) []*ast.FieldInfo {
+    if (v.vkind == 2) return v.fields;
+    out := make([]*ast.FieldInfo);
+    if (v.vkind == 1) {
+        for (i, t := range v.types) { f := new(ast.FieldInfo); f.name = itoa(i); f.ty = t; out.append(f); }
+    } else if (v.vkind == 3 && !nilT(v.fixedType)) {
+        f := new(ast.FieldInfo); f.name = "0"; f.ty = v.fixedType; out.append(f);
+    }
+    return out;
+}
+
+func (c *Checker) TupleLayout(results []*ast.Type) *StructLayout {
+    key := "tuple" + TypeKey(TupleOf(results));
+    l, ok := c.layoutMemo[key];
+    if (ok) return l;
+    fs := make([]*ast.FieldInfo);
+    for (i, r := range results) { f := new(ast.FieldInfo); f.name = itoa(i); f.ty = r; fs.append(f); }
+    l = structLayout(c, fs);
+    c.layoutMemo[key] = l;
+    return l;
+}
+// VariantLayout gives the payload layout of variant idx of enum t.
+func (c *Checker) VariantLayout(t *ast.Type, idx int) *StructLayout {
+    key := "variant" + TypeKey(t) + "#" + itoa(idx);
+    l, ok := c.layoutMemo[key];
+    if (ok) return l;
+    vs := c.VariantsOf(t);
+    l = structLayout(c, c.VariantFields(vs[idx]));
+    c.layoutMemo[key] = l;
+    return l;
+}
+func enumPayload(c *Checker, t *ast.Type) (int, int) {
+    size := 0; al := 1;
+    for (i, v := range c.VariantsOf(t)) {
+        if (v.vkind == 0 || (v.vkind == 3 && nilT(v.fixedType))) continue;
+        l := c.VariantLayout(t, i);
+        if (l.size > size) size = l.size;
+        if (l.align > al) al = l.align;
+    }
+    return size, al;
+}
+
+// EnumPayloadOffset is the byte offset of the payload after the tag.
+func (c *Checker) EnumPayloadOffset(t *ast.Type) int {
+    _, al := enumPayload(c, t);
+    return align(8, al);
+}
+
+func (c *Checker) ArrayDataOffset(elem *ast.Type) int { return align(8, c.AlignOf(elem)); }
+
+func (c *Checker) SizeOf(t *ast.Type) int {
+    if (t.kind == ast.TK.Struct || t.kind == ast.TK.Enum || t.kind == ast.TK.Array || t.kind == ast.TK.Tuple || t.kind == ast.TK.Named || t.kind == ast.TK.Buffer) {
+        key := TypeKey(t);
+        v, ok := c.sizeMemo[key];
+        if (ok) return v;
+        v = sizeOf1(c, t);
+        c.sizeMemo[key] = v;
+        return v;
+    }
+    return sizeOf1(c, t);
+}
+func sizeOf1(c *Checker, t *ast.Type) int {
+    switch (t.kind) {
+    case ast.TK.Bool: return 1;
+    case ast.TK.Int: return intSize(t.bits);
+    case ast.TK.Float: return t.bits / 8;
+    case ast.TK.String, ast.TK.Ptr, ast.TK.Dyn, ast.TK.Map: return 8;
+    case ast.TK.Interface, ast.TK.Func, ast.TK.Union: return 16;
+    case ast.TK.Named: return c.SizeOf(Underlying(t));
+    case ast.TK.Array:
+        if (t.len < 0) return 8;
+        return align(c.ArrayDataOffset(t.elem) + t.len * c.SizeOf(t.elem), c.AlignOf(t));
+    case ast.TK.Buffer:
+        if (t.len > 0) return t.len * c.SizeOf(t.elem);
+        return 8;
+    case ast.TK.Struct: return c.StructLayoutOf(t).size;
+    case ast.TK.Enum:
+        size, al := enumPayload(c, t);
+        if (size == 0) return 8;
+        a := al > 8 ? al : 8;
+        return align(align(8, al) + size, a);
+    case ast.TK.Tuple: return c.TupleLayout(t.results).size;
+    }
+    return 8;
+}
+
+func (c *Checker) AlignOf(t *ast.Type) int {
+    if (t.kind == ast.TK.Struct || t.kind == ast.TK.Enum || t.kind == ast.TK.Array || t.kind == ast.TK.Tuple || t.kind == ast.TK.Named || t.kind == ast.TK.Buffer) {
+        key := TypeKey(t);
+        v, ok := c.alignMemo[key];
+        if (ok) return v;
+        v = alignOf1(c, t);
+        c.alignMemo[key] = v;
+        return v;
+    }
+    return alignOf1(c, t);
+}
+func alignOf1(c *Checker, t *ast.Type) int {
+    switch (t.kind) {
+    case ast.TK.Bool: return 1;
+    case ast.TK.Int: return intAlign(t.bits);
+    case ast.TK.Float: return t.bits / 8;
+    case ast.TK.Named: return c.AlignOf(Underlying(t));
+    case ast.TK.Array:
+        if (t.len < 0) return 8;
+        a := c.AlignOf(t.elem);
+        return a > 8 ? a : 8;
+    case ast.TK.Buffer:
+        if (t.len > 0) return c.AlignOf(t.elem);
+        return 8;
+    case ast.TK.Struct: return c.StructLayoutOf(t).align;
+    case ast.TK.Enum:
+        _, al := enumPayload(c, t);
+        return al > 8 ? al : 8;
+    case ast.TK.Tuple: return c.TupleLayout(t.results).align;
+    }
+    return 8;
+}

@@ -1,0 +1,243 @@
+package legacy;
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+// Removed postfix type syntax (int[], T*, buffer<T>[N]) and its prefix rewrite.
+// Kinds is a bit set of the legacy forms that were found.
+struct Rewrite { text string; consumed int; kinds int; ok bool; }
+
+func ArrayKind() int { return 1; }
+func PointerKind() int { return 2; }
+func BufferKind() int { return 4; }
+
+struct legacyState { toks *[]*scanner.Token; start int; source string; hasSource bool; }
+
+func isWord(k scanner.Kind) bool {
+    switch (k) {
+    case scanner.Kind.Ident, scanner.Kind.Int, scanner.Kind.Float, scanner.Kind.Blank: return true;
+    case scanner.Kind.KwAny, scanner.Kind.KwAs, scanner.Kind.KwAsm, scanner.Kind.KwBreak, scanner.Kind.KwCase,
+         scanner.Kind.KwContinue, scanner.Kind.KwDefault, scanner.Kind.KwDefer, scanner.Kind.KwElse,
+         scanner.Kind.KwEnum, scanner.Kind.KwExtern, scanner.Kind.KwFallthrough, scanner.Kind.KwFor,
+         scanner.Kind.KwFunc, scanner.Kind.KwGoto, scanner.Kind.KwIf, scanner.Kind.KwImport,
+         scanner.Kind.KwInterface, scanner.Kind.KwMatch, scanner.Kind.KwMixed, scanner.Kind.KwNull,
+         scanner.Kind.KwPackage, scanner.Kind.KwPanic, scanner.Kind.KwRange, scanner.Kind.KwReturn,
+         scanner.Kind.KwStruct, scanner.Kind.KwSwitch, scanner.Kind.KwType, scanner.Kind.KwVarint,
+         scanner.Kind.KwVaruint: return true;
+    }
+    return false;
+}
+
+func lexeme(t *scanner.Token) string {
+    if (t.kind == scanner.Kind.Str) return t.text;
+    return t.text;
+}
+
+// JoinTokens joins tokens with conventional spacing.
+func JoinTokens(toks *[]*scanner.Token, from int, to int) string {
+    b: util.Buf;
+    for (i := from; i < to; i++) {
+        k := (*toks)[i].kind;
+        if (i > from) {
+            p := (*toks)[i - 1].kind;
+            space := (isWord(p) && isWord(k)) || p == scanner.Kind.Comma || p == scanner.Kind.Semi ||
+                k == scanner.Kind.Pipe || p == scanner.Kind.Pipe ||
+                (p == scanner.Kind.RParen && (isWord(k) || k == scanner.Kind.LParen || k == scanner.Kind.Star || k == scanner.Kind.LBrack)) ||
+                (p == scanner.Kind.LBrace && k != scanner.Kind.RBrace) ||
+                (k == scanner.Kind.RBrace && p != scanner.Kind.LBrace) ||
+                (k == scanner.Kind.LBrace && isWord(p));
+            if (space) b.Add(" ");
+        }
+        b.Add(lexeme((*toks)[i]));
+    }
+    return b.String();
+}
+
+func kind(g *legacyState, i int) scanner.Kind {
+    j := g.start + i;
+    if (j < len(*g.toks)) return (*g.toks)[j].kind;
+    return scanner.Kind.EOF;
+}
+func named(g *legacyState, i int, name string) bool {
+    return kind(g, i) == scanner.Kind.Ident && (*g.toks)[g.start + i].text == name;
+}
+
+func verbatim(g *legacyState, out *util.Buf, from int, to int) {
+    if (from >= to) return;
+    a := g.start + from; z := g.start + to;
+    exact := g.hasSource;
+    for (i := a; exact && i < z; i++) { if ((*g.toks)[i].kind == scanner.Kind.Str) exact = false; }
+    if (exact) {
+        s := (*g.toks)[a].off; e := (*g.toks)[z - 1].end;
+        if (e > s && e <= len(g.source)) { out.Add(g.source[s:e]); return; }
+    }
+    out.Add(JoinTokens(g.toks, a, z));
+}
+
+// balanced returns the index after the delimiter matching the opener at i, or 0.
+func balanced(g *legacyState, i int) int {
+    open := kind(g, i);
+    if (open == scanner.Kind.Lt) {
+        depth := 0;
+        for (; g.start + i < len(*g.toks); i++) {
+            k := kind(g, i);
+            if (k == scanner.Kind.Lt) depth++;
+            else if (k == scanner.Kind.Gt) depth--;
+            else if (k == scanner.Kind.Shr) { if (depth >= 2) depth -= 2; else depth = 0; }
+            else if (k == scanner.Kind.Semi || k == scanner.Kind.LBrace || k == scanner.Kind.EOF) return 0;
+            if (depth == 0) return i + 1;
+        }
+        return 0;
+    }
+    stack := make([]scanner.Kind);
+    for (; g.start + i < len(*g.toks); i++) {
+        k := kind(g, i);
+        if (k == scanner.Kind.LParen) stack.append(scanner.Kind.RParen);
+        else if (k == scanner.Kind.LBrack) stack.append(scanner.Kind.RBrack);
+        else if (k == scanner.Kind.LBrace) stack.append(scanner.Kind.RBrace);
+        else if (k == scanner.Kind.RParen || k == scanner.Kind.RBrack || k == scanner.Kind.RBrace) {
+            if (len(stack) == 0 || stack[len(stack) - 1] != k) return 0;
+            stack.pop();
+            if (len(stack) == 0) return i + 1;
+        } else if ((k == scanner.Kind.Semi && open != scanner.Kind.LBrace) || k == scanner.Kind.EOF) return 0;
+    }
+    return 0;
+}
+
+func startsType(k scanner.Kind) bool {
+    return k == scanner.Kind.Ident || k == scanner.Kind.KwAny || k == scanner.Kind.KwVarint || k == scanner.Kind.KwVaruint ||
+        k == scanner.Kind.Star || k == scanner.Kind.LBrack || k == scanner.Kind.KwFunc || k == scanner.Kind.KwMixed ||
+        k == scanner.Kind.KwStruct || k == scanner.Kind.KwInterface;
+}
+
+func base(g *legacyState, i int, out *util.Buf, changed *int) int {
+    k := kind(g, i);
+    if (named(g, i, "buffer")) {
+        if (kind(g, i + 1) != scanner.Kind.Lt) { out.Add("buffer"); return i + 1; }
+        close := balanced(g, i + 1);
+        if (close == 0) return 0;
+        if (kind(g, close) == scanner.Kind.LBrack) {
+            end := balanced(g, close);
+            if (end == 0) return 0;
+            *changed = *changed | 4;
+            verbatim(g, out, i, close - 1);
+            if (end > close + 2) { out.Add(", "); verbatim(g, out, close + 1, end - 1); }
+            out.Add(">");
+            return end;
+        }
+        verbatim(g, out, i, close);
+        return close;
+    }
+    if ((k == scanner.Kind.KwVarint || k == scanner.Kind.KwVaruint) && kind(g, i + 1) == scanner.Kind.LParen) {
+        close := balanced(g, i + 1);
+        if (close == 0) return 0;
+        verbatim(g, out, i, close);
+        return close;
+    }
+    if (named(g, i, "map") && kind(g, i + 1) == scanner.Kind.LBrack) {
+        close := balanced(g, i + 1);
+        if (close == 0) return 0;
+        verbatim(g, out, i, close);
+        value: util.Buf;
+        end := typ(g, close, &value, changed);
+        if (end == 0) return 0;
+        out.AddBuf(&value);
+        return end;
+    }
+    if (k == scanner.Kind.KwFunc) {
+        if (kind(g, i + 1) != scanner.Kind.LParen) return 0;
+        params := balanced(g, i + 1);
+        if (params == 0) return 0;
+        verbatim(g, out, i, params);
+        if (kind(g, params) == scanner.Kind.LParen) {
+            results := balanced(g, params);
+            if (results == 0) return 0;
+            out.Add(" ");
+            verbatim(g, out, params, results);
+            return results;
+        }
+        if (!startsType(kind(g, params))) return params;
+        result: util.Buf;
+        end := typ(g, params, &result, changed);
+        if (end == 0) return params;
+        out.Add(" ");
+        out.AddBuf(&result);
+        return end;
+    }
+    if (k == scanner.Kind.KwStruct || k == scanner.Kind.KwInterface) {
+        if (kind(g, i + 1) != scanner.Kind.LBrace) return 0;
+        end := balanced(g, i + 1);
+        if (end == 0) return 0;
+        verbatim(g, out, i, end);
+        return end;
+    }
+    if (k != scanner.Kind.Ident && k != scanner.Kind.KwAny) return 0;
+    end := i + 1;
+    for (kind(g, end) == scanner.Kind.Dot && kind(g, end + 1) == scanner.Kind.Ident) end += 2;
+    if (kind(g, end) == scanner.Kind.Lt) {
+        close := balanced(g, end);
+        if (close == 0) return 0;
+        end = close;
+    }
+    verbatim(g, out, i, end);
+    return end;
+}
+
+func typ(g *legacyState, i int, out *util.Buf, changed *int) int {
+    if (kind(g, i) == scanner.Kind.Star || kind(g, i) == scanner.Kind.KwMixed) {
+        rest: util.Buf;
+        end := typ(g, i + 1, &rest, changed);
+        if (end == 0) return 0;
+        out.Add(kind(g, i) == scanner.Kind.Star ? "*" : "mixed ");
+        out.AddBuf(&rest);
+        return end;
+    }
+    if (kind(g, i) == scanner.Kind.LBrack) {
+        close := balanced(g, i);
+        if (close == 0) return 0;
+        rest: util.Buf;
+        end := typ(g, close, &rest, changed);
+        if (end == 0) return 0;
+        verbatim(g, out, i, close);
+        out.AddBuf(&rest);
+        return end;
+    }
+    b: util.Buf;
+    end := base(g, i, &b, changed);
+    if (end == 0) return 0;
+    text := b.String();
+    for (;;) {
+        if (kind(g, end) == scanner.Kind.Star) {
+            text = "*" + text; end++; *changed = *changed | 2;
+        } else if (kind(g, end) == scanner.Kind.LBrack) {
+            close := balanced(g, end);
+            if (close == 0) break;
+            suffix: util.Buf;
+            verbatim(g, &suffix, end, close);
+            text = suffix.String() + text;
+            end = close; *changed = *changed | 1;
+        } else break;
+    }
+    out.Add(text);
+    return end;
+}
+
+// TypeRewrite parses a legacy type starting at toks[start]. ok is false when no
+// legacy suffix follows a type there.
+func TypeRewrite(toks *[]*scanner.Token, start int, source string, hasSource bool) Rewrite {
+    g := new(legacyState);
+    g.toks = toks; g.start = start; g.source = source; g.hasSource = hasSource;
+    out: util.Buf;
+    changed := 0;
+    end := typ(g, 0, &out, &changed);
+    r: Rewrite;
+    if (end == 0 || changed == 0) return r;
+    r.ok = true; r.text = out.String(); r.consumed = end; r.kinds = changed;
+    return r;
+}
+
+func Message(replacement string, kinds int) string {
+    lead := "A buffer's size is its second type argument.";
+    if ((kinds & 1) != 0) lead = "Square brackets go before the type for an array.";
+    else if ((kinds & 2) != 0) lead = "The pointer star goes before the type.";
+    return lead + " Did you mean '" + replacement + "'?";
+}

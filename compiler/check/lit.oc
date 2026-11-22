@@ -1,0 +1,167 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+// BigNat is a little-endian magnitude in base 2^32 limbs.
+struct BigNat { limbs []int; }
+
+func (b *BigNat) mulAdd(m int, a int) {
+    carry := a;
+    for (i := 0; i < len(b.limbs); i++) {
+        v := b.limbs[i] * m + carry;
+        b.limbs[i] = v & 4294967295;
+        carry = (v >> 32) & 4294967295;
+    }
+    if (carry != 0) b.limbs.append(carry);
+}
+
+func digitValue(ch i8) int {
+    if (ch >= '0' && ch <= '9') return (ch - '0') -> int;
+    if (ch >= 'a' && ch <= 'f') return (ch - 'a') -> int + 10;
+    if (ch >= 'A' && ch <= 'F') return (ch - 'A') -> int + 10;
+    return 0;
+}
+
+func ParseBigNat(text string) *BigNat {
+    b := new(BigNat);
+    base := 10; i := 0;
+    if (len(text) > 2 && text[0] == '0') {
+        ch := text[1];
+        if (ch == 'x' || ch == 'X') { base = 16; i = 2; }
+        else if (ch == 'b' || ch == 'B') { base = 2; i = 2; }
+        else if (ch == 'o' || ch == 'O') { base = 8; i = 2; }
+    }
+    if (base == 16 || base == 2 || base == 8) {
+        // Shift-based accumulation keeps very long literals linear-time per limb.
+        bitsPer := base == 16 ? 4 : (base == 8 ? 3 : 1);
+        total := (len(text) - i) * bitsPer;
+        nl := total / 32 + 1;
+        for (k := 0; k < nl; k++) b.limbs.append(0);
+        pos := 0;
+        for (j := len(text) - 1; j >= i; j--) {
+            v := digitValue(text[j]);
+            for (bit := 0; bit < bitsPer; bit++) {
+                if (((v >> bit) & 1) != 0) b.limbs[pos / 32] = b.limbs[pos / 32] | (1 << (pos % 32));
+                pos++;
+            }
+        }
+        b.trim();
+        return b;
+    }
+    // Decimal: process 9 digits at a time.
+    for (i < len(text)) {
+        chunk := 0; mul := 1; k := 0;
+        for (k < 9 && i < len(text)) { chunk = chunk * 10 + digitValue(text[i]); mul *= 10; i++; k++; }
+        if (len(b.limbs) == 0) { if (chunk != 0) b.limbs.append(chunk); }
+        else b.mulAdd(mul, chunk);
+    }
+    b.trim();
+    return b;
+}
+
+func (b *BigNat) trim() { for (len(b.limbs) > 0 && b.limbs[len(b.limbs) - 1] == 0) b.limbs.pop(); }
+func (b *BigNat) IsZero() bool { return len(b.limbs) == 0; }
+
+func (b *BigNat) BitLen() int {
+    if (len(b.limbs) == 0) return 0;
+    top := b.limbs[len(b.limbs) - 1];
+    n := 0;
+    for (top != 0) { n++; top = top >> 1; }
+    return (len(b.limbs) - 1) * 32 + n;
+}
+
+func (b *BigNat) IsPow2() bool {
+    if (len(b.limbs) == 0) return false;
+    for (i := 0; i < len(b.limbs) - 1; i++) { if (b.limbs[i] != 0) return false; }
+    top := b.limbs[len(b.limbs) - 1];
+    return (top & (top - 1)) == 0;
+}
+
+// Low64 returns the low 64 bits as an int (two's complement).
+func (b *BigNat) Low64() int {
+    lo := len(b.limbs) > 0 ? b.limbs[0] : 0;
+    hi := len(b.limbs) > 1 ? b.limbs[1] : 0;
+    return (hi << 32) | lo;
+}
+
+// Decimal renders the magnitude in base 10.
+func (b *BigNat) Decimal() string {
+    if (len(b.limbs) == 0) return "0";
+    work := make([]int);
+    work.append(b.limbs...);
+    chunks := make([]int);
+    for (len(work) > 0) {
+        rem := 0;
+        for (i := len(work) - 1; i >= 0; i--) {
+            cur := (rem << 32) | work[i];
+            // cur fits in 62 bits since rem < 1e9 < 2^30.
+            work[i] = cur / 1000000000;
+            rem = cur % 1000000000;
+        }
+        for (len(work) > 0 && work[len(work) - 1] == 0) work.pop();
+        chunks.append(rem);
+    }
+    out := "";
+    for (i := len(chunks) - 1; i >= 0; i--) {
+        s := itoa(chunks[i]);
+        if (i != len(chunks) - 1) { for (len(s) < 9) s = "0" + s; }
+        out += s;
+    }
+    return out;
+}
+
+// LitInfo describes an integer literal expression (possibly negated).
+struct LitInfo { ok bool; neg bool; mag *BigNat; }
+
+func intLiteral(c *Checker, n *ast.Node) LitInfo {
+    r: LitInfo;
+    if (n.kind == ast.NK.IntLit) {
+        r.ok = true;
+        if (n.flag) { r.mag = new(BigNat); if (n.ival != 0) r.mag.limbs.append(n.ival); }
+        else r.mag = ParseBigNat(n.text);
+        return r;
+    }
+    if (n.kind == ast.NK.Unary && n.op == scanner.Kind.Minus) {
+        inner := intLiteral(c, n.a);
+        if (inner.ok) { inner.neg = !inner.neg; if (inner.mag.IsZero()) inner.neg = false; return inner; }
+    }
+    return r;
+}
+
+// fitsInt reports whether a literal value fits an integer type.
+func litFits(l LitInfo, bits int, signed bool) bool {
+    bl := l.mag.BitLen();
+    if (l.neg) {
+        if (!signed) return false;
+        return bl < bits || (bl == bits && l.mag.IsPow2());
+    }
+    if (signed) return bl <= bits - 1;
+    return bl <= bits;
+}
+
+// defaultLitType gives the natural type of an integer literal.
+func defaultLitType(l LitInfo) *ast.Type {
+    if (!l.ok) return tInt;
+    bl := l.mag.BitLen();
+    if (l.neg) {
+        if (litFits(l, 64, true)) return tInt;
+        k := bl + 1;
+        if (l.mag.IsPow2()) k = bl;
+        if (k > 8388608) return tInvalid;
+        return varintType(k, true);
+    }
+    if (bl <= 63) return tInt;
+    if (bl <= 64) return tUint;
+    if (bl > 8388608) return tInvalid;
+    return varintType(bl, false);
+}
+
+// LiteralDecimal gives the signed decimal spelling of a literal (for IR).
+func (c *Checker) LiteralDecimal(n *ast.Node) string {
+    l := intLiteral(c, n);
+    if (!l.ok) return "0";
+    d := l.mag.Decimal();
+    if (l.neg) return "-" + d;
+    return d;
+}
+func (c *Checker) IsIntLiteral(n *ast.Node) bool { return intLiteral(c, n).ok; }

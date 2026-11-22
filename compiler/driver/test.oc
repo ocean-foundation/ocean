@@ -1,0 +1,649 @@
+package driver;
+import "github.com/ocean-foundation/ocean/compiler/loader";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+struct TestResult { name string; output string; status int; elapsed float; }
+
+struct Reporter {
+    report string;          // path ("" none)
+    reportBuf *util.Buf;
+    jsonFile *util.Buf;
+    jsonPath string;
+    pkg string;
+    json bool;
+    color bool;
+    includePassed bool;
+    includeSkipped bool;
+    passed int; failed int; skipped int;
+    completed bool;
+    workers int;
+    timeout float;
+    results []*TestResult;
+    packageOutput string;
+    grantFD int;
+    held int; waiting int;
+    shared bool;
+    displayFD int;
+    displayPID int;
+    display *util.Buf;
+    quiet bool;             // multi-package children print nothing but JSON
+    multiPackage string;    // multi: hex package suffix for display frames
+}
+
+func newReporter() *Reporter {
+    r := new(Reporter);
+    r.includeSkipped = true; r.timeout = 600.0; r.workers = 16; r.grantFD = -1; r.displayFD = -1;
+    return r;
+}
+
+func stripAnsi(s string) string {
+    b: util.Buf;
+    i := 0;
+    for (i < len(s)) {
+        if (s[i] == 27 && i + 1 < len(s) && s[i + 1] == '[') {
+            for (i < len(s) && s[i] != 'm') i++;
+            i++;
+            continue;
+        }
+        b.Addc(s[i]); i++;
+    }
+    return b.String();
+}
+
+func tprint(r *Reporter, s string) {
+    if (!r.json && !r.quiet) util.Stdout(s);
+    if (!ast_nilBuf(r.reportBuf)) r.reportBuf.Add(stripAnsi(s));
+}
+func ast_nilBuf(b *util.Buf) bool { return (b -> int) == 0; }
+
+func jsonQuote(s string) string {
+    b: util.Buf;
+    b.Addc('"');
+    for (i := 0; i < len(s); i++) {
+        c := s[i];
+        if (c == '"') b.Add("\\\"");
+        else if (c == '\\') b.Add("\\\\");
+        else if (c == '\n') b.Add("\\n");
+        else if (c == '\r') b.Add("\\r");
+        else if (c == '\t') b.Add("\\t");
+        else if (c >= 0 && c < 32) { b.Add("\\u00"); b.Addc(util.HexDigit((c->int) >> 4)); b.Addc(util.HexDigit(c->int)); }
+        else b.Addc(c);
+    }
+    b.Addc('"');
+    return b.String();
+}
+
+// jsonField extracts a string field from one event line (fixed testing.oc shape).
+func jsonField(line string, key string) string {
+    prefix := "\"" + key + "\":\"";
+    p := util.Index(line, prefix);
+    if (p < 0) return "";
+    i := p + len(prefix);
+    b: util.Buf;
+    for (i < len(line) && line[i] != '"') {
+        if (line[i] == '\\' && i + 1 < len(line)) {
+            i++;
+            c := line[i];
+            if (c == 'n') b.Addc('\n');
+            else if (c == 'r') b.Addc('\r');
+            else if (c == 't') b.Addc('\t');
+            else if (c == 'u' && i + 4 < len(line)) {
+                v := 0;
+                for (k := 1; k <= 4; k++) v = v * 16 + hexValue(line[i + k]);
+                b.Addc(v -> i8);
+                i += 4;
+            } else b.Addc(c);
+            i++;
+        } else { b.Addc(line[i]); i++; }
+    }
+    return b.String();
+}
+func hexValue(c i8) int {
+    if (c >= '0' && c <= '9') return (c - '0') -> int;
+    if (c >= 'a' && c <= 'f') return (c - 'a') -> int + 10;
+    if (c >= 'A' && c <= 'F') return (c - 'A') -> int + 10;
+    return 0;
+}
+func jsonElapsed(line string) float {
+    p := util.Index(line, "\"Elapsed\":");
+    if (p < 0) return 0.0;
+    i := p + 10;
+    j := i;
+    for (j < len(line) && (util.IsDigit(line[j]) || line[j] == '.' || line[j] == '-' || line[j] == 'e')) j++;
+    return parseFloatText(line[i:j]);
+}
+func parseFloatText(s string) float {
+    neg := false; i := 0;
+    if (len(s) > 0 && s[0] == '-') { neg = true; i = 1; }
+    v := 0.0; frac := 0.0; scale := 1.0; seenDot := false;
+    for (; i < len(s); i++) {
+        c := s[i];
+        if (c == '.') { seenDot = true; continue; }
+        if (!util.IsDigit(c)) break;
+        d := (c - '0') -> float;
+        if (seenDot) { scale = scale / 10.0; frac = frac + d * scale; } else v = v * 10.0 + d;
+    }
+    v = v + frac;
+    return neg ? -v : v;
+}
+
+func two(n int) string { if (n < 10) return "0" + util.Itoa(n); return util.Itoa(n); }
+
+// timestamp formats the current UTC time as RFC 3339 with nanoseconds.
+func timestamp() string {
+    sec, nsec := util.RealNow();
+    days := sec / 86400;
+    rem := sec % 86400;
+    // civil-from-days (Howard Hinnant)
+    z := days + 719468;
+    era := (z >= 0 ? z : z - 146096) / 146097;
+    doe := z - era * 146097;
+    yoe := (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    y := yoe + era * 400;
+    doy := doe - (365 * yoe + yoe / 4 - yoe / 100);
+    mp := (5 * doy + 2) / 153;
+    d := doy - (153 * mp + 2) / 5 + 1;
+    m := mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2) y++;
+    ns := util.Itoa(nsec);
+    for (len(ns) < 9) ns = "0" + ns;
+    return util.Itoa(y) + "-" + two(m) + "-" + two(d) + "T" + two(rem / 3600) + ":" + two((rem / 60) % 60) + ":" + two(rem % 60) + "." + ns + "Z";
+}
+
+func hexEncode(s string) string {
+    b: util.Buf;
+    for (i := 0; i < len(s); i++) { v := (s[i] -> int) & 255; b.Addc(util.HexDigit(v >> 4)); b.Addc(util.HexDigit(v)); }
+    return b.String();
+}
+
+func displaySend(r *Reporter, action string, name string, output string, elapsed float) {
+    if (r.displayFD < 0) return;
+    frame := action + "\t" + util.FormatFixed(elapsed, 9) + "\t" + hexEncode(name) + "\t" + hexEncode(output);
+    if (r.multiPackage != "") frame += "\t" + r.multiPackage;
+    r.display.Add(frame + "\n");
+    flushDisplay(r);
+}
+func flushDisplay(r *Reporter) {
+    if (r.displayFD < 0 || r.display.Len() == 0) return;
+    s := r.display.String();
+    n := util.WriteSome(r.displayFD, s);
+    if (n < 0) return;
+    r.display.Reset();
+    if (n < len(s)) r.display.Add(s[n:]);
+}
+
+func emitJSON(r *Reporter, action string, name string, output string, elapsed float) {
+    displaySend(r, action, name, output, elapsed);
+    if (!r.json && ast_nilBuf(r.jsonFile)) return;
+    line := "{\"Time\":\"" + timestamp() + "\",\"Action\":" + jsonQuote(action) + ",\"Package\":" + jsonQuote(r.pkg);
+    if (name != "") line += ",\"Test\":" + jsonQuote(name);
+    if (output != "") line += ",\"Output\":" + jsonQuote(output);
+    line += ",\"Elapsed\":" + util.FormatFixed(elapsed, 9) + "}\n";
+    if (r.json) util.Stdout(line);
+    if (!ast_nilBuf(r.jsonFile)) r.jsonFile.Add(line);
+}
+
+func grant(r *Reporter) {
+    for (r.waiting > 0 && r.held < r.workers) {
+        if (util.WriteSome(r.grantFD, "+") != 1) break;
+        r.waiting--; r.held++;
+    }
+}
+
+func findResult(r *Reporter, name string) *TestResult {
+    for (_, t := range r.results) { if (t.name == name) return t; }
+    return zero(*TestResult);
+}
+func nilResult(t *TestResult) bool { return (t -> int) == 0; }
+
+func testEvent(r *Reporter, line string) {
+    action := jsonField(line, "Action");
+    name := jsonField(line, "Test");
+    output := jsonField(line, "Output");
+    if (action == "acquire" || action == "release") {
+        if (r.shared) emitJSON(r, action, "", "", 0.0);
+        else {
+            if (action == "acquire") r.waiting++;
+            else if (r.held > 0) r.held--;
+            grant(r);
+        }
+        return;
+    }
+    elapsed := jsonElapsed(line);
+    if (action == "complete") { r.completed = true; return; }
+    emitJSON(r, action, name, output, elapsed);
+    res := findResult(r, name);
+    if (name != "" && action == "run" && nilResult(res)) {
+        res = new(TestResult);
+        res.name = name;
+        r.results.append(res);
+    }
+    if (!nilResult(res) && action == "output") res.output += output;
+    else if (!nilResult(res) && (action == "pass" || action == "fail" || action == "skip")) {
+        res.status = action == "pass" ? 1 : (action == "fail" ? 2 : 3);
+        res.elapsed = elapsed;
+        if (res.status == 1) r.passed++;
+        if (res.status == 2) r.failed++;
+        if (res.status == 3) r.skipped++;
+    } else if (name == "" && (action == "pass" || action == "fail")) r.completed = true;
+}
+
+func outputLines(r *Reporter, text string, indent int) {
+    if (text == "") return;
+    lines := util.Split(text, '\n');
+    if (len(lines) > 0 && lines[len(lines) - 1] == "") lines.pop();
+    for (_, l := range lines) tprint(r, util.Repeat(" ", indent) + l + "\n");
+}
+func rule(r *Reporter, n int) { tprint(r, util.Repeat("─", n)); }
+
+func durationText(e float) string {
+    s := "";
+    if (e >= 1.0) s = util.FormatFixed(e, 3) + "s";
+    else if (e >= 0.001) s = util.FormatFixed(e * 1000.0, 3) + "ms";
+    else if (e >= 0.000001) s = util.FormatFixed(e * 1000000.0, 3) + "µs";
+    else s = util.FormatFixed(e * 1000000000.0, 0) + "ns";
+    dot := util.IndexByte(s, '.');
+    if (dot >= 0) {
+        end := dot + 1;
+        for (end < len(s) && util.IsDigit(s[end])) end++;
+        trim := end;
+        for (trim > dot + 1 && s[trim - 1] == '0') trim--;
+        if (trim == dot + 1) trim = dot;
+        s = s[0:trim] + s[end:];
+    }
+    return s;
+}
+func digits(n int) int { w := 1; for (n >= 10) { n = n / 10; w++; } return w; }
+
+func details(r *Reporter, lineWidth int, status int) {
+    shown := 0;
+    if (r.packageOutput != "") {
+        tprint(r, "─── Messages "); rule(r, lineWidth - 13);
+        tprint(r, "\n=== " + r.pkg + "\n");
+        outputLines(r, r.packageOutput, 4);
+        shown = 1;
+    }
+    for (_, t := range r.results) {
+        if (t.status == 1 && !r.includePassed) continue;
+        if (t.status == 3 && !r.includeSkipped) continue;
+        if (shown == 0) {
+            tprint(r, "─── Messages "); rule(r, lineWidth - 13);
+            tprint(r, "\n=== " + r.pkg + "\n");
+        }
+        shown++;
+        depth := 0;
+        for (i := 0; i < len(t.name); i++) { if (t.name[i] == '/') depth++; }
+        word := t.status == 1 ? "PASS" : (t.status == 3 ? "SKIP" : "FAIL");
+        color := "";
+        if (r.color) color = t.status == 1 ? "\x1b[32m" : (t.status == 3 ? "\x1b[33m" : "\x1b[31m");
+        tprint(r, util.Repeat(" ", 4 + depth * 4) + "--- " + color + word + (r.color ? "\x1b[0m" : "") + ": " + t.name + " (" + util.FormatFixed(t.elapsed, 2) + "s)\n");
+        outputLines(r, t.output, 4 + depth * 4);
+    }
+    if (shown > 0) tprint(r, "\n");
+    if (status != 0 && (!r.completed || r.failed == 0)) tprint(r, "✗ " + r.pkg + ": test process exited before completing (status " + util.Itoa(status) + ")\n");
+}
+
+func clip(s string, w int) string { if (len(s) > w) return s[0:w]; return s; }
+
+func summary(r *Reporter, elapsed float, status int) {
+    total := r.passed + r.failed + r.skipped;
+    widths := []int{digits(r.passed), digits(r.failed), digits(r.skipped), digits(total)};
+    dur := durationText(elapsed);
+    timeWidth := util.Width(dur);
+    statusWidth := status != 0 ? 4 : 2;
+    nameWidth := len(r.pkg);
+    if (nameWidth + statusWidth + 4 < 13) nameWidth = 13 - statusWidth - 4;
+    countWidth := widths[0] + widths[1] + widths[2] + widths[3] + 9;
+    if (nameWidth + statusWidth + 4 + countWidth + timeWidth + 4 > 150) nameWidth = 150 - statusWidth - 4 - countWidth - timeWidth - 4;
+    if (nameWidth < 1) nameWidth = 1;
+    labelWidth := statusWidth + 4 + nameWidth;
+    lineWidth := labelWidth + countWidth + timeWidth + 4;
+    details(r, lineWidth, status);
+    for (row := 0; row < 2; row++) {
+        if (row == 0) { tprint(r, "─── Summary "); rule(r, labelWidth + widths[0] - 12); }
+        else rule(r, labelWidth + widths[0]);
+        tprint(r, " ✓ "); rule(r, widths[1]);
+        tprint(r, " ✗ "); rule(r, widths[2]);
+        tprint(r, " ∅ "); rule(r, widths[3]);
+        tprint(r, " ∑ "); rule(r, timeWidth > 1 ? timeWidth - 1 : 1);
+        tprint(r, " ⏱\n");
+        if (row == 0) {
+            color := "";
+            if (r.color) color = status != 0 ? "\x1b[31m" : "\x1b[32m";
+            tprint(r, color + util.PadRight(status != 0 ? "FAIL" : "ok", statusWidth) + (r.color ? "\x1b[0m" : "") + "    " + util.PadRight(clip(r.pkg, nameWidth), nameWidth) + "  ");
+        } else tprint(r, util.PadRight("(1 packages)", labelWidth) + "  ");
+        counts := []int{r.passed, r.failed, r.skipped, total};
+        for (i := 0; i < 4; i++) {
+            if (i > 0) tprint(r, "   ");
+            if (row == 0 && counts[i] == 0) tprint(r, util.Repeat(" ", widths[i]));
+            else tprint(r, util.PadLeft(util.Itoa(counts[i]), widths[i]));
+        }
+        tprint(r, "  " + util.PadLeft(dur, timeWidth) + "\n");
+    }
+}
+
+// splitLines feeds complete lines from pending to handler, keeping the rest.
+func takeLines(pending *string) []string {
+    out := make([]string);
+    s := *pending;
+    start := 0;
+    for (i := 0; i < len(s); i++) {
+        if (s[i] == '\n') { out.append(s[start:i]); start = i + 1; }
+    }
+    *pending = s[start:];
+    return out;
+}
+
+func testExecute(r *Reporter, executable string, displayExe string) int {
+    evR, evW, ok1 := util.Pipe();
+    outR, outW, ok2 := util.Pipe();
+    if (!ok1 || !ok2) { util.Stderr("ocean test: pipe\n"); return 1; }
+    grR := -1; grW := -1;
+    if (!r.shared) {
+        a, b, ok3 := util.Pipe();
+        if (!ok3) { util.Stderr("ocean test: worker slots\n"); return 1; }
+        grR = a; grW = b;
+    }
+    if (displayExe != "") startDisplay(r, displayExe);
+    start := util.MonoSeconds();
+    maps := []int{evW, 198, outW, 1, outW, 2};
+    if (!r.shared) { maps.append(grR); maps.append(199); }
+    else maps.append(199, 199);
+    if (!r.shared) util.SetNonblock(grR);
+    argv := []string{executable, "--ocean-test-workers", util.Itoa(r.workers)};
+    pid := util.SpawnMapped(argv.array(), maps, r.displayFD >= 0, false);
+    util.CloseFd(evW); util.CloseFd(outW);
+    if (!r.shared) { util.CloseFd(grR); r.grantFD = grW; util.SetNonblock(grW); }
+    if (pid < 0) { util.CloseFd(evR); util.CloseFd(outR); util.Stderr("ocean test: fork\n"); return 1; }
+    timedOut := false;
+    pending := "";
+    fds := []int{evR, outR};
+    open := 2;
+    for (open > 0) {
+        if (!r.shared) grant(r);
+        if (!timedOut && r.timeout > 0.0 && util.MonoSeconds() - start >= r.timeout) {
+            timedOut = true;
+            util.Kill(pid, 9);
+            emitJSON(r, "output", "", "test timed out\n", util.MonoSeconds() - start);
+            r.packageOutput += "test timed out after " + util.FormatFixed(r.timeout, 3) + "s\n";
+        }
+        flushDisplay(r);
+        polled := make([]int); evs := make([]int);
+        for (_, f := range fds) { polled.append(f); evs.append(1); }
+        rev := util.Poll(polled, evs, 100);
+        for (i := 0; i < 2; i++) {
+            if (fds[i] < 0 || (rev[i] & (1 | 16 | 8)) == 0) continue;
+            chunk := util.ReadFd(fds[i], 4096);
+            if (chunk == "") { util.CloseFd(fds[i]); fds[i] = -1; open--; continue; }
+            if (i == 1) { emitJSON(r, "output", "", chunk, 0.0); r.packageOutput += chunk; }
+            else {
+                pending += chunk;
+                for (_, line := range takeLines(&pending)) testEvent(r, line);
+            }
+        }
+    }
+    st := util.Wait(pid);
+    if (r.grantFD >= 0) { util.CloseFd(r.grantFD); r.grantFD = -1; }
+    status := st.Code;
+    if (st.Failed) status = 1;
+    if (!r.completed && status == 0) status = 1;
+    if (r.failed > 0 && status == 0) status = 1;
+    stopDisplay(r, util.MonoSeconds() - start, status);
+    emitJSON(r, status != 0 ? "fail" : "pass", "", !r.completed ? "test process did not complete" : "", util.MonoSeconds() - start);
+    summary(r, util.MonoSeconds() - start, status);
+    return status;
+}
+
+// ---- live display (testing/internal/display) ----
+
+func buildDisplay(dir string) string {
+    b := loader.NewBuild(newDiags());
+    std := b.StandardSource();
+    if (std == "" || !util.IsDir(std + "/testing/internal/display")) return "";
+    diags := newDiags();
+    diags.live = false;
+    prog := Frontend(std + "/testing/internal/display", false, "", diags);
+    if (!prog.ok) return "";
+    ir, ok := generate(prog);
+    if (!ok) return "";
+    exe := dir + "/display";
+    if (!compileProgram(prog, ir, exe, false)) return "";
+    return exe;
+}
+
+func startDisplay(r *Reporter, exe string) {
+    rd, wr, ok := util.Pipe();
+    if (!ok) return;
+    maps := []int{rd, 197};
+    argv := []string{exe, r.pkg, r.color ? "1" : "0", r.includeSkipped ? "1" : "0"};
+    pid := util.SpawnMapped(argv.array(), maps, false, false);
+    util.CloseFd(rd);
+    if (pid < 0) { util.CloseFd(wr); return; }
+    r.displayFD = wr; r.displayPID = pid;
+    r.display = util.NewBuf();
+    util.SetCloexec(wr);
+    util.SetNonblock(wr);
+}
+
+func stopDisplay(r *Reporter, elapsed float, status int) {
+    if (r.displayPID <= 0) return;
+    displaySend(r, "done", "", status != 0 ? "1" : "0", elapsed);
+    for (attempt := 0; attempt < 200 && r.display.Len() > 0; attempt++) { util.Poll([]int{r.displayFD}, []int{4}, 10); flushDisplay(r); }
+    util.CloseFd(r.displayFD); r.displayFD = -1;
+    for (attempt := 0; attempt < 200; attempt++) {
+        done, _ := util.WaitNoHang(r.displayPID);
+        if (done) { r.displayPID = 0; return; }
+        util.Poll(make([]int), make([]int), 10);
+    }
+    util.Kill(r.displayPID, 9);
+    util.Wait(r.displayPID);
+    r.displayPID = 0;
+    util.Stdout("\x1b[?25h");
+}
+
+// ---- command ----
+
+func testUsage() string {
+    return "Usage: ocean test [location] [--json] [--outfile path] [--jsonfile path]\n" +
+        "                  [--include-passed | -v] [--no-color] [--hide-skipped]\n" +
+        "                  [--timeout duration] [--notty] [-t nthreads | --single-threaded]\n" +
+        "Run Test*(t *testing.T) functions in _test.oc files.\n" +
+        "--json emits newline-delimited test events; --jsonfile saves them.\n" +
+        "--outfile (or -o) saves the plain tang-style report. NO_COLOR disables color.\n" +
+        "Interactive terminals use the term/tui live display; --notty disables it.\n" +
+        "Timeout defaults to 10m; 0 disables it. The command-wide worker limit defaults to 16.\n" +
+        "-t sets the shared worker limit; --single-threaded sets it to 1. Parallel tests obey this limit.\n";
+}
+
+func parseTimeout(s string) (float, bool) {
+    unit := 1.0;
+    num := s;
+    if (util.HasSuffix(s, "ms")) { unit = 0.001; num = s[0:len(s) - 2]; }
+    else if (util.HasSuffix(s, "m")) { unit = 60.0; num = s[0:len(s) - 1]; }
+    else if (util.HasSuffix(s, "s")) { num = s[0:len(s) - 1]; }
+    if (num == "") return 0.0, false;
+    for (i := 0; i < len(num); i++) { if (!util.IsDigit(num[i]) && num[i] != '.') return 0.0, false; }
+    v := parseFloatText(num) * unit;
+    if (v < 0.0 || v > 31536000.0) return 0.0, false;
+    return v, true;
+}
+
+func isTerminalOk(noTTY bool, json bool) bool {
+    term, has := util.Getenv("TERM");
+    return !noTTY && !json && util.IsTerminal(0) && util.IsTerminal(1) && (!has || term != "dumb");
+}
+
+// testOne runs one package's tests (args exclude program name and "test").
+func testOne(args []string, shared bool) int {
+    location := "."; reportPath := ""; jsonPath := "";
+    haveLocation := false; noTTY := false;
+    r := newReporter();
+    r.shared = shared;
+    noColor := false;
+    for (i := 0; i < len(args); i++) {
+        a := args[i];
+        if (a == "--help" || a == "-h") { util.Stdout(testUsage()); return 0; }
+        else if (a == "--single-threaded") r.workers = 1;
+        else if (a == "-t") {
+            i++;
+            if (i >= len(args)) { util.Stderr("ocean test: -t requires a positive thread count\n"); return 1; }
+            n, ok := util.Atoi(args[i]);
+            if (!ok || n < 1 || n > 2147483647) { util.Stderr("ocean test: -t requires a positive thread count (1..2147483647)\n"); return 1; }
+            r.workers = n;
+        } else if (a == "--timeout" || a == "-timeout") {
+            i++;
+            if (i >= len(args)) { util.Stderr("ocean test: --timeout requires a duration\n"); return 1; }
+            v, ok := parseTimeout(args[i]);
+            if (!ok) { util.Stderr("ocean test: invalid timeout\n"); return 1; }
+            r.timeout = v;
+        } else if (a == "--json" || a == "-json") r.json = true;
+        else if (a == "--include-passed" || a == "-v") r.includePassed = true;
+        else if (a == "--hide-skipped") r.includeSkipped = false;
+        else if (a == "--notty" || a == "-notty" || a == "--no-tui") noTTY = true;
+        else if (a == "--no-color") noColor = true;
+        else if (a == "--outfile" || a == "-outfile" || a == "-o" || a == "--jsonfile" || a == "-jsonfile") {
+            i++;
+            if (i >= len(args)) { util.Stderr("ocean test: " + a + " requires a path\n"); return 1; }
+            if (util.Contains(a, "jsonfile")) jsonPath = args[i]; else reportPath = args[i];
+        } else if (len(a) > 0 && a[0] == '-') { util.Stderr("ocean test: unknown option: " + a + "\n"); return 1; }
+        else if (haveLocation) { util.Stderr("ocean test accepts one package location\n"); return 1; }
+        else { location = a; haveLocation = true; }
+    }
+    live := isTerminalOk(noTTY, r.json);
+    _, nc := util.Getenv("NO_COLOR");
+    r.color = !r.json && !noColor && !nc && util.IsTerminal(1);
+    if (reportPath != "" && jsonPath != "" && (reportPath == jsonPath || sameFile(reportPath, jsonPath))) {
+        util.Stderr("ocean test: report and JSON output must be different files\n"); return 1;
+    }
+    dir, dok := util.MakeTempDir(".ocean-test-");
+    if (!dok) { util.Stderr("ocean test: temporary directory\n"); return 1; }
+    exe := dir + "/program";
+    diags := newDiags();
+    prog := Frontend(location, true, dir + "/harness", diags);
+    failed := prog.fatal || !prog.ok;
+    if (!failed && targetWasm()) { util.Stderr("ocean test requires a native target\n"); failed = true; }
+    if (!failed) {
+        for (_, pk := range prog.checker.Packages()) {
+            for (_, src := range pk.files) {
+                if (src.abs == "") continue;
+                if ((reportPath != "" && sameFile(reportPath, src.abs)) || (jsonPath != "" && sameFile(jsonPath, src.abs))) {
+                    util.Stderr("ocean test: output would overwrite an input file\n"); failed = true;
+                }
+            }
+        }
+    }
+    if (!failed) {
+        ir, ok := generate(prog);
+        failed = !ok || !compileProgram(prog, ir, exe, false);
+    }
+    displayExe := "";
+    if (!failed && live) {
+        displayExe = buildDisplay(dir);
+        if (displayExe == "") util.Stderr("ocean test: live display unavailable; using final report\n");
+    }
+    if (reportPath != "") r.reportBuf = util.NewBuf();
+    if (jsonPath != "") r.jsonFile = util.NewBuf();
+    pkg, ok := util.Realpath(location);
+    if (ok && !util.IsDir(pkg)) pkg = util.Dir(pkg);
+    if (!ok) pkg = location;
+    if (shared) pkg = loader.NewBuild(newDiags()).PackageTestPath(location);
+    r.pkg = pkg;
+    if (!failed) {
+        code := testExecute(r, exe, displayExe);
+        failed = code != 0;
+        if (code != 0) { writeReports(r, reportPath, jsonPath); util.RemoveAll(dir); return code; }
+    } else if (shared) {
+        emitJSON(r, "fail", "", "package could not be compiled", 0.0);
+    }
+    if (!writeReports(r, reportPath, jsonPath)) failed = true;
+    util.RemoveAll(dir);
+    return failed ? 1 : 0;
+}
+
+func writeReports(r *Reporter, reportPath string, jsonPath string) bool {
+    ok := true;
+    if (reportPath != "" && !ast_nilBuf(r.reportBuf)) { if (!util.WriteBufFile(reportPath, r.reportBuf)) { util.Stderr("ocean test: could not write report file\n"); ok = false; } }
+    if (jsonPath != "" && !ast_nilBuf(r.jsonFile)) { if (!util.WriteBufFile(jsonPath, r.jsonFile)) { util.Stderr("ocean test: could not write JSON file\n"); ok = false; } }
+    return ok;
+}
+
+func findPackages(list *[]string, path string) bool {
+    names, ok := util.ListDir(path);
+    if (!ok) { util.Stderr(path + ": cannot read directory\n"); return false; }
+    sources := false;
+    for (_, n := range names) { if (len(n) > 3 && util.HasSuffix(n, ".oc")) sources = true; }
+    if (sources) addLocation(list, path);
+    for (_, n := range names) {
+        if (n[0] == '.' || n == "vendor" || n == "node_modules") continue;
+        child := path + "/" + n;
+        if (util.IsDir(child) && !util.IsSymlink(child)) findPackages(list, child);
+    }
+    return true;
+}
+
+func addLocation(list *[]string, path string) bool {
+    resolved := loader.NewBuild(newDiags()).PackageTestLocation(path);
+    if (resolved == "") { util.Stderr(path + ": No such file or directory\n"); return false; }
+    if (!util.IsDir(resolved)) {
+        if (!util.HasSuffix(resolved, ".oc")) { util.Stderr("ocean test: expected an Ocean file or package directory: " + path + "\n"); return false; }
+        resolved = util.Dir(resolved);
+    }
+    for (_, x := range *list) { if (x == resolved) return true; }
+    (*list).append(resolved);
+    return true;
+}
+
+func testMain(args []string) int {
+    if (len(args) > 2 && args[2] == "--internal-test-package") return testOne(args[3:], true);
+    rest := args[2:];
+    flags := make([]string);
+    list := make([]string);
+    count := 0; recursive := false; failedList := false;
+    report := ""; jsonFile := ""; json := false; notty := false;
+    for (i := 0; i < len(rest); i++) {
+        a := rest[i];
+        if (a == "--help" || a == "-h") {
+            util.Stdout("Usage: ocean test [packages...] [options]\n" +
+                "Locations may be directories or files; ./... and engine/... recursively select packages.\n" +
+                "Overlapping selections run once. Packages share the configured worker limit.\n" +
+                "Options: --json --outfile path --jsonfile path -v --no-color --hide-skipped\n" +
+                "         --timeout duration --notty -t nthreads --single-threaded\n");
+            return 0;
+        }
+        if (len(a) > 0 && a[0] == '-') {
+            flags.append(a);
+            if (a == "--json" || a == "-json") json = true;
+            if (a == "--notty" || a == "-notty" || a == "--no-tui") notty = true;
+            value := a == "-t" || a == "--timeout" || a == "-timeout" || a == "--outfile" || a == "-outfile" || a == "-o" || a == "--jsonfile" || a == "-jsonfile";
+            if (value && i + 1 < len(rest)) {
+                i++;
+                flags.append(rest[i]);
+                if (util.Contains(a, "jsonfile")) jsonFile = rest[i];
+                else if (a == "-o" || util.Contains(a, "outfile")) report = rest[i];
+            }
+            continue;
+        }
+        count++;
+        if (a == "..." || util.HasSuffix(a, "/...")) {
+            recursive = true;
+            base := a == "..." ? "." : a[0:len(a) - 4];
+            if (base == "") base = "/";
+            resolved := loader.NewBuild(newDiags()).PackageTestLocation(base);
+            if (resolved == "") { util.Stderr("ocean test: package not found: " + base + "\n"); failedList = true; }
+            else if (!findPackages(&list, resolved)) failedList = true;
+        } else if (!addLocation(&list, a)) failedList = true;
+    }
+    if (count == 0) return testOne(rest, false);
+    if (count == 1 && !recursive && !failedList && len(list) == 1) {
+        flags.append(list[0]);
+        return testOne(flags, false);
+    }
+    if (failedList || len(list) == 0) {
+        if (len(list) == 0) util.Stderr("ocean test: no packages matched\n");
+        return 1;
+    }
+    if ((report != "" && util.HasSuffix(report, ".oc")) || (jsonFile != "" && util.HasSuffix(jsonFile, ".oc"))) {
+        util.Stderr("ocean test: output would overwrite an Ocean source file\n"); return 1;
+    }
+    return testPackages(flags, list, report, jsonFile, json, notty);
+}

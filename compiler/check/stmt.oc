@@ -1,0 +1,576 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+func checkFunc(c *Checker, d *ast.Node) {
+    s := d.sym;
+    if (nilS(s)) return;
+    resolveSymType(c, s);
+    sv := enterSym(c, s);
+    f := new(FuncCtx);
+    f.node = d; f.sym = s; f.level = 1;
+    f.results = s.ty.results;
+    c.fn = f;
+    pushed := 0;
+    if (!nilS(s.owner)) { withTypeParams(c, s.recvParams); pushed++; }
+    withTypeParams(c, s.typeParams);
+    pushed++;
+    push(c);
+    c.scope.isFunc = true;
+    if (!nilN(d.a)) {
+        r := newSym(c, ast.SK.Var, d.a.name, d.a);
+        r.param = true;
+        r.ty = receiverType(c, s);
+        d.a.sym = r; d.a.ty = r.ty;
+        declare(c, r, d.a);
+    }
+    declareParams(c, d.list, d.list2, f);
+    funcBody(c, d.b, f);
+    pop(c);
+    for (i := 0; i < pushed; i++) pop(c);
+    leave(c, sv);
+}
+
+func funcBody(c *Checker, body *ast.Node, f *FuncCtx) {
+    block(c, body);
+    for (_, g := range f.gotos) {
+        target, ok := f.labels[g.name];
+        if (!ok) { err(c, g, "undefined label: " + g.name); continue; }
+        g.ref = target;
+    }
+    if (len(f.results) > 0 && !terminates(c, body)) {
+        at := f.node;
+        if (f.node.kind == ast.NK.Func) {
+            w := new(ast.Node);
+            w.src = f.node.src; w.line = f.node.nameLine; w.col = f.node.nameCol;
+            at = w;
+        }
+        warn(c, at, "value-returning function can reach its end without returning; returning a zero value");
+        f.node.flag3 = true;
+    }
+}
+
+// predeclare makes block-level type declarations visible throughout the block.
+func predeclare(c *Checker, stmts []*ast.Node) {
+    for (_, st := range stmts) {
+        if (st.kind == ast.NK.Struct || st.kind == ast.NK.Enum || st.kind == ast.NK.Interface || st.kind == ast.NK.TypeDecl) {
+            s := newSym(c, declKind(c, st), st.name, st);
+            s.local = true; s.scope = c.scope;
+            st.sym = s;
+            declare(c, s, st);
+        }
+    }
+    for (_, st := range stmts) {
+        if (!nilS(st.sym) && st.sym.local && (st.kind == ast.NK.Struct || st.kind == ast.NK.Enum || st.kind == ast.NK.Interface || st.kind == ast.NK.TypeDecl)) {
+            resolveSymType(c, st.sym);
+        }
+    }
+}
+
+func block(c *Checker, n *ast.Node) {
+    push(c);
+    predeclare(c, n.list);
+    for (_, s := range n.list) stmt(c, s);
+    pop(c);
+}
+
+// stmtScoped checks a statement in its own scope (if/for bodies, cases).
+func stmtScoped(c *Checker, n *ast.Node) {
+    if (n.kind == ast.NK.Block) { block(c, n); return; }
+    push(c);
+    stmt(c, n);
+    pop(c);
+}
+
+func stmt(c *Checker, n *ast.Node) {
+    switch (n.kind) {
+    case ast.NK.Block: block(c, n);
+    case ast.NK.Empty:
+    case ast.NK.VarDecl: localVar(c, n);
+    case ast.NK.ExprStmt:
+        t := expr(c, n.a, zero(*ast.Type));
+        defaultType(c, n.a, t);
+        if (n.a.kind == ast.NK.Member && (n.a.sem == ast.Sem.Method || n.a.sem == ast.Sem.IfaceMethod)) err(c, n.a, "bound method values are not supported");
+    case ast.NK.If:
+        push(c);
+        if (!nilN(n.a)) stmt(c, n.a);
+        condition(c, n.b);
+        stmtScoped(c, n.c);
+        if (!nilN(n.d)) stmtScoped(c, n.d);
+        pop(c);
+    case ast.NK.For:
+        push(c);
+        if (!nilN(n.a)) stmt(c, n.a);
+        if (!nilN(n.b)) condition(c, n.b);
+        if (!nilN(n.c)) valueExpr(c, n.c);
+        c.fn.loopDepth++;
+        stmtScoped(c, n.d);
+        c.fn.loopDepth--;
+        pop(c);
+    case ast.NK.ForRange: forRange(c, n);
+    case ast.NK.Switch: switchStmt(c, n);
+    case ast.NK.TypeSwitch: typeSwitch(c, n);
+    case ast.NK.Match: matchStmt(c, n);
+    case ast.NK.Return: returnStmt(c, n);
+    case ast.NK.ReturnPanic:
+        exprExpect(c, n.a, tString);
+    case ast.NK.Panic:
+        exprExpect(c, n.a, tString);
+    case ast.NK.Forward:
+        c.fn.forwardDepth++;
+        if (n.a.kind == ast.NK.VarDecl) localVar(c, n.a);
+        else stmt(c, n.a);
+        c.fn.forwardDepth--;
+        n.ival = 1;
+    case ast.NK.Defer:
+        c.fn.hasDefer = true;
+        valueExpr(c, n.a);
+    case ast.NK.Labeled:
+        _, dup := c.fn.labels[n.name];
+        if (dup) err(c, n, "duplicate label: " + n.name);
+        c.fn.labels[n.name] = n;
+        n.ref = n.a;
+        stmt(c, n.a);
+    case ast.NK.Break:
+        if (n.name != "") { branchLabel(c, n, false); }
+        else if (c.fn.loopDepth == 0 && c.fn.switchDepth == 0) err(c, n, "break requires an enclosing loop or switch");
+    case ast.NK.Continue:
+        if (n.name != "") { branchLabel(c, n, true); }
+        else if (c.fn.loopDepth == 0) err(c, n, "continue requires an enclosing loop");
+    case ast.NK.Goto:
+        c.fn.gotos.append(n);
+    case ast.NK.Fallthrough:
+    case ast.NK.Asm: asmStmt(c, n);
+    case ast.NK.Func:
+        err(c, n, "nested named function declarations are not supported; assign a function literal to a variable");
+    case ast.NK.Struct, ast.NK.Enum, ast.NK.Interface, ast.NK.TypeDecl:
+        if (nilS(n.sym)) { predeclare(c, []*ast.Node{n}); }
+    default:
+        err(c, n, "invalid statement");
+    }
+}
+
+func branchLabel(c *Checker, n *ast.Node, isContinue bool) {
+    target, ok := c.fn.labels[n.name];
+    if (!ok) { err(c, n, "undefined label: " + n.name); return; }
+    k := target.a.kind;
+    if (isContinue && k != ast.NK.For && k != ast.NK.ForRange) { err(c, n, "continue label must name an enclosing loop"); return; }
+    if (!isContinue && k != ast.NK.For && k != ast.NK.ForRange && k != ast.NK.Switch && k != ast.NK.TypeSwitch && k != ast.NK.Match) {
+        err(c, n, "break label must name an enclosing loop or switch"); return;
+    }
+    n.ref = target.a;
+}
+
+func condition(c *Checker, n *ast.Node) {
+    t := valueExpr(c, n);
+    if (Underlying(t).kind != ast.TK.Bool && t.kind != ast.TK.Invalid) err(c, n, "type mismatch: expected bool, got " + TypeString(t));
+}
+
+func declareLocal(c *Checker, id *ast.Node, t *ast.Type) {
+    if (id.kind == ast.NK.Blank || id.name == "_") return;
+    s := newSym(c, ast.SK.Var, id.name, id);
+    s.ty = t;
+    id.sym = s; id.ty = t;
+    declare(c, s, id);
+}
+
+// localVar checks `names : [Type] [= values]`.
+func localVar(c *Checker, n *ast.Node) {
+    names := n.list; values := n.list2;
+    if (!nilN(n.a)) {
+        t := resolveType(c, n.a);
+        n.tyAlt = t;
+        if (t.kind == ast.TK.Void) err(c, n, "void is not a variable storage type");
+        if (len(values) == 0) {
+            if (t.kind == ast.TK.Array && t.len == -2) err(c, n, "array<T> requires an existing array initializer; instantiate with T[n]");
+            if (t.kind == ast.TK.Buffer && t.len == -2) err(c, n, "unsized buffer requires an initializer");
+            if (t.kind == ast.TK.Buffer && nilT(t.elem)) err(c, n, "unsized buffer requires an initializer");
+            if (t.kind == ast.TK.Array && t.len == -1) { lt := expr(c, t.lenNode, tInt); if (isUntyped(lt)) defaultType(c, t.lenNode, lt); }
+            if (t.kind == ast.TK.Buffer && t.len == -1) { lt := expr(c, t.lenNode, tInt); if (isUntyped(lt)) defaultType(c, t.lenNode, lt); }
+            if (t.kind == ast.TK.Struct) {
+                for (_, f := range c.FieldsOf(t)) { if (f.valueParam) { err(c, n, "struct with parameters requires an initializer"); break; } }
+            }
+            if (t.kind == ast.TK.Family) err(c, n, "struct literals require concrete type arguments");
+            for (_, id := range names) declareLocal(c, id, t);
+            return;
+        }
+        if (t.kind == ast.TK.Buffer && t.len == -1) err(c, n, "runtime-sized buffers cannot have initializers");
+        if (len(values) == 1 && len(names) > 1) {
+            vt := multiValue(c, n, values[0], len(names));
+            if (vt.kind == ast.TK.Tuple) {
+                for (i, r := range vt.results) { if (!c.Assignable(r, t)) mismatch(c, n, t, r); }
+            }
+            for (_, id := range names) declareLocal(c, id, t);
+            return;
+        }
+        if (len(values) != len(names)) { err(c, n, "initializer count mismatch"); for (_, v := range values) valueExpr(c, v); }
+        else {
+            for (_, v := range values) {
+                if (v.kind == ast.NK.Composite && nilN(v.a)) allowContext(c, v);
+                expr(c, v, t);
+                if (t.kind == ast.TK.Ptr && intLiteral(c, v).ok) { defaultType(c, v, v.ty); continue; }
+                coerce(c, v, t, n);
+            }
+        }
+        for (_, id := range names) declareLocal(c, id, t);
+        return;
+    }
+    // inferred
+    if (len(values) == 1 && len(names) > 1) {
+        vt := multiValue(c, n, values[0], len(names));
+        for (i, id := range names) {
+            t := tInvalid;
+            if (vt.kind == ast.TK.Tuple && i < len(vt.results)) t = vt.results[i];
+            declareLocal(c, id, t);
+        }
+        return;
+    }
+    if (len(values) != len(names)) {
+        err(c, n, "initializer count mismatch");
+        for (_, v := range values) valueExpr(c, v);
+        for (_, id := range names) declareLocal(c, id, tInvalid);
+        return;
+    }
+    types := make([]*ast.Type);
+    for (_, v := range values) {
+        t := valueExpr(c, v);
+        if (t.kind == ast.TK.Null) { err(c, n, "null requires an explicit pointer type"); t = tInvalid; }
+        if (t.kind == ast.TK.Void) { err(c, n, "function returns no value"); t = tInvalid; }
+        if (t.kind == ast.TK.Tuple) { err(c, n, len(values) == 1 ? "initializer count mismatch" : "multiple-return call must be the only expression in a value list"); t = tInvalid; }
+        if (v.kind == ast.NK.Member && (v.sem == ast.Sem.Method || v.sem == ast.Sem.IfaceMethod)) { err(c, v, "bound method values are not supported"); t = tInvalid; }
+        if (v.kind == ast.NK.Member && v.sem == ast.Sem.EnumSelector) { err(c, v, "enum payload variant requires construction"); t = tInvalid; }
+        if (t.kind == ast.TK.Family) { err(c, v, "generic enum value requires explicit type arguments"); t = tInvalid; }
+        if ((v.sem == ast.Sem.TypeName) && (v.kind == ast.NK.Ident || v.kind == ast.NK.Member || v.kind == ast.NK.Inst)) { err(c, v, "a type is not a value; use T{...}, zero(T), or [n]T to construct one"); t = tInvalid; }
+        types.append(t);
+    }
+    for (i, id := range names) declareLocal(c, id, types[i]);
+}
+
+// multiValue types the single value supplying several names: a call or comma-ok form.
+func multiValue(c *Checker, n *ast.Node, v *ast.Node, count int) *ast.Type {
+    if (count == 2 && (v.kind == ast.NK.Index || v.kind == ast.NK.Assert)) {
+        t := commaOk(c, v);
+        if (t.kind == ast.TK.Tuple) return t;
+        rs := make([]*ast.Type);
+        rs.append(t); rs.append(tBool);
+        return TupleOf(rs);
+    }
+    t := valueExpr(c, v);
+    if (t.kind == ast.TK.Invalid) return t;
+    if (t.kind != ast.TK.Tuple) {
+        err(c, n, "initializer count mismatch");
+        return tInvalid;
+    }
+    if (len(t.results) != count) { err(c, n, "initializer count mismatch"); return tInvalid; }
+    return t;
+}
+
+func forRange(c *Checker, n *ast.Node) {
+    push(c);
+    t := valueExpr(c, n.a);
+    u := Underlying(t);
+    kt := tInt; vt := tInvalid;
+    if (u.kind == ast.TK.Array || u.kind == ast.TK.Dyn) vt = u.elem;
+    else if (u.kind == ast.TK.String) vt = tI8;
+    else if (u.kind == ast.TK.Map) { kt = u.key; vt = u.elem; }
+    else if (u.kind == ast.TK.Buffer && u.len > 0) vt = u.elem;
+    else if (t.kind != ast.TK.Invalid) err(c, n.a, "range requires an array, dynamic array, string, or map");
+    n.tyAlt = t;
+    declareLocal(c, n.list[0], kt);
+    if (len(n.list) > 1) declareLocal(c, n.list[1], vt);
+    c.fn.loopDepth++;
+    stmtScoped(c, n.d);
+    c.fn.loopDepth--;
+    pop(c);
+}
+
+func switchStmt(c *Checker, n *ast.Node) {
+    push(c);
+    if (!nilN(n.a)) stmt(c, n.a);
+    tag := zero(*ast.Type);
+    if (!nilN(n.b)) {
+        tag = valueExpr(c, n.b);
+        if (tag.kind == ast.TK.Enum) { }
+    }
+    c.fn.switchDepth++;
+    for (_, cl := range n.list) {
+        for (_, e := range cl.list) {
+            if (nilT(tag)) { condition(c, e); continue; }
+            et := expr(c, e, tag);
+            if (tag.kind == ast.TK.Enum && e.kind == ast.NK.Member && (e.sem == ast.Sem.EnumSelector || e.sem == ast.Sem.EnumUnit || e.sem == ast.Sem.EnumFixed)) {
+                if (!comparable(c, e, tag, et)) mismatch(c, e, tag, et);
+                continue;
+            }
+            if (isUntyped(et)) { coerce(c, e, tag, e); continue; }
+            if (!c.Assignable(et, tag) && !comparable(c, e, tag, et)) mismatch(c, e, tag, et);
+        }
+        push(c);
+        predeclare(c, cl.list2);
+        for (_, s := range cl.list2) stmt(c, s);
+        pop(c);
+    }
+    c.fn.switchDepth--;
+    pop(c);
+}
+
+func typeSwitch(c *Checker, n *ast.Node) {
+    push(c);
+    if (!nilN(n.a)) stmt(c, n.a);
+    t := valueExpr(c, n.b);
+    if (t.kind == ast.TK.Enum) err(c, n, "type-guard switches do not support enums; use match");
+    else if (t.kind != ast.TK.Interface && t.kind != ast.TK.Union && t.kind != ast.TK.Param && t.kind != ast.TK.Invalid &&
+             !(t.kind == ast.TK.Buffer && nilT(t.elem)) && t.kind != ast.TK.Family && !(t.kind == ast.TK.Array && t.len == -2)) {
+        err(c, n, "type switch requires an interface or any value");
+    }
+    c.fn.switchDepth++;
+    for (_, cl := range n.list) {
+        cl.types = make([]*ast.Type);
+        for (_, e := range cl.list) {
+            ct := resolveTypeOrUnion(c, e);
+            e.tyAlt = ct;
+            cl.types.append(ct);
+        }
+        for (_, s := range cl.list2) { if (s.kind == ast.NK.Fallthrough) err(c, s, "fallthrough is not allowed in a type switch"); }
+        push(c);
+        if (n.name != "" && n.name != "_") {
+            bt := tAny;
+            if (!cl.flag && len(cl.types) == 1 && cl.types[0].kind != ast.TK.Union) bt = cl.types[0];
+            if (!cl.flag && len(cl.types) == 1 && cl.types[0].kind == ast.TK.Interface) bt = cl.types[0];
+            id := new(ast.Node);
+            id.kind = ast.NK.Ident; id.src = n.src; id.line = n.nameLine; id.col = n.nameCol; id.name = n.name;
+            declareLocal(c, id, bt);
+            cl.sym = id.sym;
+        }
+        predeclare(c, cl.list2);
+        for (_, s := range cl.list2) stmt(c, s);
+        pop(c);
+    }
+    c.fn.switchDepth--;
+    pop(c);
+}
+
+func matchStmt(c *Checker, n *ast.Node) {
+    t := valueExpr(c, n.a);
+    if (t.kind == ast.TK.Invalid) return;
+    if (t.kind != ast.TK.Enum) { err(c, n.a, "match requires an enum value"); return; }
+    vs := c.VariantsOf(t);
+    seen := make([]bool);
+    for (i := 0; i < len(vs); i++) seen.append(false);
+    hasDefault := false;
+    c.fn.switchDepth++;
+    for (_, arm := range n.list) {
+        p := arm.a;
+        push(c);
+        ref := p.a;
+        // default arm: the bare enum name
+        rt, isType := typeOfExpr(c, ref);
+        if (isType) {
+            if (rt.kind != ast.TK.Enum && rt.kind != ast.TK.Family) { err(c, p, "default match pattern must name the enum type"); pop(c); continue; }
+            if (rt.sym != t.sym) { err(c, p, "match pattern belongs to a different enum"); pop(c); continue; }
+            if (len(p.list) > 0 || p.ival != 0) { err(c, p, "default enum pattern cannot bind a payload"); pop(c); continue; }
+            if (hasDefault) { err(c, p, "duplicate default enum pattern"); pop(c); continue; }
+            hasDefault = true;
+            p.ival = 0; p.name = "";
+            p.sem = ast.Sem.TypeName;
+            stmt(c, arm.b);
+            pop(c);
+            continue;
+        }
+        if (ref.kind != ast.NK.Member) { err(c, p, "default match pattern must name the enum type"); pop(c); continue; }
+        et, ok := typeOfExpr(c, ref.a);
+        if (!ok || (et.kind != ast.TK.Enum && et.kind != ast.TK.Family)) { err(c, p, "match pattern belongs to a different enum"); pop(c); continue; }
+        if (et.sym != t.sym) { err(c, p, "match pattern belongs to a different enum"); pop(c); continue; }
+        if (et.kind == ast.TK.Enum && !Identical(et, t)) { err(c, p, "match pattern has different enum type arguments"); pop(c); continue; }
+        v := zero(*ast.VariantInfo);
+        for (_, x := range vs) { if (x.name == ref.name) v = x; }
+        if (nilV(v)) { err(c, ref, "unknown enum variant: " + ref.name); pop(c); continue; }
+        checkVariantExport(c, ref, t, ref.name);
+        if (seen[v.index]) { err(c, p, "duplicate enum match variant"); pop(c); continue; }
+        seen[v.index] = true;
+        p.name = v.name;
+        p.sem = ast.Sem.EnumSelector;
+        p.labelId = v.index;
+        if (p.ival == 1) {
+            if (v.vkind != 1 && v.vkind != 3) { err(c, p, "enum pattern does not match variant payload form"); }
+            else {
+                types := v.types;
+                if (v.vkind == 3) { types = make([]*ast.Type); types.append(v.fixedType); }
+                if (len(p.list) != len(types)) err(c, p, "tuple enum pattern count mismatch; use _ to omit a field");
+                else { for (i, b := range p.list) declareLocal(c, b, types[i]); }
+            }
+        } else if (p.ival == 2) {
+            if (v.vkind != 2) err(c, p, "enum pattern does not match variant payload form");
+            else {
+                used: map[string]bool;
+                for (_, b := range p.list) {
+                    idx := -1;
+                    for (i, f := range v.fields) { if (f.name == b.text) idx = i; }
+                    if (idx < 0) { err(c, b, "unknown enum payload field: " + b.text); continue; }
+                    _, dup := used[b.text];
+                    if (dup) { err(c, b, "duplicate enum pattern field"); continue; }
+                    used[b.text] = true;
+                    b.ival = idx;
+                    id := new(ast.Node);
+                    id.kind = ast.NK.Ident; id.src = b.src; id.line = b.line; id.col = b.col; id.name = b.name;
+                    declareLocal(c, id, v.fields[idx].ty);
+                    b.sym = id.sym;
+                }
+            }
+        }
+        stmt(c, arm.b);
+        pop(c);
+    }
+    c.fn.switchDepth--;
+    if (!hasDefault) {
+        missing := "";
+        for (i, v := range vs) { if (!seen[i]) { if (missing != "") missing += ", "; missing += v.name; } }
+        if (missing != "") warn(c, n, "non-exhaustive enum match: missing " + missing);
+    }
+    n.flag = hasDefault;
+}
+
+func returnStmt(c *Checker, n *ast.Node) {
+    results := c.fn.results;
+    if (len(n.list) == 0) {
+        if (len(results) > 0 && len(c.fn.named) == 0) err(c, n, "return count mismatch: Expected " + itoa(len(results)) + " return values, but got 0.");
+        return;
+    }
+    if (len(n.list) == 1 && len(results) > 1) {
+        t := valueExpr(c, n.list[0]);
+        if (t.kind == ast.TK.Tuple && len(t.results) == len(results)) {
+            for (i, r := range t.results) { if (!c.Assignable(r, results[i])) mismatch(c, n.list[0], results[i], r); }
+            n.flag2 = true;
+            return;
+        }
+        if (t.kind == ast.TK.Invalid) return;
+        err(c, n, "return count mismatch: Expected " + itoa(len(results)) + " return values, but got 1.");
+        return;
+    }
+    if (len(n.list) != len(results)) {
+        err(c, n, "return count mismatch: Expected " + itoa(len(results)) + " return values, but got " + itoa(len(n.list)) + ".");
+        for (_, v := range n.list) valueExpr(c, v);
+        return;
+    }
+    for (i, v := range n.list) {
+        expr(c, v, results[i]);
+        coerce(c, v, results[i], v);
+    }
+}
+
+func asmStmt(c *Checker, n *ast.Node) {
+    for (_, op := range n.list) {
+        s := lookup(c, op.name);
+        if (nilS(s) || s.kind != ast.SK.Var) { err(c, n, "unresolved asm operand: " + op.name); continue; }
+        op.sym = s;
+        t := s.global ? resolveSymType(c, s) : s.ty;
+        u := Underlying(t);
+        if (u.kind != ast.TK.Int && u.kind != ast.TK.Float && u.kind != ast.TK.Bool && u.kind != ast.TK.Ptr && !(u.kind == ast.TK.Buffer && u.len == -2)) {
+            err(c, n, "asm operands require mutable scalar variables or pointers");
+        }
+        op.ty = t;
+        if (!s.global) markCapture(c, s);
+    }
+}
+
+func checkGlobal(c *Checker, d *ast.Node) {
+    if (nilN(d.a)) return;
+    t := d.list[0].sym.ty;
+    if (nilT(t)) return;
+    if (len(d.list2) == 1 && len(d.list) > 1) { valueExpr(c, d.list2[0]); return; }
+    for (_, v := range d.list2) {
+        if (v.kind == ast.NK.Composite && nilN(v.a)) allowContext(c, v);
+        expr(c, v, t);
+        if (t.kind == ast.TK.Ptr && intLiteral(c, v).ok) { defaultType(c, v, v.ty); continue; }
+        coerce(c, v, t, d);
+    }
+}
+
+// ---- reachability ----
+
+func isTrueLit(n *ast.Node) bool { return n.kind == ast.NK.Ident && n.name == "true"; }
+func isFalseLit(n *ast.Node) bool { return n.kind == ast.NK.Ident && n.name == "false"; }
+
+// hasBreak reports whether a break targets the loop/switch `target` inside n.
+func hasBreak(n *ast.Node, target *ast.Node, depth int) bool {
+    if (nilN(n)) return false;
+    switch (n.kind) {
+    case ast.NK.Break:
+        if (n.name != "") return n.ref == target;
+        return depth == 0;
+    case ast.NK.For, ast.NK.ForRange, ast.NK.Switch, ast.NK.TypeSwitch:
+        if (n == target) {
+            if (n.kind == ast.NK.Switch || n.kind == ast.NK.TypeSwitch) {
+                for (_, cl := range n.list) { for (_, s := range cl.list2) { if (hasBreak(s, target, 0)) return true; } }
+                return false;
+            }
+            return hasBreak(n.d, target, 0);
+        }
+        if (n.kind == ast.NK.Switch || n.kind == ast.NK.TypeSwitch) {
+            for (_, cl := range n.list) { for (_, s := range cl.list2) { if (hasBreak(s, target, depth + 1)) return true; } }
+            return false;
+        }
+        return hasBreak(n.d, target, depth + 1);
+    case ast.NK.Match:
+        for (_, arm := range n.list) { if (hasBreak(arm.b, target, depth + 1)) return true; }
+        return false;
+    case ast.NK.Block:
+        for (_, s := range n.list) { if (hasBreak(s, target, depth)) return true; }
+        return false;
+    case ast.NK.If: return hasBreak(n.c, target, depth) || hasBreak(n.d, target, depth);
+    case ast.NK.Labeled, ast.NK.Forward: return hasBreak(n.a, target, depth);
+    }
+    return false;
+}
+
+func terminates(c *Checker, n *ast.Node) bool {
+    if (nilN(n)) return false;
+    switch (n.kind) {
+    case ast.NK.Return, ast.NK.ReturnPanic, ast.NK.Panic, ast.NK.Goto: return true;
+    case ast.NK.Block:
+        for (i := len(n.list) - 1; i >= 0; i--) {
+            s := n.list[i];
+            if (s.kind == ast.NK.Empty) continue;
+            if (terminates(c, s)) return true;
+            if (s.kind == ast.NK.Labeled) return false;
+            return false;
+        }
+        return false;
+    case ast.NK.If:
+        if (isTrueLit(n.b)) return terminates(c, n.c);
+        if (isFalseLit(n.b)) return !nilN(n.d) && terminates(c, n.d);
+        return !nilN(n.d) && terminates(c, n.c) && terminates(c, n.d);
+    case ast.NK.For:
+        infinite := nilN(n.b) || isTrueLit(n.b);
+        return infinite && !hasBreak(n, n, 0);
+    case ast.NK.Labeled: return terminates(c, n.a) && !hasBreak(n.a, n.a, 0);
+    case ast.NK.Forward: return terminates(c, n.a);
+    case ast.NK.Switch, ast.NK.TypeSwitch:
+        hasDefault := false;
+        for (_, cl := range n.list) {
+            if (cl.flag) hasDefault = true;
+            if (n.kind == ast.NK.TypeSwitch) { for (_, t := range cl.types) { if (IsAny(t)) hasDefault = true; } }
+        }
+        if (!hasDefault || hasBreak(n, n, 0)) return false;
+        for (i, cl := range n.list) {
+            if (len(cl.list2) == 0) { if (i == len(n.list) - 1) return false; continue; }
+            last := cl.list2[len(cl.list2) - 1];
+            if (last.kind == ast.NK.Fallthrough) continue;
+            b := new(ast.Node); b.kind = ast.NK.Block; b.list = cl.list2;
+            if (!terminates(c, b)) return false;
+        }
+        return true;
+    case ast.NK.Match:
+        exhaustive := n.flag;
+        if (!exhaustive && !nilT(n.a.ty) && n.a.ty.kind == ast.TK.Enum) {
+            count := 0;
+            for (_, arm := range n.list) { if (arm.a.name != "") count++; }
+            exhaustive = count == len(c.VariantsOf(n.a.ty));
+        }
+        if (!exhaustive) return false;
+        for (_, arm := range n.list) { if (!terminates(c, arm.b)) return false; }
+        return len(n.list) > 0;
+    }
+    return false;
+}
+
+func unusedScanner(c *Checker, k scanner.Kind) bool { return k == scanner.Kind.EOF; }

@@ -1,0 +1,57 @@
+package driver;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/loader";
+import "github.com/ocean-foundation/ocean/compiler/parser";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+// Program is a loaded and checked package graph.
+struct Program {
+    build *loader.Build;
+    checker *check.Checker;
+    diags *diag.List;
+    ok bool;
+    isLibrary bool;
+    name string;
+    dir string;
+    order []*ast.Package;
+    fatal bool;
+    usesFFI bool;
+}
+
+func builtinPackage(diags *diag.List) *ast.Package {
+    p := new(ast.Package);
+    p.name = "builtin"; p.path = "builtin"; p.dir = "<builtin>"; p.id = -1;
+    src := new(ast.Source);
+    src.path = "<builtin>"; src.abs = "<builtin>"; src.text = check.BuiltinSource(); src.pkg = p;
+    toks, _ := scanner.Scan(src.path, src.text, diags, false);
+    src.tokens = toks;
+    f, _ := parser.ParseFile(src, diags, false);
+    src.file = f;
+    p.files.append(src);
+    return p;
+}
+
+// Frontend loads and checks a package (test=true synthesizes the test harness).
+func Frontend(location string, test bool, harness string, diags *diag.List) *Program {
+    prog := new(Program);
+    prog.diags = diags;
+    b := loader.NewBuild(diags);
+    prog.build = b;
+    ok := false;
+    if (test) ok = b.LoadTestPackage(location, harness);
+    else ok = b.LoadPackage(location);
+    if (b.IsFatal()) { prog.fatal = true; return prog; }
+    if (!ok || b.Errors() > 0) return prog;
+    prog.isLibrary = b.IsLibrary();
+    prog.name = b.PackageName();
+    prog.dir = b.Root().dir;
+    prog.order = b.Order();
+    c := check.NewChecker(diags);
+    c.SetBuiltin(builtinPackage(diags));
+    prog.checker = c;
+    errs := c.Check(b.Order(), b.StandardSource());
+    prog.ok = errs == 0;
+    return prog;
+}

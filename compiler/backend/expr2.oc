@@ -1,0 +1,576 @@
+package backend;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+func boundsCheck(g *Gen, n *ast.Node, idx string, length string) {
+    c := tmp(g);
+    emit(g, c + " = icmp ult i64 " + idx + ", " + length);
+    ok := newLabel(g, "inb"); bad := newLabel(g, "oob");
+    condBr(g, c, ok, bad);
+    label(g, bad);
+    emit(g, "call void @oc_bounds(i64 " + idx + ", i64 " + length + ", i64 " + itoa(site(g, n)) + ")");
+    term(g, "unreachable");
+    label(g, ok);
+}
+
+// collectionRef yields the base value of an indexed collection, preferring storage.
+func indexBase(g *Gen, n *ast.Node) V {
+    bt := typeOf(g, n.a);
+    u := under(bt);
+    if (u.kind == ast.TK.Array && u.len >= 0 && isLvalue(n.a)) return mkV(addrOf(g, n.a), bt);
+    return genExpr(g, n.a);
+}
+
+// indexAddr computes the element address (checked unless the base is a buffer).
+func indexAddr(g *Gen, n *ast.Node, readOnly bool) string {
+    bt := typeOf(g, n.a);
+    u := under(bt);
+    if (u.kind == ast.TK.Map) return mapSlot(g, n);
+    base := indexBase(g, n);
+    idxV := genExpr(g, n.b);
+    idx := intConv(g, idxV.r, idxV.t, check.TInt());
+    if (u.kind == ast.TK.Buffer) return gepDyn(g, base.r, idx, sizeOf(g, u.elem));
+    elem := u.kind == ast.TK.String ? check.TI8() : u.elem;
+    length := collectionLen(g, base);
+    boundsCheck(g, n, idx, length);
+    data := arrayDataPtr(g, base);
+    return gepDyn(g, data, idx, sizeOf(g, elem));
+}
+
+func mapSlot(g *Gen, n *ast.Node) string {
+    mt := under(typeOf(g, n.a));
+    slot := lvalueAddr(g, n.a);
+    k := genAs(g, n.b, mt.key);
+    r := tmp(g);
+    emit(g, r + " = call ptr @oc_map_slot(ptr " + slot + ", ptr " + spill(g, k) + ", ptr " + desc(g, mt.key) + ", ptr " + desc(g, mt.elem) + ")");
+    return r;
+}
+
+func genIndex(g *Gen, n *ast.Node, t *ast.Type) V {
+    bt := typeOf(g, n.a);
+    u := under(bt);
+    if (n.flag2) return genIndexOk(g, n, t);
+    if (u.kind == ast.TK.Map) {
+        m := genExpr(g, n.a);
+        k := genAs(g, n.b, u.key);
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_map_get(ptr " + m.r + ", ptr " + spill(g, k) + ", ptr " + desc(g, u.key) + ")");
+        c := tmp(g); emit(g, c + " = icmp eq ptr " + r + ", null");
+        bad := newLabel(g, "nokey"); ok := newLabel(g, "key");
+        condBr(g, c, bad, ok);
+        label(g, bad);
+        setSite(g, n);
+        emit(g, "call void @oc_map_missing(i64 " + itoa(site(g, n)) + ")");
+        term(g, "unreachable");
+        label(g, ok);
+        return load(g, u.elem, r);
+    }
+    return load(g, t, indexAddr(g, n, true));
+}
+
+// genIndexOk produces the (value, ok) tuple of a two-value index.
+func genIndexOk(g *Gen, n *ast.Node, t0 *ast.Type) V {
+    bt := typeOf(g, n.a);
+    u := under(bt);
+    elem := u.kind == ast.TK.Map ? u.elem : (u.kind == ast.TK.String ? check.TI8() : u.elem);
+    rts := make([]*ast.Type);
+    rts.append(elem); rts.append(check.TBool());
+    tt := tupleType(rts);
+    out := alloca(g, tt);
+    vslot := gep(g, out, tupleOffset(g, rts, 0));
+    okslot := gep(g, out, tupleOffset(g, rts, 1));
+    zeroInto(g, elem, vslot);
+    emit(g, "store i1 false, ptr " + okslot);
+    found := newLabel(g, "found"); done := newLabel(g, "lookup");
+    srcp := "";
+    if (u.kind == ast.TK.Map) {
+        m := genExpr(g, n.a);
+        k := genAs(g, n.b, u.key);
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_map_get(ptr " + m.r + ", ptr " + spill(g, k) + ", ptr " + desc(g, u.key) + ")");
+        c := tmp(g); emit(g, c + " = icmp ne ptr " + r + ", null");
+        condBr(g, c, found, done);
+        srcp = r;
+    } else {
+        base := indexBase(g, n);
+        idxV := genExpr(g, n.b);
+        idx := intConv(g, idxV.r, idxV.t, check.TInt());
+        length := collectionLen(g, base);
+        c := tmp(g); emit(g, c + " = icmp ult i64 " + idx + ", " + length);
+        data := arrayDataPtr(g, base);
+        condBr(g, c, found, done);
+        label(g, found);
+        srcp = gepDyn(g, data, idx, sizeOf(g, elem));
+        store(g, elem, vslot, copyV(g, load(g, elem, srcp)));
+        emit(g, "store i1 true, ptr " + okslot);
+        br(g, done);
+        label(g, done);
+        return freshV(out, tt);
+    }
+    label(g, found);
+    store(g, elem, vslot, copyV(g, load(g, elem, srcp)));
+    emit(g, "store i1 true, ptr " + okslot);
+    br(g, done);
+    label(g, done);
+    return freshV(out, tt);
+}
+
+func genSlice(g *Gen, n *ast.Node, t *ast.Type) V {
+    bt := typeOf(g, n.a);
+    u := under(bt);
+    base := indexBase(g, n);
+    elem := u.kind == ast.TK.String ? check.TI8() : u.elem;
+    data := "";
+    length := "";
+    checked := "1";
+    if (u.kind == ast.TK.Buffer) {
+        data = base.r;
+        length = u.len > 0 ? itoa(u.len) : "9223372036854775807";
+        if (u.len <= 0) checked = "0";
+    } else { data = arrayDataPtr(g, base); length = collectionLen(g, base); }
+    lo := "0";
+    if (!nilN(n.b)) { v := genExpr(g, n.b); lo = intConv(g, v.r, v.t, check.TInt()); }
+    hi := length;
+    if (!nilN(n.c)) { v := genExpr(g, n.c); hi = intConv(g, v.r, v.t, check.TInt()); }
+    r := tmp(g);
+    emit(g, r + " = call ptr @oc_slice(ptr " + data + ", i64 " + length + ", i64 " + lo + ", i64 " + hi + ", ptr " + desc(g, elem) + ", i64 " + checked + ", i64 " + itoa(site(g, n)) + ")");
+    return freshV(r, t);
+}
+
+// ---- assignment ----
+
+func assignTo(g *Gen, target *ast.Node, v V) V {
+    tt := typeOf(g, target);
+    if (target.kind == ast.NK.Blank) return v;
+    if (target.kind == ast.NK.Member && target.sem == ast.Sem.BitField) {
+        p, st := structBase(g, target.a);
+        return writeBitfield(g, p, fieldPlace(g, st, target.ival), tt, conv(g, v, tt));
+    }
+    if (target.kind == ast.NK.Index && under(typeOf(g, target.a)).kind == ast.TK.Map) {
+        mt := under(typeOf(g, target.a));
+        slot := lvalueAddr(g, target.a);
+        k := genAs(g, target.b, mt.key);
+        val := conv(g, v, mt.elem);
+        emit(g, "call void @oc_map_set(ptr " + slot + ", ptr " + spill(g, k) + ", ptr " + spill(g, val) + ", ptr " + desc(g, mt.key) + ", ptr " + desc(g, mt.elem) + ")");
+        return val;
+    }
+    p := addrOf(g, target);
+    val := conv(g, v, tt);
+    store(g, tt, p, val);
+    return val;
+}
+
+func genAssign(g *Gen, n *ast.Node) V {
+    target := n.a;
+    tt := typeOf(g, target);
+    if (target.kind == ast.NK.Member && target.sem == ast.Sem.ArrayData) { genDataAssign(g, n); return mkV("", check.TVoid()); }
+    if (n.op == scanner.Kind.Assign) {
+        v := genAs(g, n.b, tt);
+        return assignTo(g, target, v);
+    }
+    op := check.CompoundBase(n.op);
+    u := under(tt);
+    if (op == scanner.Kind.Plus && (u.kind == ast.TK.Dyn || u.kind == ast.TK.Array) && (u.kind == ast.TK.Dyn)) {
+        // dynamic-array += element or array
+        slot := lvalueAddr(g, target);
+        bv := genExpr(g, n.b);
+        bu := under(bv.t);
+        if ((bu.kind == ast.TK.Dyn || bu.kind == ast.TK.Array) && !check.Identical(bv.t, u.elem)) {
+            cur := tmp(g); emit(g, cur + " = load ptr, ptr " + slot);
+            l := tmp(g); emit(g, l + " = call i64 @oc_arr_len(ptr " + cur + ")");
+            // snapshot the source first: self-concatenation is allowed
+            src := copyV(g, conv(g, bv, bv.t));
+            emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + l + ", ptr " + arrayDataPtr(g, src) + ", i64 " + collectionLen(g, src) + ", ptr " + desc(g, u.elem) + ", i64 0)");
+        } else {
+            ev := copyV(g, conv(g, bv, u.elem));
+            dst := tmp(g);
+            emit(g, dst + " = call ptr @oc_arr_push(ptr " + slot + ", i64 " + itoa(sizeOf(g, u.elem)) + ")");
+            store(g, u.elem, dst, ev);
+        }
+        return load(g, tt, slot);
+    }
+    if (target.kind == ast.NK.Member && target.sem == ast.Sem.BitField) {
+        p, st := structBase(g, target.a);
+        place := fieldPlace(g, st, target.ival);
+        old := readBitfield(g, p, place, tt);
+        b := genExpr(g, n.b);
+        r := binaryValues(g, n, op, old, b, binaryResult(g, op, old.t, b.t, tt));
+        return writeBitfield(g, p, place, tt, conv(g, r, tt));
+    }
+    p := lvalueAddr(g, target);
+    old := load(g, tt, p);
+    if (isAgg(tt)) old = copyV(g, old);
+    b := genExpr(g, n.b);
+    r := binaryValues(g, n, op, old, b, binaryResult(g, op, old.t, b.t, tt));
+    val := copyV(g, conv(g, r, tt));
+    store(g, tt, p, val);
+    return val;
+}
+
+// binaryResult gives the operator result type for compound assignment.
+func binaryResult(g *Gen, op scanner.Kind, a *ast.Type, b *ast.Type, dest *ast.Type) *ast.Type {
+    ua := under(a);
+    if (ua.kind == ast.TK.String || ua.kind == ast.TK.Ptr || ua.kind == ast.TK.Array || ua.kind == ast.TK.Dyn) return dest;
+    if (ua.kind == ast.TK.Union || under(b).kind == ast.TK.Union) return dest;
+    r := g.c.NumericResult(a, b);
+    if (nilT(r)) return dest;
+    return r;
+}
+
+func genMultiAssign(g *Gen, n *ast.Node) {
+    targets := n.list; values := n.list2;
+    vals := make([]V);
+    if (len(values) == 1 && len(targets) > 1) {
+        tv := genExpr(g, values[0]);
+        rts := under(tv.t).results;
+        for (i, rt := range rts) vals.append(copyV(g, load(g, rt, gep(g, tv.r, tupleOffset(g, rts, i)))));
+    } else {
+        for (i, v := range values) {
+            tt := targets[i].kind == ast.NK.Blank ? typeOf(g, v) : typeOf(g, targets[i]);
+            x := genAs(g, v, tt);
+            if (isAgg(x.t)) x = copyIntoTemp(g, x);
+            vals.append(x);
+        }
+    }
+    // compute every simple target address before storing anything
+    addrs := make([]string);
+    for (_, t := range targets) {
+        simple := t.kind != ast.NK.Blank && !(t.kind == ast.NK.Member && t.sem == ast.Sem.BitField) &&
+            !(t.kind == ast.NK.Index && under(typeOf(g, t.a)).kind == ast.TK.Map);
+        addrs.append(simple ? addrOf(g, t) : "");
+    }
+    for (i, t := range targets) {
+        if (addrs[i] == "") { assignTo(g, t, vals[i]); continue; }
+        tt := typeOf(g, t);
+        store(g, tt, addrs[i], conv(g, vals[i], tt));
+    }
+}
+
+func copyIntoTemp(g *Gen, v V) V {
+    p := alloca(g, v.t);
+    memcpy(g, p, v.r, sizeOf(g, v.t));
+    return freshV(p, v.t);
+}
+
+// arr.data = src copies into the existing elements without changing length.
+func genDataAssign(g *Gen, n *ast.Node) {
+    target := n.a;
+    bt := typeOf(g, target.a);
+    arrV: V;
+    if (bt.kind == ast.TK.Ptr) { pv := genExpr(g, target.a); arrV = load(g, bt.elem, pv.r); }
+    else if (under(bt).kind == ast.TK.Array && under(bt).len >= 0 && isLvalue(target.a)) arrV = mkV(addrOf(g, target.a), bt);
+    else arrV = genExpr(g, target.a);
+    u := under(arrV.t);
+    elem := u.elem;
+    es := sizeOf(g, elem);
+    data := arrayDataPtr(g, arrV);
+    length := collectionLen(g, arrV);
+    v := n.b;
+    if (v.kind == ast.NK.Composite) {
+        vals := make([]V);
+        for (_, e := range v.list) vals.append(genAs(g, e.b, elem));
+        cnt := itoa(len(vals));
+        c := tmp(g); emit(g, c + " = icmp ugt i64 " + cnt + ", " + length);
+        bad := newLabel(g, "datalit"); ok := newLabel(g, "datafits");
+        condBr(g, c, bad, ok);
+        label(g, bad);
+        emit(g, "call void @oc_data_literal_bounds(i64 " + cnt + ", i64 " + length + ", i64 " + itoa(site(g, n)) + ")");
+        term(g, "unreachable");
+        label(g, ok);
+        bytes := tmp(g); emit(g, bytes + " = mul i64 " + length + ", " + itoa(es));
+        emit(g, "call void @llvm.memset.p0.i64(ptr " + data + ", i8 0, i64 " + bytes + ", i1 false)");
+        for (i, x := range vals) store(g, elem, gep(g, data, i * es), x);
+        return;
+    }
+    src := genExpr(g, v);
+    bytes := tmp(g); emit(g, bytes + " = mul i64 " + length + ", " + itoa(es));
+    emit(g, "call void @llvm.memmove.p0.p0.i64(ptr " + data + ", ptr " + src.r + ", i64 " + bytes + ", i1 false)");
+}
+
+// ---- composite literals ----
+
+func genComposite(g *Gen, n *ast.Node, t *ast.Type) V {
+    if (n.sem == ast.Sem.CallEnum) {
+        et := t;
+        p := alloca(g, et);
+        setTag(g, et, p, n.ival);
+        vs := g.c.VariantsOf(under(et));
+        v := vs[n.ival];
+        l := g.c.VariantLayout(under(et), n.ival);
+        base := gep(g, p, g.c.EnumPayloadOffset(under(et)));
+        for (_, e := range n.list) {
+            f := v.fields[e.ival];
+            store(g, f.ty, gep(g, base, l.places[e.ival].offset), genAs(g, e.b, f.ty));
+        }
+        return freshV(p, et);
+    }
+    u := under(t);
+    switch (u.kind) {
+    case ast.TK.Struct:
+        p := alloca(g, t);
+        zeroInto(g, t, p);
+        fs := g.c.FieldsOf(u);
+        l := g.c.StructLayoutOf(u);
+        for (_, e := range n.list) {
+            f := fs[e.ival];
+            val := genAs(g, e.b, f.ty);
+            place := l.places[e.ival];
+            if (f.bits > 0) writeBitfield(g, p, place, f.ty, val);
+            else store(g, f.ty, gep(g, p, place.offset), val);
+        }
+        return freshV(p, t);
+    case ast.TK.Array:
+        if (u.len < 0) {
+            blk := tmp(g);
+            emit(g, blk + " = call ptr @oc_block_new(i64 " + itoa(len(n.list)) + ", ptr " + desc(g, u.elem) + ")");
+            data := gep(g, blk, g.c.ArrayDataOffset(u.elem));
+            for (i, e := range n.list) store(g, u.elem, gep(g, data, i * sizeOf(g, u.elem)), genAs(g, e.b, u.elem));
+            return freshV(blk, t);
+        }
+        p := alloca(g, t);
+        zeroInto(g, t, p);
+        data := gep(g, p, g.c.ArrayDataOffset(u.elem));
+        es := sizeOf(g, u.elem);
+        for (i, e := range n.list) store(g, u.elem, gep(g, data, i * es), genAs(g, e.b, u.elem));
+        return freshV(p, t);
+    case ast.TK.Buffer:
+        es := sizeOf(g, u.elem);
+        if (u.len > 0) {
+            p := alloca(g, t);
+            zeroInto(g, t, p);
+            for (i, e := range n.list) store(g, u.elem, gep(g, p, i * es), genAs(g, e.b, u.elem));
+            return freshV(p, t);
+        }
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_alloc(i64 " + itoa(es * len(n.list)) + ")");
+        for (i, e := range n.list) store(g, u.elem, gep(g, r, i * es), genAs(g, e.b, u.elem));
+        return freshV(r, t);
+    case ast.TK.Dyn:
+        es := sizeOf(g, u.elem);
+        vals := make([]V);
+        for (_, e := range n.list) vals.append(genAs(g, e.b, u.elem));
+        if (len(vals) == 0) return freshV("null", t);
+        arr := tmp(g);
+        emit(g, arr + " = call ptr @oc_arr_new(i64 " + itoa(len(vals)) + ", i64 " + itoa(es) + ", i64 0)");
+        data := tmp(g);
+        emit(g, data + " = call ptr @oc_arr_data(ptr " + arr + ")");
+        for (i, v := range vals) store(g, u.elem, gep(g, data, i * es), v);
+        return freshV(arr, t);
+    case ast.TK.Map:
+        slot := alloca(g, t);
+        emit(g, "store ptr null, ptr " + slot);
+        for (_, e := range n.list) {
+            k := genAs(g, e.a, u.key);
+            v := genAs(g, e.b, u.elem);
+            emit(g, "call void @oc_map_set(ptr " + slot + ", ptr " + spill(g, k) + ", ptr " + spill(g, v) + ", ptr " + desc(g, u.key) + ", ptr " + desc(g, u.elem) + ")");
+        }
+        r := tmp(g); emit(g, r + " = load ptr, ptr " + slot);
+        return freshV(r, t);
+    }
+    fail(g, n, "unsupported composite literal");
+    return mkV("undef", t);
+}
+
+// ---- casts ----
+
+func genCast(g *Gen, n *ast.Node, t *ast.Type) V {
+    v := genExpr(g, n.a);
+    st := v.t;
+    us := under(st); ut := under(t);
+    if (n.sem == ast.Sem.CallIface) {
+        // a boxed primitive cast: assert the dynamic type, then convert
+        return assertValue(g, n, v, t, false);
+    }
+    if (check.Identical(st, t)) return v;
+    if ((us.kind == ast.TK.Int || us.kind == ast.TK.Float || us.kind == ast.TK.Bool) && (ut.kind == ast.TK.Int || ut.kind == ast.TK.Float || ut.kind == ast.TK.Bool)) {
+        return mkV(numConv(g, v.r, us, ut), t);
+    }
+    if (us.kind == ast.TK.Int && (ut.kind == ast.TK.Ptr || ut.kind == ast.TK.Buffer || ut.kind == ast.TK.Array)) {
+        x := intConv(g, v.r, us, check.TInt());
+        r := tmp(g); emit(g, r + " = inttoptr i64 " + x + " to ptr");
+        if (ut.kind == ast.TK.Array && ut.len >= 0) return mkV(r, t);
+        return mkV(r, t);
+    }
+    if ((us.kind == ast.TK.Ptr || us.kind == ast.TK.Buffer || us.kind == ast.TK.Array) && ut.kind == ast.TK.Int) {
+        p := us.kind == ast.TK.Array && us.len >= 0 ? v.r : v.r;
+        r := tmp(g); emit(g, r + " = ptrtoint ptr " + p + " to i64");
+        return mkV(intConv(g, r, check.TInt(), ut), t);
+    }
+    if ((us.kind == ast.TK.String && ut.kind == ast.TK.Dyn) || (us.kind == ast.TK.Dyn && ut.kind == ast.TK.String)) return conv(g, v, t);
+    if (ut.kind == ast.TK.Array && ut.len >= 0 && (us.kind == ast.TK.Buffer || us.kind == ast.TK.Ptr)) {
+        // view raw storage as an array value: build a block copy of N elements
+        p := alloca(g, t);
+        zeroInto(g, t, p);
+        memcpy(g, gep(g, p, g.c.ArrayDataOffset(ut.elem)), v.r, ut.len * sizeOf(g, ut.elem));
+        return freshV(p, t);
+    }
+    if (ut.kind == ast.TK.Array && ut.len < 0 && (us.kind == ast.TK.Buffer || us.kind == ast.TK.Ptr) && !nilN(t.lenNode)) {
+        cnt := genAs(g, t.lenNode, check.TInt());
+        blk := tmp(g);
+        emit(g, blk + " = call ptr @oc_block_new(i64 " + cnt.r + ", ptr " + desc(g, ut.elem) + ")");
+        bytes := tmp(g); emit(g, bytes + " = mul i64 " + cnt.r + ", " + itoa(sizeOf(g, ut.elem)));
+        emit(g, "call void @llvm.memcpy.p0.p0.i64(ptr " + gep(g, blk, g.c.ArrayDataOffset(ut.elem)) + ", ptr " + v.r + ", i64 " + bytes + ", i1 false)");
+        return freshV(blk, t);
+    }
+    if (us.kind == ast.TK.Union && (ut.kind == ast.TK.Int || ut.kind == ast.TK.Float || ut.kind == ast.TK.Bool)) return assertValue(g, n, v, t, true);
+    // representation-compatible values (defined types, pointers, buffers, layouts)
+    v2 := conv(g, v, t);
+    v2.t = t;
+    return v2;
+}
+
+// ---- assertions ----
+
+func genAssert(g *Gen, n *ast.Node, t *ast.Type) V {
+    v := genExpr(g, n.a);
+    if (under(v.t).kind == ast.TK.Enum) return genExtract(g, n, v, t);
+    target := sub(g, n.tyAlt);
+    if (n.flag2) return assertOk(g, n, v, target);
+    return assertValue(g, n, v, target, false);
+}
+
+// typeTest emits an i1 testing whether descriptor d matches target.
+func typeTest(g *Gen, d string, target *ast.Type) string {
+    u := under(target);
+    if (target.kind == ast.TK.Interface || target.kind == ast.TK.Union || target.kind == ast.TK.Family ||
+        (u.kind == ast.TK.Buffer && (nilT(u.elem) || u.len == -2)) || (u.kind == ast.TK.Array && u.len < 0) || (u.kind == ast.TK.Dyn && u.isMixed) ||
+        (u.kind == ast.TK.Dyn && check.IsAny(u.elem))) {
+        if (check.IsAny(target)) { r := tmp(g); emit(g, r + " = icmp ne ptr " + d + ", null"); return r; }
+        r := tmp(g);
+        emit(g, r + " = call i1 " + matcherFor(g, target) + "(ptr " + d + ")");
+        return r;
+    }
+    r := tmp(g);
+    emit(g, r + " = icmp eq ptr " + d + ", " + desc(g, target));
+    return r;
+}
+
+// unboxAs converts boxed data to the target type (after a successful test).
+func unboxAs(g *Gen, d string, data string, iv V, target *ast.Type) V {
+    u := under(target);
+    if (target.kind == ast.TK.Interface || target.kind == ast.TK.Union) { x := iv; x.t = target; return x; }
+    if (u.kind == ast.TK.Dyn && (u.isMixed || check.IsAny(u.elem))) {
+        r := tmp(g); emit(g, r + " = call ptr @oc_box_elements(ptr " + d + ", ptr " + data + ")");
+        return freshV(r, target);
+    }
+    if (u.kind == ast.TK.Array && u.len < 0 && check.IsAny(u.elem)) {
+        r := tmp(g); emit(g, r + " = call ptr @oc_box_elements_block(ptr " + d + ", ptr " + data + ")");
+        return freshV(r, target);
+    }
+    if (u.kind == ast.TK.Array && u.len < 0) {
+        r := tmp(g); emit(g, r + " = call ptr @oc_block_copy(ptr " + data + ", ptr " + desc(g, u.elem) + ")");
+        return freshV(r, target);
+    }
+    if (u.kind == ast.TK.Buffer && u.len <= 0) {
+        // boxed buffers: a sized buffer's data is its storage; unsized holds a pointer
+        return mkV(data, target);
+    }
+    return copyV(g, load(g, target, data));
+}
+
+func assertValue(g *Gen, n *ast.Node, iv V, target *ast.Type, convertNumeric bool) V {
+    if (convertNumeric) {
+        // dispatch over the union's numeric terms
+        terms := unionTerms(g, iv.t);
+        slot := alloca(g, target);
+        done := newLabel(g, "cvt");
+        d := extract(g, iv.r, 0); data := extract(g, iv.r, 1);
+        for (_, term := range terms) {
+            yes := newLabel(g, "cvty"); no := newLabel(g, "cvtn");
+            c := tmp(g); emit(g, c + " = icmp eq ptr " + d + ", " + desc(g, term));
+            condBr(g, c, yes, no);
+            label(g, yes);
+            x := load(g, term, data);
+            store(g, target, slot, mkV(numConv(g, x.r, term, target), target));
+            br(g, done);
+            label(g, no);
+        }
+        term(g, "call void @llvm.trap()\n  unreachable");
+        label(g, done);
+        return load(g, target, slot);
+    }
+    d := extract(g, iv.r, 0); data := extract(g, iv.r, 1);
+    ok := typeTest(g, d, target);
+    yes := newLabel(g, "asserted"); no := newLabel(g, "badassert");
+    condBr(g, ok, yes, no);
+    label(g, no);
+    term(g, "call void @llvm.trap()\n  unreachable");
+    label(g, yes);
+    return unboxAs(g, d, data, iv, target);
+}
+
+func assertOk(g *Gen, n *ast.Node, iv V, target *ast.Type) V {
+    rts := make([]*ast.Type);
+    rts.append(target); rts.append(check.TBool());
+    tt := tupleType(rts);
+    out := alloca(g, tt);
+    vslot := gep(g, out, tupleOffset(g, rts, 0));
+    okslot := gep(g, out, tupleOffset(g, rts, 1));
+    zeroInto(g, target, vslot);
+    emit(g, "store i1 false, ptr " + okslot);
+    d := extract(g, iv.r, 0); data := extract(g, iv.r, 1);
+    c := typeTest(g, d, target);
+    yes := newLabel(g, "okyes"); done := newLabel(g, "okdone");
+    condBr(g, c, yes, done);
+    label(g, yes);
+    store(g, target, vslot, unboxAs(g, d, data, iv, target));
+    emit(g, "store i1 true, ptr " + okslot);
+    br(g, done);
+    label(g, done);
+    return freshV(out, tt);
+}
+
+// genExtract implements enum payload extraction e.(E.V).
+func genExtract(g *Gen, n *ast.Node, ev V, t *ast.Type) V {
+    et := ev.t;
+    vs := g.c.VariantsOf(under(et));
+    v := vs[n.ival];
+    tag := tagOf(g, ev);
+    c := tmp(g); emit(g, c + " = icmp eq i64 " + tag + ", " + itoa(n.ival));
+    yes := newLabel(g, "variant"); no := newLabel(g, "wrongvariant");
+    condBr(g, c, yes, no);
+    label(g, no);
+    term(g, "call void @llvm.trap()\n  unreachable");
+    label(g, yes);
+    fs := g.c.VariantFields(v);
+    l := g.c.VariantLayout(under(et), n.ival);
+    base := gep(g, ev.r, g.c.EnumPayloadOffset(under(et)));
+    if (v.vkind == 3 || (v.vkind == 1 && len(fs) == 1)) return copyV(g, load(g, fs[0].ty, base));
+    if (v.vkind == 2 && n.flag) {
+        // named bindings: a tuple in the order of the binding list
+        if (len(n.list) == 1) { e := n.list[0]; return copyV(g, load(g, fs[e.ival].ty, gep(g, base, l.places[e.ival].offset))); }
+        rts := make([]*ast.Type);
+        for (_, e := range n.list) rts.append(fs[e.ival].ty);
+        tt := tupleType(rts);
+        out := alloca(g, tt);
+        for (i, e := range n.list) store(g, rts[i], gep(g, out, tupleOffset(g, rts, i)), copyV(g, load(g, fs[e.ival].ty, gep(g, base, l.places[e.ival].offset))));
+        return freshV(out, tt);
+    }
+    if (v.vkind == 2) {
+        // record payload snapshot: same layout as the payload struct
+        p := alloca(g, t);
+        memcpy(g, p, base, sizeOf(g, t));
+        return copyV(g, mkV(p, t));
+    }
+    rts := make([]*ast.Type);
+    for (_, f := range fs) rts.append(f.ty);
+    tt := tupleType(rts);
+    out := alloca(g, tt);
+    for (i, f := range fs) store(g, f.ty, gep(g, out, tupleOffset(g, rts, i)), copyV(g, load(g, f.ty, gep(g, base, l.places[i].offset))));
+    return freshV(out, tt);
+}
+
+// ---- closures ----
+
+func genFuncLit(g *Gen, n *ast.Node, t *ast.Type) V {
+    name := literalRef(g, n);
+    k := len(n.syms);
+    env := tmp(g);
+    emit(g, env + " = call ptr @oc_alloc(i64 " + itoa(k * 8) + ")");
+    for (i, s := range n.syms) {
+        p := storageOf(g, s, n);
+        emit(g, "store ptr " + p + ", ptr " + gep(g, env, i * 8));
+    }
+    return pair(g, name, env, t);
+}

@@ -1,0 +1,647 @@
+package backend;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+func genBlock(g *Gen, n *ast.Node) {
+    if (nilN(n)) return;
+    if (n.kind != ast.NK.Block) { genStmt(g, n); return; }
+    for (_, s := range n.list) genStmt(g, s);
+}
+
+func genStmt(g *Gen, n *ast.Node) {
+    switch (n.kind) {
+    case ast.NK.Block: genBlock(g, n);
+    case ast.NK.Empty, ast.NK.Struct, ast.NK.Enum, ast.NK.Interface, ast.NK.TypeDecl:
+    case ast.NK.VarDecl: genVarDecl(g, n);
+    case ast.NK.ExprStmt: genExpr(g, n.a);
+    case ast.NK.If: genIf(g, n);
+    case ast.NK.For: genFor(g, n);
+    case ast.NK.ForRange: genRange(g, n);
+    case ast.NK.Switch: genSwitch(g, n);
+    case ast.NK.TypeSwitch: genTypeSwitch(g, n);
+    case ast.NK.Match: genMatch(g, n);
+    case ast.NK.Return: genReturn(g, n);
+    case ast.NK.ReturnPanic:
+        m := genAs(g, n.a, check.TString());
+        setSite(g, n);
+        emit(g, "call void @oc_return_panic(ptr " + m.r + ", i64 " + itoa(site(g, n)) + ")");
+        term(g, "unreachable");
+    case ast.NK.Panic:
+        m := genAs(g, n.a, check.TString());
+        setSite(g, n);
+        emit(g, "call void @oc_panic(ptr " + m.r + ", i64 " + itoa(site(g, n)) + ")");
+        term(g, "unreachable");
+    case ast.NK.Forward:
+        g.fn.forward++;
+        genStmt(g, n.a);
+        g.fn.forward--;
+    case ast.NK.Defer: genDefer(g, n);
+    case ast.NK.Labeled:
+        l := labelFor(g, n.name);
+        label(g, l);
+        g.fn.pendingLabel = n;
+        genStmt(g, n.a);
+    case ast.NK.Break:
+        target := findLoop(g, n, false);
+        if (target != "") br(g, target);
+    case ast.NK.Continue:
+        target := findLoop(g, n, true);
+        if (target != "") br(g, target);
+    case ast.NK.Goto:
+        if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
+        br(g, labelFor(g, n.name));
+    case ast.NK.Fallthrough:
+        if (len(g.fn.fallLabels) > 0) br(g, g.fn.fallLabels[len(g.fn.fallLabels) - 1]);
+    case ast.NK.Asm: genAsm(g, n);
+    case ast.NK.Func: fail(g, n, "nested named functions are not supported");
+    default: fail(g, n, "unsupported statement");
+    }
+}
+
+func labelFor(g *Gen, name string) string {
+    l, ok := g.fn.labels[name];
+    if (ok) return l;
+    l = "L." + mangle(name) + "." + itoa(len(g.fn.labels));
+    g.fn.labels[name] = l;
+    return l;
+}
+
+func findLoop(g *Gen, n *ast.Node, cont bool) string {
+    for (i := len(g.fn.loops) - 1; i >= 0; i--) {
+        lp := g.fn.loops[i];
+        if (!nilN(n.ref) && lp.node != n.ref) continue;
+        if (cont) { if (lp.cont == "") continue; return lp.cont; }
+        return lp.brk;
+    }
+    fail(g, n, "branch target not found");
+    return "";
+}
+
+func pushLoop(g *Gen, n *ast.Node, brk string, cont string) {
+    lp := new(Loop);
+    lp.node = n; lp.brk = brk; lp.cont = cont;
+    g.fn.loops.append(lp);
+}
+func popLoop(g *Gen) { g.fn.loops.pop(); }
+
+func genVarDecl(g *Gen, n *ast.Node) {
+    names := n.list; values := n.list2;
+    if (len(values) == 1 && len(names) > 1) {
+        tv := genExpr(g, values[0]);
+        rts := under(tv.t).results;
+        for (i, id := range names) {
+            if (nilS(id.sym)) continue;
+            vt := sub(g, id.sym.ty);
+            v := copyV(g, conv(g, load(g, rts[i], gep(g, tv.r, tupleOffset(g, rts, i))), vt));
+            p := localStorage(g, id.sym, vt);
+            store(g, vt, p, v);
+        }
+        return;
+    }
+    if (len(values) == 0) {
+        for (_, id := range names) {
+            if (nilS(id.sym)) continue;
+            vt := sub(g, id.sym.ty);
+            u := under(vt);
+            p := localStorage(g, id.sym, vt);
+            if (u.kind == ast.TK.Array && u.len == -1 && !nilN(vt.lenNode)) {
+                cnt := genAs(g, vt.lenNode, check.TInt());
+                blk := tmp(g);
+                emit(g, blk + " = call ptr @oc_block_new(i64 " + cnt.r + ", ptr " + desc(g, u.elem) + ")");
+                emit(g, "store ptr " + blk + ", ptr " + p);
+                continue;
+            }
+            if (u.kind == ast.TK.Buffer && u.len == -1 && !nilN(vt.lenNode)) {
+                cnt := genAs(g, vt.lenNode, check.TInt());
+                bytes := tmp(g); emit(g, bytes + " = mul i64 " + cnt.r + ", " + itoa(sizeOf(g, u.elem)));
+                b := tmp(g); emit(g, b + " = call ptr @oc_alloc(i64 " + bytes + ")");
+                emit(g, "store ptr " + b + ", ptr " + p);
+                continue;
+            }
+            zeroInto(g, vt, p);
+        }
+        return;
+    }
+    vals := make([]V);
+    for (i, v := range values) {
+        id := names[i];
+        vt := nilS(id.sym) ? typeOf(g, v) : sub(g, id.sym.ty);
+        x := genAs(g, v, vt);
+        if (isAgg(x.t) && len(values) > 1) x = copyIntoTemp(g, x);
+        vals.append(x);
+    }
+    for (i, id := range names) {
+        if (nilS(id.sym)) continue;
+        vt := sub(g, id.sym.ty);
+        p := localStorage(g, id.sym, vt);
+        store(g, vt, p, conv(g, vals[i], vt));
+    }
+}
+
+func genIf(g *Gen, n *ast.Node) {
+    if (!nilN(n.a)) genStmt(g, n.a);
+    c := genExpr(g, n.b);
+    yes := newLabel(g, "if"); no := newLabel(g, "else"); done := newLabel(g, "fi");
+    condBr(g, c.r, yes, nilN(n.d) ? done : no);
+    label(g, yes);
+    genStmt(g, n.c);
+    br(g, done);
+    if (!nilN(n.d)) { label(g, no); genStmt(g, n.d); br(g, done); }
+    label(g, done);
+}
+
+func genFor(g *Gen, n *ast.Node) {
+    if (!nilN(n.a)) genStmt(g, n.a);
+    head := newLabel(g, "for"); body := newLabel(g, "loop"); post := newLabel(g, "post"); done := newLabel(g, "endfor");
+    if (n.flag) br(g, body); else br(g, head);
+    label(g, head);
+    if (!nilN(n.b)) { c := genExpr(g, n.b); condBr(g, c.r, body, done); }
+    else br(g, body);
+    label(g, body);
+    if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
+    pushLoop(g, loopNode(g, n), done, post);
+    genStmt(g, n.d);
+    popLoop(g);
+    br(g, post);
+    label(g, post);
+    if (!nilN(n.c)) genExpr(g, n.c);
+    br(g, head);
+    label(g, done);
+}
+
+// loopNode returns the node break/continue labels refer to (the loop itself).
+func loopNode(g *Gen, n *ast.Node) *ast.Node { return n; }
+
+func genRange(g *Gen, n *ast.Node) {
+    cv := genExpr(g, n.a);
+    if (isAgg(cv.t) && !cv.fresh) cv = copyV(g, cv);
+    u := under(cv.t);
+    idx := alloca(g, check.TInt());
+    emit(g, "store i64 0, ptr " + idx);
+    keys := ""; vals := "";
+    kt := check.TInt(); vt := zero(*ast.Type);
+    count := "";
+    data := "";
+    if (u.kind == ast.TK.Map) {
+        ks := alloca(g, check.TVoidPtr()); vs := alloca(g, check.TVoidPtr());
+        emit(g, "call void @oc_map_snapshot(ptr " + cv.r + ", ptr " + desc(g, u.key) + ", ptr " + desc(g, u.elem) + ", ptr " + ks + ", ptr " + vs + ")");
+        keys = tmp(g); emit(g, keys + " = load ptr, ptr " + ks);
+        vals = tmp(g); emit(g, vals + " = load ptr, ptr " + vs);
+        count = tmp(g); emit(g, count + " = call i64 @oc_arr_len(ptr " + keys + ")");
+        kt = u.key; vt = u.elem;
+    } else {
+        vt = u.kind == ast.TK.String ? check.TI8() : u.elem;
+        count = collectionLen(g, cv);
+        if (u.kind == ast.TK.Buffer) data = cv.r; else data = arrayDataPtr(g, cv);
+    }
+    head := newLabel(g, "range"); body := newLabel(g, "rbody"); post := newLabel(g, "rpost"); done := newLabel(g, "rdone");
+    br(g, head);
+    label(g, head);
+    i := tmp(g); emit(g, i + " = load i64, ptr " + idx);
+    c := tmp(g); emit(g, c + " = icmp slt i64 " + i + ", " + count);
+    condBr(g, c, body, done);
+    label(g, body);
+    if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
+    b0 := n.list[0];
+    if (!nilS(b0.sym)) {
+        p := localStorage(g, b0.sym, kt);
+        if (u.kind == ast.TK.Map) {
+            kd := tmp(g); emit(g, kd + " = call ptr @oc_arr_data(ptr " + keys + ")");
+            store(g, kt, p, copyV(g, load(g, kt, gepDyn(g, kd, i, sizeOf(g, kt)))));
+        } else emit(g, "store i64 " + i + ", ptr " + p);
+    }
+    if (len(n.list) > 1 && !nilS(n.list[1].sym)) {
+        p := localStorage(g, n.list[1].sym, vt);
+        src := "";
+        if (u.kind == ast.TK.Map) { vd := tmp(g); emit(g, vd + " = call ptr @oc_arr_data(ptr " + vals + ")"); src = gepDyn(g, vd, i, sizeOf(g, vt)); }
+        else src = gepDyn(g, data, i, sizeOf(g, vt));
+        store(g, vt, p, copyV(g, load(g, vt, src)));
+    }
+    pushLoop(g, n, done, post);
+    genStmt(g, n.d);
+    popLoop(g);
+    br(g, post);
+    label(g, post);
+    i2 := tmp(g); emit(g, i2 + " = add i64 " + i + ", 1");
+    emit(g, "store i64 " + i2 + ", ptr " + idx);
+    br(g, head);
+    label(g, done);
+}
+
+func genSwitch(g *Gen, n *ast.Node) {
+    if (!nilN(n.a)) genStmt(g, n.a);
+    tag: V;
+    hasTag := !nilN(n.b);
+    if (hasTag) { tag = genExpr(g, n.b); if (isAgg(tag.t) && !tag.fresh) tag = copyV(g, tag); }
+    done := newLabel(g, "endswitch");
+    bodies := make([]string);
+    for (i := 0; i < len(n.list); i++) bodies.append(newLabel(g, "case"));
+    defaultIdx := -1;
+    for (i, cl := range n.list) {
+        if (cl.flag) { defaultIdx = i; continue; }
+        for (_, e := range cl.list) {
+            next := newLabel(g, "test");
+            c := "";
+            if (hasTag) {
+                ev := conv(g, genExpr(g, e), tag.t);
+                fake := new(ast.Node);
+                fake.kind = ast.NK.Binary; fake.op = scanner.Kind.EqEq; fake.a = n.b; fake.b = e;
+                c = equality(g, fake, tag, ev);
+            } else c = genExpr(g, e).r;
+            condBr(g, c, bodies[i], next);
+            label(g, next);
+        }
+    }
+    if (defaultIdx >= 0) br(g, bodies[defaultIdx]); else br(g, done);
+    pushLoop(g, n, done, "");
+    for (i, cl := range n.list) {
+        label(g, bodies[i]);
+        fall := i + 1 < len(bodies) ? bodies[i + 1] : done;
+        g.fn.fallLabels.append(fall);
+        for (_, s := range cl.list2) genStmt(g, s);
+        g.fn.fallLabels.pop();
+        br(g, done);
+    }
+    popLoop(g);
+    label(g, done);
+}
+
+func genTypeSwitch(g *Gen, n *ast.Node) {
+    if (!nilN(n.a)) genStmt(g, n.a);
+    sv := genExpr(g, n.b);
+    iv := sv;
+    if (under(sv.t).kind != ast.TK.Interface && under(sv.t).kind != ast.TK.Union) iv = box(g, sv);
+    d := extract(g, iv.r, 0);
+    data := extract(g, iv.r, 1);
+    done := newLabel(g, "endtswitch");
+    bodies := make([]string);
+    for (i := 0; i < len(n.list); i++) bodies.append(newLabel(g, "tcase"));
+    defaultIdx := -1;
+    for (i, cl := range n.list) {
+        if (cl.flag) { defaultIdx = i; continue; }
+        for (_, ct := range cl.types) {
+            next := newLabel(g, "ttest");
+            t := sub(g, ct);
+            c := "";
+            if (check.IsAny(t)) { c = "true"; }
+            else c = typeTest(g, d, t);
+            condBr(g, c, bodies[i], next);
+            label(g, next);
+        }
+    }
+    if (defaultIdx >= 0) br(g, bodies[defaultIdx]); else br(g, done);
+    pushLoop(g, n, done, "");
+    for (i, cl := range n.list) {
+        label(g, bodies[i]);
+        if (!nilS(cl.sym)) {
+            bt := sub(g, cl.sym.ty);
+            p := localStorage(g, cl.sym, bt);
+            if (under(bt).kind == ast.TK.Interface || under(bt).kind == ast.TK.Union) store(g, bt, p, mkV(iv.r, bt));
+            else store(g, bt, p, unboxAs(g, d, data, iv, bt));
+        }
+        for (_, s := range cl.list2) genStmt(g, s);
+        br(g, done);
+    }
+    popLoop(g);
+    label(g, done);
+}
+
+func genMatch(g *Gen, n *ast.Node) {
+    sv := genExpr(g, n.a);
+    if (!sv.fresh) sv = copyV(g, sv);
+    et := sv.t;
+    tag := tagOf(g, sv);
+    done := newLabel(g, "endmatch");
+    vs := g.c.VariantsOf(under(et));
+    pushLoop(g, n, done, "");
+    defaultArm := zero(*ast.Node);
+    for (_, arm := range n.list) {
+        p := arm.a;
+        if (p.name == "") { defaultArm = arm; continue; }
+        yes := newLabel(g, "arm"); next := newLabel(g, "narm");
+        c := tmp(g); emit(g, c + " = icmp eq i64 " + tag + ", " + itoa(p.labelId));
+        condBr(g, c, yes, next);
+        label(g, yes);
+        v := vs[p.labelId];
+        fs := g.c.VariantFields(v);
+        l := g.c.VariantLayout(under(et), p.labelId);
+        base := gep(g, sv.r, g.c.EnumPayloadOffset(under(et)));
+        if (p.ival == 1) {
+            for (i, b := range p.list) {
+                if (nilS(b.sym)) continue;
+                ft := fs[i].ty;
+                slot := localStorage(g, b.sym, ft);
+                store(g, ft, slot, copyV(g, load(g, ft, gep(g, base, l.places[i].offset))));
+            }
+        } else if (p.ival == 2) {
+            for (_, b := range p.list) {
+                if (nilS(b.sym)) continue;
+                ft := fs[b.ival].ty;
+                slot := localStorage(g, b.sym, ft);
+                store(g, ft, slot, copyV(g, load(g, ft, gep(g, base, l.places[b.ival].offset))));
+            }
+        }
+        genStmt(g, arm.b);
+        br(g, done);
+        label(g, next);
+    }
+    if (!nilN(defaultArm)) genStmt(g, defaultArm.b);
+    br(g, done);
+    popLoop(g);
+    label(g, done);
+}
+
+func genReturn(g *Gen, n *ast.Node) {
+    f := g.fn;
+    rts := f.resultTypes;
+    if (len(n.list) == 0) { br(g, "exit"); return; }
+    vals := make([]V);
+    if (n.flag2) {
+        tv := genExpr(g, n.list[0]);
+        trs := under(tv.t).results;
+        for (i, rt := range trs) vals.append(copyV(g, conv(g, load(g, rt, gep(g, tv.r, tupleOffset(g, trs, i))), rts[i])));
+    } else {
+        for (i, v := range n.list) {
+            x := genAs(g, v, rts[i]);
+            if (isAgg(x.t) && len(n.list) > 1) x = copyIntoTemp(g, x);
+            vals.append(x);
+        }
+    }
+    for (i, v := range vals) {
+        if (f.hasDefer) storeVolatile(g, rts[i], f.resultSlots[i], conv(g, v, rts[i]));
+        else store(g, rts[i], f.resultSlots[i], conv(g, v, rts[i]));
+    }
+    br(g, "exit");
+}
+
+// ---- defer ----
+
+// deferItem is one value captured at the defer site.
+struct deferItem { ty string; size int; agg bool; ot *ast.Type; }
+
+// genDefer captures the callee and arguments now and registers a thunk record.
+func genDefer(g *Gen, n *ast.Node) {
+    c := n.a;
+    items := make([]V);
+    callee := "";
+    ft := zero(*ast.Type);
+    lead := "null";
+    kind := 0; // 0 direct name, 1 closure value, 2 interface method, 3 extern, 4 builtin recover, 5 method
+    recvIdx := -1;
+    switch (c.sem) {
+    case ast.Sem.CallFunc, ast.Sem.CallIntrinsic:
+        ft = c.sym.ty;
+        if (len(c.targs) > 0) ft = check.Subst(ft, check.MakeEnv(c.sym.typeParams, c.targs));
+        callee = funcRef(g, c.sym, c.targs);
+    case ast.Sem.CallValue:
+        kind = 1;
+        fv := genExpr(g, c.a);
+        items.append(fv);
+        ft = under(fv.t);
+    case ast.Sem.CallMethod, ast.Sem.CallParamMethod:
+        kind = 5;
+        mem := memberOf(c);
+        rt := typeOf(g, mem.a);
+        base := rt; if (base.kind == ast.TK.Ptr) base = base.elem;
+        m := c.sym;
+        if (c.sem == ast.Sem.CallParamMethod) {
+            if (base.kind == ast.TK.Interface) { kind = 2; }
+            else { mr := g.c.FindMethod(base, mem.text); m = mr.sym; }
+        }
+        if (kind == 5) {
+            callee = methodRef(g, m, base, c.targs);
+            ft = check.Subst(m.ty, check.MakeEnv(m.recvParams, base.args).Extend(m.typeParams, c.targs));
+            if (m.recvPtr) {
+                if (rt.kind == ast.TK.Ptr) items.append(genExpr(g, mem.a));
+                else items.append(mkV(addrOf(g, mem.a), check.PtrTo(base)));
+            } else {
+                rv: V;
+                if (rt.kind == ast.TK.Ptr) rv = copyV(g, load(g, rt.elem, genExpr(g, mem.a).r));
+                else rv = copyV(g, genExpr(g, mem.a));
+                items.append(rv);
+            }
+            recvIdx = 0;
+        }
+    case ast.Sem.CallExtern:
+        kind = 3;
+    case ast.Sem.CallBuiltin:
+        if (c.text == "recover") kind = 4;
+        else { fail(g, n, "deferred builtin calls are not supported"); return; }
+    }
+    if (c.sem == ast.Sem.CallIface || kind == 2) {
+        kind = 2;
+        mem := memberOf(c);
+        iv := genExpr(g, mem.a);
+        if (iv.t.kind == ast.TK.Ptr) iv = load(g, iv.t.elem, iv.r);
+        items.append(iv);
+        ft = sub(g, mem.ty);
+        if (c.a.kind == ast.NK.Inst) ft = sub(g, c.a.ty);
+    }
+    if (kind == 3) {
+        // extern: evaluate arguments as values
+        for (i, a := range c.list) {
+            v := genExpr(g, a);
+            if (i < len(c.sym.ty.params)) v = conv(g, v, c.sym.ty.params[i]);
+            else v = promoteVariadic(g, v);
+            items.append(v);
+        }
+    } else if (kind != 4) {
+        argStart := len(items);
+        for (_, v := range argValues(g, c, ft)) items.append(v);
+        argStart = argStart + 0;
+    }
+    // record: {next, thunk, slot0, slot1, ...} with 16-byte slots
+    nslots := len(items);
+    rec := tmp(g);
+    emit(g, rec + " = call ptr @oc_alloc(i64 " + itoa(16 + nslots * 16) + ")");
+    for (i, v := range items) {
+        slot := gep(g, rec, 16 + i * 16);
+        if (isAgg(v.t) || (under(v.t).kind == ast.TK.Int && under(v.t).bits > 128)) {
+            h := tmp(g);
+            emit(g, h + " = call ptr @oc_alloc(i64 " + itoa(sizeOf(g, v.t)) + ")");
+            store(g, v.t, h, v);
+            emit(g, "store ptr " + h + ", ptr " + slot);
+        } else store(g, v.t, slot, v);
+    }
+    thunk := deferThunk(g, n, c, kind, callee, ft, items, recvIdx);
+    emit(g, "store ptr " + thunk + ", ptr " + gep(g, rec, 8));
+    fd := gep(g, g.fn.frame, 24);
+    old := tmp(g); emit(g, old + " = load ptr, ptr " + fd);
+    emit(g, "store ptr " + old + ", ptr " + rec);
+    emit(g, "store ptr " + rec + ", ptr " + fd);
+    lead = lead + "";
+}
+
+// argValues evaluates call arguments (packing variadics) as individual values.
+func argValues(g *Gen, n *ast.Node, ft *ast.Type) []V {
+    out := make([]V);
+    params := make([]*ast.Type);
+    for (_, p := range ft.params) params.append(sub(g, p));
+    fixed := len(params);
+    if (ft.variadic) fixed--;
+    if (n.flag2) {
+        tv := genExpr(g, n.list[0]);
+        rts := under(tv.t).results;
+        vals := make([]V);
+        for (i, rt := range rts) vals.append(load(g, rt, gep(g, tv.r, tupleOffset(g, rts, i))));
+        for (i := 0; i < fixed; i++) out.append(copyV(g, conv(g, vals[i], params[i])));
+        if (ft.variadic) {
+            extra := make([]V);
+            for (i := fixed; i < len(vals); i++) extra.append(vals[i]);
+            out.append(packVariadic(g, params[len(params) - 1], extra, zero(*ast.Node)));
+        }
+        return out;
+    }
+    for (i := 0; i < fixed && i < len(n.list); i++) out.append(argValue(g, n.list[i], params[i]));
+    if (ft.variadic) {
+        vt := params[len(params) - 1];
+        extra := make([]V);
+        spread := zero(*ast.Node);
+        for (i := fixed; i < len(n.list); i++) {
+            if (n.flag && i == len(n.list) - 1) { spread = n.list[i]; break; }
+            extra.append(genAs(g, n.list[i], under(vt).elem));
+        }
+        out.append(packVariadic(g, vt, extra, spread));
+    }
+    return out;
+}
+
+func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, ft *ast.Type, items []V, recvIdx int) string {
+    g.deferThunks++;
+    name := "@\"defer." + itoa(g.deferThunks) + "\"";
+    saved := g.fn;
+    f := newFn(g, saved.inst, name);
+    f.cur = "entry";
+    g.fn = f;
+    vals := make([]V);
+    for (i, v := range items) {
+        slot := gep(g, "%rec", 16 + i * 16);
+        if (isAgg(v.t) || (under(v.t).kind == ast.TK.Int && under(v.t).bits > 128)) {
+            h := tmp(g); emit(g, h + " = load ptr, ptr " + slot);
+            vals.append(load(g, v.t, h));
+        } else vals.append(load(g, v.t, slot));
+    }
+    if (kind == 4) {
+        out := alloca(g, check.TAny());
+        emit(g, "call void @oc_recover(ptr " + out + ")");
+    } else if (kind == 3) {
+        s := c.sym;
+        declareExtern(g, s);
+        eft := s.ty;
+        sig := cRet(eft.results) + " (";
+        for (i, p := range eft.params) { if (i > 0) sig += ", "; sig += cParam(p); }
+        if (eft.variadic) sig += len(eft.params) > 0 ? ", ..." : "...";
+        sig += ")";
+        args := "";
+        for (i, v := range vals) {
+            if (i > 0) args += ", ";
+            if (i < len(eft.params)) args += cParam(eft.params[i]) + " " + v.r;
+            else args += ll(v.t) + " " + v.r;
+        }
+        emit(g, "call " + sig + " @\"" + s.name + "\"(" + args + ")");
+    } else {
+        results := make([]*ast.Type);
+        for (_, r := range ft.results) results.append(sub(g, r));
+        lead := "null";
+        fn := callee;
+        start := 0;
+        prefix := "";
+        if (kind == 1) { fn = extract(g, vals[0].r, 0); lead = extract(g, vals[0].r, 1); start = 1; }
+        if (kind == 2) {
+            d := extract(g, vals[0].r, 0); data := extract(g, vals[0].r, 1);
+            fn = tmp(g);
+            emit(g, fn + " = call ptr @oc_method(ptr " + d + ", ptr " + methodName(g, memberOf(c).text) + ", i64 " + itoa(site(g, site0)) + ")");
+            prefix = ", ptr " + data;
+            start = 1;
+        }
+        if (kind == 5) { prefix = ", " + argText(g, vals[0]); start = 1; }
+        args := prefix;
+        for (i := start; i < len(vals); i++) args += ", " + argText(g, vals[i]);
+        call := "(ptr " + lead;
+        if (resultAgg(g, results)) { slot := alloca(g, resultStorage(g, results)); call += ", ptr " + slot; }
+        call += args + ")";
+        rl := retLL(g, results);
+        if (kind == 1) {
+            nf := tmp(g); emit(g, nf + " = icmp eq ptr " + fn + ", null");
+            bad := newLabel(g, "nofn"); ok := newLabel(g, "fn");
+            condBr(g, nf, bad, ok);
+            label(g, bad);
+            emit(g, "call void @oc_uninit_func(i64 " + itoa(site(g, site0)) + ")");
+            term(g, "unreachable");
+            label(g, ok);
+        }
+        if (rl == "void") emit(g, "call void " + fn + call);
+        else { r := tmp(g); emit(g, r + " = call " + rl + " " + fn + call); }
+    }
+    term(g, "ret void");
+    g.mod.Add("define internal void ").Add(name).Add("(ptr %rec) {\nentry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
+    g.fn = saved;
+    return name;
+}
+
+// ---- inline assembly ----
+
+func hostArch() string { return "x86_64"; }
+func hostPlatform() string { return "linux"; }
+
+func genAsm(g *Gen, n *ast.Node) {
+    if (g.wasm) { if (n.name != "wasm") return; }
+    else if (n.name != hostArch() || (n.text != "" && n.text != hostPlatform())) return;
+    x86 := n.name == "x86_64";
+    s := n.text2;
+    hash := n.name != "aarch64";
+    index: map[string]int;
+    order := make([]*ast.Node);
+    for (_, op := range n.list) { index[op.name] = len(order); order.append(op); }
+    b: util.Buf;
+    i := 0; quote: i8 = 0;
+    for (i < len(s)) {
+        ch := s[i];
+        nx: i8 = i + 1 < len(s) ? s[i + 1] : 0->i8;
+        if (quote == 0 && ch == '$' && nx == '{') {
+            j := i + 2;
+            for (j < len(s) && s[j] != '}') j++;
+            name := s[i + 2:j];
+            k, ok := index[name];
+            if (ok) { b.Add("$").AddInt(k); i = j + 1; continue; }
+        }
+        if (quote == 0 && ((ch == '/' && nx == '/') || (ch == '#' && hash))) {
+            for (i < len(s) && s[i] != '\n') { asmByte(&b, s[i]); i++; }
+            continue;
+        }
+        if (quote == 0 && ch == '/' && nx == '*') {
+            for (i < len(s) && !(s[i] == '*' && i + 1 < len(s) && s[i + 1] == '/')) { asmByte(&b, s[i]); i++; }
+            continue;
+        }
+        if (quote != 0) { if (ch == '\\' && i + 1 < len(s)) { asmByte(&b, ch); i++; ch = s[i]; } else if (ch == quote) quote = 0; }
+        else if (ch == '"' || ch == '\'') quote = ch;
+        asmByte(&b, ch);
+        i++;
+    }
+    cons := "";
+    for (k := 0; k < len(order); k++) cons += "=*m,";
+    for (k := 0; k < len(order); k++) cons += "*m,";
+    cons += "~{memory}";
+    if (x86) {
+        regs := []string{"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+        for (_, r := range regs) cons += ",~{" + r + "}";
+        for (k := 0; k < 16; k++) cons += ",~{xmm" + itoa(k) + "}";
+        cons += ",~{dirflag},~{fpsr},~{flags}";
+    }
+    args := "";
+    for (k := 0; k < len(order) * 2; k++) {
+        op := order[k % len(order)];
+        if (k > 0) args += ", ";
+        args += "ptr elementtype(" + ll(sub(g, op.ty)) + ") " + storageOf(g, op.sym, n);
+    }
+    emit(g, "call void asm sideeffect alignstack" + (x86 ? " inteldialect" : "") + " \"" + b.String() + "\\0A\", \"" + cons + "\"(" + args + ")");
+}
+
+func asmByte(b *util.Buf, ch i8) {
+    c := (ch -> int) & 255;
+    if (c == 36) { b.Add("$$"); return; }
+    if (c < 32 || c >= 127 || c == 34 || c == 92) { b.Add("\\"); b.Addc(util.HexDigit(c >> 4)); b.Addc(util.HexDigit(c)); return; }
+    b.Addc(ch);
+}

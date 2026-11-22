@@ -1,0 +1,183 @@
+package ast;
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+// Syntax node kinds. One Node struct with generic slots keeps traversal code
+// compact; each kind documents which slots it uses.
+enum NK {
+    Bad,
+    // file level
+    File,        // name=package, list=decls, list2=imports
+    Import,      // name=alias ("" default, "." dot, "_" blank), text=path
+    Func,        // name, list=params, list2=results, list3=type params, a=receiver(Param), b=body, flag=variadic, list4=receiver type args
+    Extern,      // name, a=result type (nil=void), list=params, flag=C variadic
+    Struct,      // name, list3=type params, list2=value params, list=fields
+    Enum,        // name, list3=type params, list=variants
+    Interface,   // name, list3=type params, list=method specs, a=type list (constraint)
+    TypeDecl,    // name, a=type, flag=alias
+    VarDecl,     // list=names (Ident/Blank), a=type, list2=values
+    Param,       // name ("" unnamed), a=type, flag=variadic
+    TypeParam,   // name, a=constraint (nil=any)
+    Field,       // name, a=type, ival=bit size (0 none)
+    Variant,     // name, ival=0 unit,1 tuple,2 record,3 fixed; list=tuple types or record fields; a=fixed value, b=fixed type
+    MethodSpec,  // name, list=params, list2=results, list3=type params, flag=variadic
+    // types
+    TPtr,        // a=elem
+    TArray,      // a=elem, b=dimension expr (nil when flag), flag=inferred [...]
+    TSlice,      // a=elem  ([]T)
+    TMixed,      // a=TSlice
+    TMap,        // a=key, b=value
+    TFunc,       // list=params, list2=results, flag=variadic
+    TBuffer,     // a=elem (nil for family), b=size expr
+    TVarint,     // ival=width, flag=signed
+    TInterface,  // list=method specs, a=type list
+    TStruct,     // list=fields (unsupported)
+    TUnion,      // list=terms
+    TTilde,      // a=type
+    // expressions
+    Ident,       // name
+    Blank,
+    IntLit,      // text, flag=char, ival=char value
+    FloatLit,    // text
+    StrLit,      // text (decoded)
+    Null,
+    Binary,      // op, a, b
+    Unary,       // op, a
+    PostInc,     // op (++/--), a
+    Assign,      // op (= or compound), a target, b value
+    MultiAssign, // list=targets, list2=values
+    Ternary,     // a cond, b then, c else
+    Comma,       // list
+    Call,        // a=callee, list=args, flag=last argument spread
+    Index,       // a, b
+    Slice,       // a, b=lo, c=hi
+    Member,      // a, name
+    Assert,      // a, b=type, list=record binding entries, flag=has binding body
+    TypeGuard,   // a  (x.(type))
+    Inst,        // a, list=type args
+    Composite,   // a=type (nil untyped), list=entries
+    Entry,       // a=key (nil positional), b=value
+    Cast,        // a, b=type
+    FuncLit,     // list=params, list2=results, b=body, flag=variadic
+    ExternRef,   // name
+    Zero,        // a=type
+    New,         // a=type
+    Make,        // a=type
+    Sizeof,      // a=operand (type or expression)
+    // statements
+    Block,       // list
+    ExprStmt,    // a
+    If,          // a=init, b=cond, c=then, d=else
+    For,         // a=init, b=cond, c=post, d=body, flag=defer first check, flag2=condition-only form
+    ForRange,    // list=bindings, a=expr, d=body
+    Switch,      // a=init, b=tag, list=clauses, flag2=had parentheses
+    TypeSwitch,  // a=init, name=binding, b=subject, list=clauses
+    Case,        // list=exprs, list2=body, flag=default
+    Match,       // a=subject, list=arms
+    Arm,         // a=pattern, b=statement
+    Pattern,     // a=enum ref, name=variant ("" default arm), list=bindings, ival=0 bare,1 tuple,2 record
+    Return,      // list=values
+    ReturnPanic, // a
+    Panic,       // a
+    Forward,     // a=statement
+    Defer,       // a=call
+    Labeled,     // name, a=statement
+    Break,       // name
+    Continue,    // name
+    Goto,        // name
+    Fallthrough,
+    Asm,         // name=arch, text=platform, list=operands? body in text2
+    Empty
+}
+
+struct Source {
+    path string;     // display path (relative to the working directory)
+    abs string;
+    text string;
+    tokens []*scanner.Token;
+    file *Node;
+    pkg *Package;
+    test bool;
+    index int;
+    // file-scoped bindings
+    imports map[string]*Symbol;
+    dotImports []*Package;
+    externs map[string]*Symbol;
+    importNodes []*Node;
+}
+
+struct Node {
+    kind NK;
+    src *Source;
+    line int;
+    col int;
+    off int;
+    end int;
+    name string;
+    text string;
+    text2 string;
+    op scanner.Kind;
+    a *Node;
+    b *Node;
+    c *Node;
+    d *Node;
+    list []*Node;
+    list2 []*Node;
+    list3 []*Node;
+    list4 []*Node;
+    flag bool;
+    flag2 bool;
+    flag3 bool;
+    ival int;
+    nameLine int;
+    nameCol int;
+    // semantic annotations
+    ty *Type;        // expression type after checking
+    sym *Symbol;     // resolved symbol (identifiers, declarations)
+    sem Sem;         // checker-defined classification
+    ref *Node;       // checker-defined link
+    targs []*Type;   // resolved type arguments (Inst, generic calls)
+    scope *Scope;
+    tyAlt *Type;     // secondary type (e.g. resolved type operand)
+    labelId int;
+    syms []*Symbol;  // captures (FuncLit), bindings
+    types []*Type;   // auxiliary types (e.g. per-binding types)
+    fixed bool;      // checker: value is a fresh temporary
+}
+
+func NewNode(k NK, t *scanner.Token, src *Source) *Node {
+    n := new(Node);
+    n.kind = k; n.src = src;
+    n.line = t.line; n.col = t.col; n.off = t.off; n.end = t.end;
+    return n;
+}
+
+func (n *Node) Pos() string {
+    return n.src.path + ":" + itoa(n.line) + ":" + itoa(n.col);
+}
+
+func itoa(v int) string {
+    if (v == 0) return "0";
+    neg := v < 0;
+    if (neg) v = -v;
+    out := make([]i8);
+    for (v > 0) { out.prepend(('0' + v % 10) -> i8); v = v / 10; }
+    if (neg) out.prepend('-');
+    return out -> string;
+}
+
+func Nil(n *Node) bool { return (n -> int) == 0; }
+func NilType(t *Type) bool { return (t -> int) == 0; }
+func NilSym(s *Symbol) bool { return (s -> int) == 0; }
+func NilPkg(p *Package) bool { return (p -> int) == 0; }
+
+// Semantic classification stored in Node.sem by the checker.
+enum Sem {
+    None,
+    LocalVar, GlobalVar, FuncValue, TypeName, PackageName, BuiltinName,
+    Field, PkgMember, Method, IfaceMethod, ArrayLength, ArrayCapacity, ArraySize, ArrayData,
+    EnumUnit, EnumSelector, EnumFixed, EnumRecordField,
+    CallFunc, CallMethod, CallIface, CallValue, CallExtern, CallBuiltin, CallEnum, CallIntrinsic,
+    CallParamMethod,
+    TypeExpr,
+    BitField
+}

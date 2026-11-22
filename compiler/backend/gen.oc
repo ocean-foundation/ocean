@@ -1,0 +1,462 @@
+package backend;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+// V is a generated value. Scalars are SSA operands; aggregates live in memory
+// and r is a pointer to their storage. fresh marks temporaries we own.
+struct V { r string; t *ast.Type; fresh bool; }
+
+struct Inst {
+    sym *ast.Symbol;       // function or method (nil for literals)
+    node *ast.Node;        // declaration or FuncLit
+    env *check.Env;
+    name string;
+    kind int;              // 0 function/method, 1 literal, 2 interface thunk
+    thunkPtr bool;         // thunk: box holds a pointer
+    recvType *ast.Type;    // methods: concrete receiver type
+}
+
+struct Loop { node *ast.Node; brk string; cont string; }
+
+struct Fn {
+    inst *Inst;
+    body *util.Buf;
+    allocas *util.Buf;
+    tmp int;
+    label int;
+    frame string;
+    hasDefer bool;
+    terminated bool;
+    locals map[int]string;     // symbol id -> storage pointer
+    loops []*Loop;
+    labels map[string]string;
+    resultTypes []*ast.Type;
+    resultSlots []string;
+    sret string;
+    exit string;
+    retLL string;
+    envParam string;
+    captureIndex map[int]int;
+    name string;
+    forward int;
+    switchBreaks []*Loop;
+    fallLabels []string;
+    cur string;
+    pendingLabel *ast.Node;
+}
+
+struct Gen {
+    c *check.Checker;
+    mod *util.Buf;
+    decls map[string]string;
+    declOrder []string;
+    globals *util.Buf;
+    fn *Fn;
+    env *check.Env;
+    strs map[string]string;
+    nstr int;
+    descs map[string]string;
+    descTypes []*ast.Type;
+    descDone int;
+    funcs map[string]*Inst;
+    queue []*Inst;
+    qpos int;
+    sites *util.Buf;
+    nsites int;
+    siteKeys map[string]int;
+    names map[string]string;   // interned method names
+    globalNames map[int]string;
+    nlit int;
+    matchers []*Matcher;
+    matcherKeys map[string]string;
+    usesThreads bool;
+    library bool;
+    deferThunks int;
+    errors int;
+    target string;
+    wasm bool;
+    fnNames map[string]string;
+    boxedTypes []*ast.Type;
+    boxedKeys map[string]bool;
+    ifaceCalls map[string]bool;
+    lastMethodCount int;
+    globalSyms []*ast.Symbol;
+    globalUsed map[int]bool;
+    ownedMemo map[string]bool;
+    initMemo map[string]bool;
+}
+
+struct Matcher { name string; term *ast.Type; tilde bool; }
+
+func NewGen(c *check.Checker) *Gen {
+    g := new(Gen);
+    g.c = c;
+    g.mod = util.NewBuf();
+    g.globals = util.NewBuf();
+    g.sites = util.NewBuf();
+    g.nsites = 1;
+    g.env = check.MakeEnv(make([]*ast.Symbol), make([]*ast.Type));
+    return g;
+}
+
+func nilT(t *ast.Type) bool { return (t -> int) == 0; }
+func nilN(n *ast.Node) bool { return (n -> int) == 0; }
+func nilS(s *ast.Symbol) bool { return (s -> int) == 0; }
+func itoa(n int) string { return util.Itoa(n); }
+
+// ---- types ----
+
+// sub applies the current generic environment.
+func sub(g *Gen, t *ast.Type) *ast.Type {
+    if (nilT(t)) return t;
+    return check.Subst(t, g.env);
+}
+
+func under(t *ast.Type) *ast.Type { return check.Underlying(t); }
+
+// isAgg reports whether a type is represented in memory rather than SSA.
+func isAgg(t *ast.Type) bool {
+    u := under(t);
+    switch (u.kind) {
+    case ast.TK.Struct, ast.TK.Enum, ast.TK.Tuple: return true;
+    case ast.TK.Array: return u.len >= 0;
+    case ast.TK.Buffer: return u.len > 0;
+    }
+    return false;
+}
+
+func isPair(t *ast.Type) bool {
+    u := under(t);
+    return u.kind == ast.TK.Interface || u.kind == ast.TK.Func || u.kind == ast.TK.Union;
+}
+
+// ll gives the SSA LLVM type of a scalar Ocean type ("ptr" for aggregates' addresses).
+func ll(t *ast.Type) string {
+    u := under(t);
+    switch (u.kind) {
+    case ast.TK.Bool: return "i1";
+    case ast.TK.Int: return "i" + itoa(u.bits);
+    case ast.TK.Float: return u.bits == 32 ? "float" : "double";
+    case ast.TK.Interface, ast.TK.Func, ast.TK.Union: return "{ptr, ptr}";
+    case ast.TK.Void: return "void";
+    }
+    return "ptr";
+}
+
+func sizeOf(g *Gen, t *ast.Type) int { return g.c.SizeOf(under(t)); }
+func alignOf(g *Gen, t *ast.Type) int { return g.c.AlignOf(under(t)); }
+
+func zeroLit(t *ast.Type) string {
+    u := under(t);
+    switch (u.kind) {
+    case ast.TK.Bool: return "false";
+    case ast.TK.Int: return "0";
+    case ast.TK.Float: return "0.0";
+    case ast.TK.Interface, ast.TK.Func, ast.TK.Union: return "zeroinitializer";
+    }
+    return "null";
+}
+
+// owned reports types needing deep copies (dynamic arrays and maps inside).
+func owned(g *Gen, t *ast.Type) bool {
+    u := under(t);
+    k := u.kind;
+    if (k != ast.TK.Struct && k != ast.TK.Enum && k != ast.TK.Array && k != ast.TK.Tuple && k != ast.TK.Buffer) return k == ast.TK.Dyn || k == ast.TK.Map;
+    key := check.TypeKey(u);
+    v, ok := g.ownedMemo[key];
+    if (ok) return v;
+    g.ownedMemo[key] = false;
+    v = owned1(g, u);
+    g.ownedMemo[key] = v;
+    return v;
+}
+func owned1(g *Gen, u *ast.Type) bool {
+    switch (u.kind) {
+    case ast.TK.Dyn, ast.TK.Map: return true;
+    case ast.TK.Array: return owned(g, u.elem);
+    case ast.TK.Buffer: return u.len > 0 && owned(g, u.elem);
+    case ast.TK.Struct:
+        for (_, f := range g.c.FieldsOf(u)) { if (owned(g, f.ty)) return true; }
+        return false;
+    case ast.TK.Enum:
+        for (_, v := range g.c.VariantsOf(u)) {
+            for (_, f := range g.c.VariantFields(v)) { if (owned(g, f.ty)) return true; }
+        }
+        return false;
+    case ast.TK.Tuple:
+        for (_, r := range u.results) { if (owned(g, r)) return true; }
+        return false;
+    }
+    return false;
+}
+
+// needsInit reports types whose zero value is not all-zero bytes (inline array headers).
+func needsInit(g *Gen, t *ast.Type) bool {
+    u := under(t);
+    k := u.kind;
+    if (k != ast.TK.Struct && k != ast.TK.Enum && k != ast.TK.Array && k != ast.TK.Tuple && k != ast.TK.Buffer) return false;
+    key := check.TypeKey(u);
+    v, ok := g.initMemo[key];
+    if (ok) return v;
+    v = needsInit1(g, u);
+    g.initMemo[key] = v;
+    return v;
+}
+func needsInit1(g *Gen, u *ast.Type) bool {
+    switch (u.kind) {
+    case ast.TK.Array: return u.len >= 0;
+    case ast.TK.Buffer: return u.len > 0 && needsInit(g, u.elem);
+    case ast.TK.Struct:
+        for (_, f := range g.c.FieldsOf(u)) { if (f.bits == 0 && needsInit(g, f.ty)) return true; }
+        return false;
+    case ast.TK.Tuple:
+        for (_, r := range u.results) { if (needsInit(g, r)) return true; }
+        return false;
+    case ast.TK.Enum:
+        vs := g.c.VariantsOf(u);
+        if (len(vs) > 0) { for (_, f := range g.c.VariantFields(vs[0])) { if (needsInit(g, f.ty)) return true; } }
+        return false;
+    }
+    return false;
+}
+
+// ---- emission helpers ----
+
+func emit(g *Gen, s string) {
+    if (g.fn.terminated) {
+        // unreachable code after a terminator gets its own block
+        g.fn.label++;
+        g.fn.body.Add("dead").AddInt(g.fn.label).Add(":\n");
+        g.fn.cur = "dead" + itoa(g.fn.label);
+        g.fn.terminated = false;
+    }
+    g.fn.body.Add("  ").Add(s).Add("\n");
+}
+func tmp(g *Gen) string { g.fn.tmp++; return "%t" + itoa(g.fn.tmp); }
+func newLabel(g *Gen, base string) string { g.fn.label++; return base + itoa(g.fn.label); }
+func label(g *Gen, l string) {
+    if (!g.fn.terminated) g.fn.body.Add("  br label %").Add(l).Add("\n");
+    g.fn.body.Add(l).Add(":\n");
+    g.fn.cur = l;
+    g.fn.terminated = false;
+}
+func br(g *Gen, l string) { emit(g, "br label %" + l); g.fn.terminated = true; }
+func condBr(g *Gen, c string, a string, b string) { emit(g, "br i1 " + c + ", label %" + a + ", label %" + b); g.fn.terminated = true; }
+func term(g *Gen, s string) { emit(g, s); g.fn.terminated = true; }
+
+func alloca(g *Gen, t *ast.Type) string {
+    r := tmp(g);
+    if (isAgg(t)) {
+        sz := sizeOf(g, t); al := alignOf(g, t);
+        if (sz == 0) sz = 1;
+        g.fn.allocas.Add("  ").Add(r).Add(" = alloca [").AddInt(sz).Add(" x i8], align ").AddInt(al < 1 ? 1 : al).Add("\n");
+    } else {
+        g.fn.allocas.Add("  ").Add(r).Add(" = alloca ").Add(ll(t)).Add(", align 8\n");
+    }
+    return r;
+}
+func allocaBytes(g *Gen, n int, al int) string {
+    r := tmp(g);
+    if (n <= 0) n = 1;
+    g.fn.allocas.Add("  ").Add(r).Add(" = alloca [").AddInt(n).Add(" x i8], align ").AddInt(al).Add("\n");
+    return r;
+}
+
+func gep(g *Gen, p string, off int) string {
+    if (off == 0) return p;
+    r := tmp(g);
+    emit(g, r + " = getelementptr inbounds i8, ptr " + p + ", i64 " + itoa(off));
+    return r;
+}
+func gepDyn(g *Gen, p string, idx string, scale int) string {
+    r := tmp(g);
+    if (scale == 1) { emit(g, r + " = getelementptr inbounds i8, ptr " + p + ", i64 " + idx); return r; }
+    off := tmp(g);
+    emit(g, off + " = mul i64 " + idx + ", " + itoa(scale));
+    emit(g, r + " = getelementptr inbounds i8, ptr " + p + ", i64 " + off);
+    return r;
+}
+
+func memcpy(g *Gen, dst string, src string, n int) {
+    if (n <= 0 || dst == src) return;
+    emit(g, "call void @llvm.memcpy.p0.p0.i64(ptr " + dst + ", ptr " + src + ", i64 " + itoa(n) + ", i1 false)");
+}
+func memset0(g *Gen, dst string, n int) {
+    if (n <= 0) return;
+    emit(g, "call void @llvm.memset.p0.i64(ptr " + dst + ", i8 0, i64 " + itoa(n) + ", i1 false)");
+}
+
+// load reads a value of type t stored at p.
+func load(g *Gen, t *ast.Type, p string) V {
+    v: V;
+    v.t = t;
+    if (isAgg(t)) { v.r = p; return v; }
+    r := tmp(g);
+    emit(g, r + " = load " + ll(t) + ", ptr " + p);
+    v.r = r;
+    return v;
+}
+// store writes v (already of type t) to p.
+func store(g *Gen, t *ast.Type, p string, v V) {
+    if (isAgg(t)) { memcpy(g, p, v.r, sizeOf(g, t)); return; }
+    emit(g, "store " + ll(t) + " " + v.r + ", ptr " + p);
+}
+func storeVolatile(g *Gen, t *ast.Type, p string, v V) {
+    if (isAgg(t)) { memcpy(g, p, v.r, sizeOf(g, t)); return; }
+    emit(g, "store volatile " + ll(t) + " " + v.r + ", ptr " + p);
+}
+
+func mkV(r string, t *ast.Type) V { v: V; v.r = r; v.t = t; return v; }
+func freshV(r string, t *ast.Type) V { v: V; v.r = r; v.t = t; v.fresh = true; return v; }
+
+// spill materializes a scalar into memory and returns its address.
+func spill(g *Gen, v V) string {
+    if (isAgg(v.t)) return v.r;
+    p := alloca(g, v.t);
+    store(g, v.t, p, v);
+    return p;
+}
+
+// zeroInto writes the zero value of t to p.
+func zeroInto(g *Gen, t *ast.Type, p string) {
+    if (!isAgg(t)) { emit(g, "store " + ll(t) + " " + zeroLit(t) + ", ptr " + p); return; }
+    if (needsInit(g, t)) { emit(g, "call void @oc_zero(ptr " + p + ", ptr " + desc(g, t) + ")"); return; }
+    memset0(g, p, sizeOf(g, t));
+}
+func zeroV(g *Gen, t *ast.Type) V {
+    if (!isAgg(t)) return mkV(zeroLit(t), t);
+    p := alloca(g, t);
+    zeroInto(g, t, p);
+    return freshV(p, t);
+}
+
+// copyV returns an independent copy of v (deep for owned contents).
+func copyV(g *Gen, v V) V {
+    t := v.t;
+    if (v.fresh || !owned(g, t)) {
+        if (isAgg(t) && !v.fresh) {
+            p := alloca(g, t);
+            memcpy(g, p, v.r, sizeOf(g, t));
+            return freshV(p, t);
+        }
+        return v;
+    }
+    u := under(t);
+    if (u.kind == ast.TK.Dyn) {
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_arr_copy(ptr " + v.r + ", ptr " + desc(g, u.elem) + ")");
+        return freshV(r, t);
+    }
+    if (u.kind == ast.TK.Map) {
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_map_copy(ptr " + v.r + ")");
+        return freshV(r, t);
+    }
+    if (u.kind == ast.TK.Array && u.len < 0) {
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_block_copy(ptr " + v.r + ", ptr " + desc(g, u.elem) + ")");
+        return freshV(r, t);
+    }
+    p := alloca(g, t);
+    emit(g, "call void @oc_copy(ptr " + p + ", ptr " + v.r + ", ptr " + desc(g, t) + ")");
+    return freshV(p, t);
+}
+
+// ---- constants ----
+
+func quoteBytes(s string) string {
+    b: util.Buf;
+    b.Add("c\"");
+    for (i := 0; i < len(s); i++) {
+        c := (s[i] -> int) & 255;
+        if (c >= 32 && c < 127 && c != 34 && c != 92) b.Addc(s[i]);
+        else { b.Add("\\"); b.Addc(util.HexDigit(c >> 4)); b.Addc(util.HexDigit(c)); }
+    }
+    b.Add("\"");
+    return b.String();
+}
+
+// strConst returns a global holding an Ocean string header (null for "").
+func strConst(g *Gen, s string) string {
+    if (len(s) == 0) return "null";
+    name, ok := g.strs[s];
+    if (ok) return name;
+    g.nstr++;
+    name = "@oc.str." + itoa(g.nstr);
+    g.globals.Add(name).Add(".data = private unnamed_addr constant [").AddInt(len(s)).Add(" x i8] ").Add(quoteBytes(s)).Add("\n");
+    g.globals.Add(name).Add(" = private unnamed_addr constant {i64, i64, ptr} {i64 ").AddInt(len(s)).Add(", i64 ").AddInt(len(s)).Add(", ptr ").Add(name).Add(".data}\n");
+    g.strs[s] = name;
+    return name;
+}
+
+// cstr returns a global NUL-terminated C string.
+func cstr(g *Gen, s string) string {
+    key := "\x00c" + s;
+    name, ok := g.strs[key];
+    if (ok) return name;
+    g.nstr++;
+    name = "@oc.cstr." + itoa(g.nstr);
+    g.globals.Add(name).Add(" = private unnamed_addr constant [").AddInt(len(s) + 1).Add(" x i8] ").Add(quoteBytes(s + "\x00")).Add("\n");
+    g.strs[key] = name;
+    return name;
+}
+
+// methodName interns method-name strings for interface dispatch.
+func methodName(g *Gen, s string) string {
+    name, ok := g.names[s];
+    if (ok) return name;
+    name = "@oc.mname." + itoa(len(g.names) + 1);
+    g.globals.Add(name).Add(" = constant [").AddInt(len(s) + 1).Add(" x i8] ").Add(quoteBytes(s + "\x00")).Add("\n");
+    g.names[s] = name;
+    return name;
+}
+
+// site registers a source location for diagnostics and returns its id.
+func site(g *Gen, n *ast.Node) int {
+    if (nilN(n) || (n.src -> int) == 0) return 0;
+    return siteAt(g, n.src, n.line, n.col);
+}
+func siteAt(g *Gen, src *ast.Source, line int, col int) int {
+    key := src.path + ":" + itoa(line) + ":" + itoa(col);
+    id, ok := g.siteKeys[key];
+    if (ok) return id;
+    id = g.nsites;
+    g.nsites++;
+    g.siteKeys[key] = id;
+    text := lineText(src.text, line);
+    g.sites.Add(", {ptr, i64, i64, ptr} {ptr ").Add(cstr(g, src.path)).Add(", i64 ").AddInt(line).Add(", i64 ").AddInt(col).Add(", ptr ").Add(cstr(g, text)).Add("}");
+    return id;
+}
+
+func lineText(text string, line int) string {
+    start := 0;
+    for (n := 1; n < line; n++) {
+        for (start < len(text) && text[start] != '\n') start++;
+        if (start >= len(text)) return "";
+        start++;
+    }
+    end := start;
+    for (end < len(text) && text[end] != '\n' && text[end] != '\r') end++;
+    return text[start:end];
+}
+
+// setSite records the current call site in the frame before a call.
+func setSite(g *Gen, n *ast.Node) {
+    id := site(g, n);
+    if (g.fn.forward > 0) id = id + 1099511627776;
+    emit(g, "store i64 " + itoa(id) + ", ptr " + gep(g, g.fn.frame, 16));
+}
+
+func declare(g *Gen, name string, text string) {
+    _, ok := g.decls[name];
+    if (ok) return;
+    g.decls[name] = text;
+    g.declOrder.append(name);
+}
+
+func fail(g *Gen, n *ast.Node, msg string) {
+    g.errors++;
+    if (nilN(n)) { util.Stderr("backend error: " + msg + "\n"); return; }
+    util.Stderr("[" + n.src.path + ":" + itoa(n.line) + ":" + itoa(n.col) + "]: backend error: " + msg + "\n");
+}

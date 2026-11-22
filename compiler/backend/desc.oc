@@ -1,0 +1,220 @@
+package backend;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+func descKind(t *ast.Type) int {
+    u := under(t);
+    switch (u.kind) {
+    case ast.TK.Int: return 1;
+    case ast.TK.Float: return 2;
+    case ast.TK.Bool: return 3;
+    case ast.TK.String: return 4;
+    case ast.TK.Ptr: return 5;
+    case ast.TK.Dyn: return 6;
+    case ast.TK.Array: return 7;
+    case ast.TK.Buffer: return 8;
+    case ast.TK.Map: return 9;
+    case ast.TK.Struct, ast.TK.Tuple: return 10;
+    case ast.TK.Enum: return 11;
+    case ast.TK.Interface, ast.TK.Union: return 12;
+    case ast.TK.Func: return 13;
+    }
+    return 0;
+}
+
+// desc returns the global name of a type descriptor (registering it).
+func desc(g *Gen, t0 *ast.Type) string {
+    t := sub(g, t0);
+    if (t.kind == ast.TK.String) { registerDesc(g, t, "@oc_type_string"); return "@oc_type_string"; }
+    key := check.TypeKey(t);
+    name, ok := g.descs[key];
+    if (ok) return name;
+    name = "@oc.type." + itoa(len(g.descs) + 1);
+    registerDesc(g, t, name);
+    return name;
+}
+
+func registerDesc(g *Gen, t *ast.Type, name string) {
+    key := check.TypeKey(t);
+    _, ok := g.descs[key];
+    if (ok) return;
+    g.descs[key] = name;
+    g.descTypes.append(t);
+}
+
+func typeDisplay(t *ast.Type) string {
+    if (t.kind == ast.TK.Struct || t.kind == ast.TK.Enum || t.kind == ast.TK.Named || t.kind == ast.TK.Interface) {
+        if (!nilS(t.sym)) return t.sym.name;
+    }
+    return check.TypeString(t);
+}
+
+func fieldEntry(g *Gen, name string, t *ast.Type, off int, bitOff int, bits int, vp bool) string {
+    return "{ptr, ptr, i64, i64, i64, i64} {ptr " + cstr(g, name) + ", ptr " + desc(g, t) + ", i64 " + itoa(off) + ", i64 " + itoa(bitOff) + ", i64 " + itoa(bits) + ", i64 " + (vp ? "1" : "0") + "}";
+}
+
+func fieldsArray(g *Gen, name string, fields []*ast.FieldInfo) string {
+    if (len(fields) == 0) return "null";
+    l := g.c.FieldsLayout("desc" + name, fields);
+    b: util.Buf;
+    b.Add(name).Add(" = private constant [").AddInt(len(fields)).Add(" x {ptr, ptr, i64, i64, i64, i64}] [");
+    for (i, f := range fields) {
+        if (i > 0) b.Add(", ");
+        p := l.places[i];
+        if (f.bits > 0) b.Add(fieldEntry(g, f.name, f.ty, p.offset, p.bitOffset, p.bits, f.valueParam));
+        else b.Add(fieldEntry(g, f.name, f.ty, p.offset, 0, 0, f.valueParam));
+    }
+    b.Add("]\n");
+    g.globals.AddBuf(&b);
+    return name;
+}
+
+// structOf wraps a field list as an anonymous struct type for layout queries.
+func structOf(g *Gen, fields []*ast.FieldInfo) *ast.Type {
+    s := new(ast.Symbol);
+    s.kind = ast.SK.Struct; s.fields = fields; s.state = 2; s.name = "<fields>";
+    t := ast.NewType(ast.TK.Struct);
+    t.sym = s;
+    s.ty = t; s.self = t;
+    return t;
+}
+
+func tupleFields(results []*ast.Type) []*ast.FieldInfo {
+    out := make([]*ast.FieldInfo);
+    for (i, r := range results) { f := new(ast.FieldInfo); f.name = itoa(i); f.ty = r; out.append(f); }
+    return out;
+}
+
+func emitDesc(g *Gen, t *ast.Type) {
+    name := g.descs[check.TypeKey(t)];
+    u := under(t);
+    kind := descKind(t);
+    size := 8; al := 8;
+    if (u.kind != ast.TK.Void && u.kind != ast.TK.Null) { size = sizeOf(g, u); al = alignOf(g, u); }
+    bits := 0; flags := 0;
+    elem := "null"; key := "null";
+    nfields := 0; fields := "null"; nvars := 0; vars := "null"; payload := 0;
+    nmeth := 0; meths := "null"; underName := "null";
+    switch (u.kind) {
+    case ast.TK.Int:
+        bits = u.bits;
+        if (u.signed) flags = flags | 1;
+        if (u.varw) flags = flags | 4;
+    case ast.TK.Float: bits = u.bits;
+    case ast.TK.Ptr: if (u.elem.kind != ast.TK.Void) elem = desc(g, u.elem);
+    case ast.TK.Dyn:
+        elem = desc(g, u.elem);
+        if (u.isMixed) flags = flags | 8;
+    case ast.TK.Array: elem = desc(g, u.elem); bits = u.len; if (u.len < 0) bits = -1;
+    case ast.TK.Buffer:
+        if (!nilT(u.elem)) elem = desc(g, u.elem);
+        bits = u.len;
+    case ast.TK.Map: key = desc(g, u.key); elem = desc(g, u.elem);
+    case ast.TK.Struct:
+        fs := g.c.FieldsOf(u);
+        nfields = len(fs);
+        fields = fieldsArray(g, name + ".fields", fs);
+    case ast.TK.Tuple:
+        fs := tupleFields(u.results);
+        nfields = len(fs);
+        fields = fieldsArray(g, name + ".fields", fs);
+    case ast.TK.Enum:
+        vs := g.c.VariantsOf(u);
+        nvars = len(vs);
+        payload = g.c.EnumPayloadOffset(u);
+        b: util.Buf;
+        b.Add(name).Add(".variants = private constant [").AddInt(len(vs)).Add(" x {ptr, i64, ptr}] [");
+        for (i, v := range vs) {
+            if (i > 0) b.Add(", ");
+            fs := g.c.VariantFields(v);
+            fa := fieldsArray(g, name + ".v" + itoa(i), fs);
+            b.Add("{ptr, i64, ptr} {ptr ").Add(cstr(g, v.name)).Add(", i64 ").AddInt(len(fs)).Add(", ptr ").Add(fa).Add("}");
+        }
+        b.Add("]\n");
+        if (len(vs) > 0) { g.globals.AddBuf(&b); vars = name + ".variants"; }
+    }
+    if (owned(g, u)) flags = flags | 2;
+    if (t.kind == ast.TK.Named) { flags = flags | 16; underName = desc(g, u); }
+    // method table for boxed concrete types
+    mt := methodTable(g, t, name);
+    if (mt != "null") { meths = mt; nmeth = g.lastMethodCount; }
+    dname := cstr(g, typeDisplay(t));
+    line: util.Buf;
+    line.Add(name).Add(" = constant {i64, i64, i64, i64, i64, ptr, ptr, ptr, i64, ptr, i64, ptr, i64, i64, ptr, ptr} {");
+    line.Add("i64 ").AddInt(kind).Add(", i64 ").AddInt(size).Add(", i64 ").AddInt(al).Add(", i64 ").AddInt(bits).Add(", i64 ").AddInt(flags);
+    line.Add(", ptr ").Add(elem).Add(", ptr ").Add(key).Add(", ptr ").Add(dname);
+    line.Add(", i64 ").AddInt(nfields).Add(", ptr ").Add(fields).Add(", i64 ").AddInt(nvars).Add(", ptr ").Add(vars);
+    line.Add(", i64 ").AddInt(payload).Add(", i64 ").AddInt(nmeth).Add(", ptr ").Add(meths).Add(", ptr ").Add(underName).Add("}\n");
+    g.globals.AddBuf(&line);
+}
+
+// methodTable emits {name, thunk} entries for the non-generic methods of a boxed type.
+func methodTable(g *Gen, t *ast.Type, name string) string {
+    g.lastMethodCount = 0;
+    base := t;
+    ptr := false;
+    if (t.kind == ast.TK.Ptr) { base = t.elem; ptr = true; }
+    if (base.kind != ast.TK.Struct && base.kind != ast.TK.Enum && base.kind != ast.TK.Named) return "null";
+    if (nilS(base.sym)) return "null";
+    entries := make([]string);
+    for (_, m := range base.sym.methodList) {
+        if (len(m.typeParams) > 0) continue;
+        if (m.recvPtr && !ptr) continue;
+        if (!m.exported && !m.builtin && false) continue;
+        thunk := thunkFor(g, m, base, ptr);
+        entries.append("{ptr, ptr} {ptr " + methodName(g, m.name) + ", ptr " + thunk + "}");
+    }
+    if (len(entries) == 0) return "null";
+    g.lastMethodCount = len(entries);
+    tn := name + ".methods";
+    g.globals.Add(tn).Add(" = private constant [").AddInt(len(entries)).Add(" x {ptr, ptr}] [").Add(util.JoinList(entries, ", ")).Add("]\n");
+    return tn;
+}
+
+func emitPendingDescs(g *Gen) {
+    for (g.descDone < len(g.descTypes)) {
+        t := g.descTypes[g.descDone];
+        g.descDone++;
+        emitDesc(g, t);
+    }
+}
+
+// ---- runtime type predicates ----
+
+// matcherFor returns a function testing whether a descriptor satisfies a type term.
+func matcherFor(g *Gen, term *ast.Type) string {
+    key := check.TypeKey(term);
+    name, ok := g.matcherKeys[key];
+    if (ok) return name;
+    name = "@oc.match." + itoa(len(g.matchers) + 1);
+    g.matcherKeys[key] = name;
+    m := new(Matcher);
+    m.name = name; m.term = term;
+    g.matchers.append(m);
+    return name;
+}
+
+func emitMatchers(g *Gen) {
+    for (_, m := range g.matchers) {
+        b: util.Buf;
+        b.Add("define internal i1 ").Add(m.name).Add("(ptr %t) {\nentry:\n");
+        n := 0;
+        acc := "false";
+        for (_, t := range g.descTypes) {
+            if (!concreteBoxable(t)) continue;
+            if (!g.c.Satisfies(t, m.term)) continue;
+            n++;
+            b.Add("  %c").AddInt(n).Add(" = icmp eq ptr %t, ").Add(g.descs[check.TypeKey(t)]).Add("\n");
+            b.Add("  %a").AddInt(n).Add(" = or i1 ").Add(acc).Add(", %c").AddInt(n).Add("\n");
+            acc = "%a" + itoa(n);
+        }
+        b.Add("  ret i1 ").Add(acc).Add("\n}\n");
+        g.mod.AddBuf(&b);
+    }
+}
+
+func concreteBoxable(t *ast.Type) bool {
+    if (t.kind == ast.TK.Interface || t.kind == ast.TK.Union || t.kind == ast.TK.Tuple || t.kind == ast.TK.Param || t.kind == ast.TK.Family) return false;
+    return !check.HasParams(t);
+}

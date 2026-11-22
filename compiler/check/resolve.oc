@@ -1,0 +1,557 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+struct savedCtx { pkg *ast.Package; src *ast.Source; scope *ast.Scope; fn *FuncCtx; }
+
+func enterSym(c *Checker, s *ast.Symbol) savedCtx {
+    sv: savedCtx;
+    sv.pkg = c.pkg; sv.src = c.src; sv.scope = c.scope; sv.fn = c.fn;
+    if (!nilPkg(s.pkg)) c.pkg = s.pkg;
+    if (!nilSrc(s.src)) c.src = s.src;
+    if (s.local && !ast.NilScope(s.scope)) c.scope = s.scope;
+    else if (!nilPkg(s.pkg)) c.scope = s.pkg.scope;
+    if (!s.local) c.fn = zero(*FuncCtx);
+    return sv;
+}
+func leave(c *Checker, sv savedCtx) { c.pkg = sv.pkg; c.src = sv.src; c.scope = sv.scope; c.fn = sv.fn; }
+
+// selfType returns the type a type symbol declares (generic: with its own parameters).
+func selfType(c *Checker, s *ast.Symbol) *ast.Type {
+    if (!nilT(s.self)) return s.self;
+    k := ast.TK.Struct;
+    if (s.kind == ast.SK.Enum) k = ast.TK.Enum;
+    else if (s.kind == ast.SK.Interface) k = ast.TK.Interface;
+    else if (s.kind == ast.SK.TypeDef) k = ast.TK.Named;
+    t := ast.NewType(k);
+    t.sym = s;
+    for (_, tp := range s.typeParams) t.args.append(tp.ty);
+    s.self = t;
+    return t;
+}
+
+// resolveSymType resolves the declaration behind a symbol and returns its type.
+func resolveSymType(c *Checker, s *ast.Symbol) *ast.Type {
+    if (s.state == 2) return s.ty;
+    if (s.state == 1) {
+        if (s.kind == ast.SK.TypeDef || s.kind == ast.SK.Alias) { err(c, s.node, "cyclic type declaration"); s.ty = tInvalid; s.state = 2; return s.ty; }
+        if (s.kind == ast.SK.Var) { err(c, s.node, "cannot infer global type; add an explicit type"); s.ty = tInvalid; return s.ty; }
+        return s.ty;
+    }
+    s.state = 1;
+    sv := enterSym(c, s);
+    switch (s.kind) {
+    case ast.SK.Struct: resolveStruct(c, s);
+    case ast.SK.Enum: resolveEnum(c, s);
+    case ast.SK.Interface: resolveInterface(c, s);
+    case ast.SK.TypeDef:
+        s.self = zero(*ast.Type);
+        selfType(c, s);
+        u := resolveType(c, s.node.a);
+        if (u.kind == ast.TK.Void) { err(c, s.node, "void cannot be the underlying type of a distinct type"); u = tInvalid; }
+        if (u.kind == ast.TK.Buffer && u.len == -1) err(c, s.node, "runtime-sized buffers cannot be used in type declarations");
+        if (u.kind == ast.TK.Array && u.len == -1) err(c, s.node, "runtime-sized buffers cannot be used in type declarations");
+        s.ty = u;
+        if (typeContainsSelf(c, u, s, false)) err(c, s.node, "cyclic type declaration");
+    case ast.SK.Alias:
+        t := resolveTypeOrFamily(c, s.node.a);
+        if (t.kind == ast.TK.Buffer && t.len == -1) err(c, s.node, "runtime-sized buffers cannot be used in type declarations");
+        s.ty = t;
+    case ast.SK.Func: resolveFuncSig(c, s);
+    case ast.SK.Var: resolveGlobal(c, s);
+    }
+    leave(c, sv);
+    s.state = 2;
+    return s.ty;
+}
+
+// typeContainsSelf detects definitions that embed themselves without indirection.
+func typeContainsSelf(c *Checker, t *ast.Type, s *ast.Symbol, viaStruct bool) bool {
+    if (t.kind == ast.TK.Named) return t.sym == s;
+    if (t.kind == ast.TK.Array && t.len >= 0) return typeContainsSelf(c, t.elem, s, viaStruct);
+    if (t.kind == ast.TK.Buffer && t.len > 0) return typeContainsSelf(c, t.elem, s, viaStruct);
+    return false;
+}
+
+func resolveStruct(c *Checker, s *ast.Symbol) {
+    n := s.node;
+    if (n.name == "array") err(c, n, "array is a reserved type name");
+    s.typeParams = declareTypeParams(c, n.list3, s);
+    withTypeParams(c, s.typeParams);
+    resolveConstraints(c, s.typeParams);
+    s.ty = selfType(c, s);
+    for (_, vp := range n.list2) {
+        f := new(ast.FieldInfo);
+        f.name = vp.name; f.valueParam = true; f.node = vp;
+        f.ty = resolveTypeOrUnion(c, vp.a);
+        s.fields.append(f);
+    }
+    for (_, fd := range n.list) {
+        for (_, prev := range s.fields) {
+            if (prev.name == fd.name) { err(c, fd, prev.valueParam ? "Struct field duplicates a value parameter" : "duplicate declaration: " + fd.name); }
+        }
+        f := new(ast.FieldInfo);
+        f.name = fd.name; f.node = fd; f.bits = fd.ival;
+        f.ty = resolveType(c, fd.a);
+        if (f.ty.kind == ast.TK.Void) err(c, fd, "void is not a field storage type");
+        if (f.ty.kind == ast.TK.Buffer && f.ty.len == -1) err(c, fd, "runtime-sized buffers cannot be used in type declarations");
+        if (f.bits > 0) checkBitfield(c, fd, f);
+        s.fields.append(f);
+    }
+    pop(c);
+}
+
+func checkBitfield(c *Checker, fd *ast.Node, f *ast.FieldInfo) {
+    u := Underlying(f.ty);
+    if (u.kind == ast.TK.Param) return;
+    if (u.kind == ast.TK.Bool) {
+        if (f.bits > 1) err(c, fd, "bitfield size exceeds its type width");
+        return;
+    }
+    if (u.kind != ast.TK.Int) { err(c, fd, "bitfield requires an integer or bool type"); return; }
+    if (f.bits > u.bits) { err(c, fd, "bitfield size exceeds its type width"); return; }
+    if (!nilN(fd.a) && fd.a.kind == ast.NK.TVarint && f.bits < fd.a.ival) {
+        warn(c, fd, "bitfield size " + itoa(f.bits) + " is smaller than explicit " + (fd.a.flag ? "varint(" : "varuint(") + itoa(fd.a.ival) + ")");
+    }
+}
+
+func resolveEnum(c *Checker, s *ast.Symbol) {
+    n := s.node;
+    if (n.name == "array") err(c, n, "array is a reserved type name");
+    s.typeParams = declareTypeParams(c, n.list3, s);
+    withTypeParams(c, s.typeParams);
+    resolveConstraints(c, s.typeParams);
+    s.ty = selfType(c, s);
+    for (i, vn := range n.list) {
+        v := new(ast.VariantInfo);
+        v.name = vn.name; v.vkind = vn.ival; v.index = i; v.node = vn;
+        if (vn.ival == 1) {
+            for (_, tn := range vn.list) {
+                t := resolveType(c, tn);
+                if (t.kind == ast.TK.Void) err(c, tn, "void is not an enum payload type");
+                v.types.append(t);
+            }
+        } else if (vn.ival == 2) {
+            for (_, fd := range vn.list) {
+                f := new(ast.FieldInfo);
+                f.name = fd.name; f.node = fd;
+                f.ty = resolveType(c, fd.a);
+                for (_, prev := range v.fields) { if (prev.name == f.name) err(c, fd, "duplicate declaration: " + f.name); }
+                v.fields.append(f);
+            }
+        } else if (vn.ival == 3) {
+            v.fixedValue = vn.a;
+            if (!nilN(vn.b)) v.fixedType = resolveType(c, vn.b);
+        }
+        vn.sym = s;
+        s.variants.append(v);
+    }
+    pop(c);
+    // Fixed values are typed after declarations are known.
+    withTypeParams(c, s.typeParams);
+    for (_, v := range s.variants) {
+        if (v.vkind != 3) continue;
+        if (!nilT(v.fixedType)) {
+            exprExpect(c, v.fixedValue, v.fixedType);
+        } else {
+            t := expr(c, v.fixedValue, zero(*ast.Type));
+            v.fixedType = defaultType(c, v.fixedValue, t);
+        }
+    }
+    pop(c);
+}
+
+func resolveInterface(c *Checker, s *ast.Symbol) {
+    n := s.node;
+    if (n.name == "array") err(c, n, "array is a reserved type name");
+    s.typeParams = declareTypeParams(c, n.list3, s);
+    withTypeParams(c, s.typeParams);
+    resolveConstraints(c, s.typeParams);
+    t := selfType(c, s);
+    s.ty = t;
+    fillInterface(c, t, n);
+    pop(c);
+}
+
+// fillInterface computes the methods or type list of an interface declaration or literal.
+func fillInterface(c *Checker, t *ast.Type, n *ast.Node) {
+    if (!nilN(n.a)) {
+        u := resolveConstraint(c, n.a);
+        if (u.kind == ast.TK.Union) { t.terms = u.terms; t.tilde = u.tilde; }
+        else if (u.kind == ast.TK.Interface) {
+            // single-term embedding inherits methods
+            t.methods = methodsOf(c, u);
+            t.terms = u.terms; t.tilde = u.tilde;
+            if (len(t.terms) == 0 && len(t.methods) == 0) { }
+        } else { t.terms.append(u); t.tilde.append(false); }
+        return;
+    }
+    for (_, ms := range n.list) {
+        m := new(ast.Method);
+        m.name = ms.name;
+        m.typeParams = declareTypeParams(c, ms.list3, zero(*ast.Symbol));
+        withTypeParams(c, m.typeParams);
+        resolveConstraints(c, m.typeParams);
+        m.ty = signature(c, ms.list, ms.list2, ms.flag);
+        pop(c);
+        t.methods.append(m);
+    }
+}
+
+// signature resolves parameter and result lists into a function type.
+func signature(c *Checker, params []*ast.Node, results []*ast.Node, variadic bool) *ast.Type {
+    ps := make([]*ast.Type);
+    for (i, p := range params) {
+        pt := resolveTypeOrUnion(c, p.a);
+        if (p.flag && i == len(params) - 1) {
+            if (IsInterface(pt) && len(pt.terms) == 0) pt = MixedOf(pt);
+            else pt = DynOf(pt);
+        }
+        if (pt.kind == ast.TK.Void) err(c, p, "void is not a variable storage type");
+        p.ty = pt;
+        ps.append(pt);
+    }
+    rs := make([]*ast.Type);
+    for (_, r := range results) {
+        rt := resolveTypeOrUnion(c, r.a);
+        r.ty = rt;
+        rs.append(rt);
+    }
+    return FuncOf(ps, rs, variadic);
+}
+
+func resolveFuncSig(c *Checker, s *ast.Symbol) {
+    if (!nilT(s.ty) && s.kind == ast.SK.Func && s.state == 2) return;
+    sv := enterSym(c, s);
+    n := s.node;
+    pushed := 0;
+    if (!nilS(s.owner)) {
+        resolveSymType(c, s.owner);
+        // receiver type parameters inherit the owner's constraints
+        for (i, rp := range s.recvParams) {
+            rp.ty = ParamType(rp);
+            if (i < len(s.owner.typeParams)) {
+                resolveConstraints(c, s.owner.typeParams);
+                rp.constraint = s.owner.typeParams[i].constraint;
+            }
+        }
+        withTypeParams(c, s.recvParams);
+        pushed++;
+    }
+    s.typeParams = declareTypeParams(c, n.list3, s);
+    withTypeParams(c, s.typeParams);
+    pushed++;
+    resolveConstraints(c, s.typeParams);
+    s.ty = signature(c, n.list, n.list2, n.flag);
+    for (i := 0; i < pushed; i++) pop(c);
+    leave(c, sv);
+    s.state = 2;
+}
+
+// receiverType gives the type of a method receiver within its own declaration.
+func receiverType(c *Checker, m *ast.Symbol) *ast.Type {
+    o := m.owner;
+    resolveSymType(c, o);
+    base := selfType(c, o);
+    if (len(m.recvParams) > 0) {
+        t := ast.NewType(base.kind);
+        t.sym = o;
+        for (_, rp := range m.recvParams) t.args.append(rp.ty);
+        base = t;
+    }
+    if (m.recvPtr) return PtrTo(base);
+    return base;
+}
+
+func resolveExtern(c *Checker, s *ast.Symbol) {
+    if (s.state == 2) return;
+    s.state = 2;
+    n := s.node;
+    ps := make([]*ast.Type);
+    for (_, p := range n.list) {
+        t := resolveType(c, p.a);
+        checkExternType(c, p, t, false);
+        p.ty = t;
+        ps.append(t);
+    }
+    rs := make([]*ast.Type);
+    if (!nilN(n.a)) {
+        t := resolveType(c, n.a);
+        checkExternType(c, n, t, true);
+        if (t.kind != ast.TK.Void) rs.append(t);
+    }
+    s.ty = FuncOf(ps, rs, n.flag);
+}
+
+func checkExternType(c *Checker, n *ast.Node, t *ast.Type, result bool) {
+    u := Underlying(t);
+    if (u.kind == ast.TK.Int && u.varw && u.bits != 8 && u.bits != 16 && u.bits != 32 && u.bits != 64) {
+        err(c, n, "C has no " + itoa(u.bits) + "-bit integer type: declare a C-sized integer and cast with ->");
+    }
+    if (u.kind == ast.TK.Struct || u.kind == ast.TK.Enum) err(c, n, "structs cannot be passed or returned by value through extern functions");
+}
+
+func resolveGlobal(c *Checker, s *ast.Symbol) {
+    d := s.decl;
+    if (!nilN(d.a)) {
+        s.ty = resolveType(c, d.a);
+        if (s.ty.kind == ast.TK.Buffer && s.ty.len == -1) err(c, d, "global buffers require fixed dimensions; use an array for runtime-sized storage");
+        return;
+    }
+    // Inferred: type the matching initializer.
+    idx := 0;
+    for (i, id := range d.list) { if (id.sym == s) idx = i; }
+    if (len(d.list2) == 0) { s.ty = tInvalid; return; }
+    s.ty = zero(*ast.Type);
+    if (len(d.list2) == len(d.list)) {
+        v := d.list2[idx];
+        t := expr(c, v, zero(*ast.Type));
+        s.ty = defaultType(c, v, t);
+        if (s.ty.kind == ast.TK.Null) { err(c, v, "null requires an explicit pointer type"); s.ty = tInvalid; }
+    } else if (len(d.list2) == 1) {
+        t := expr(c, d.list2[0], zero(*ast.Type));
+        if (t.kind == ast.TK.Tuple && idx < len(t.results)) s.ty = t.results[idx];
+        else s.ty = tInvalid;
+    } else s.ty = tInvalid;
+    if (nilT(s.ty)) s.ty = tInvalid;
+}
+
+// ---- type syntax ----
+
+func resolveTypeOrUnion(c *Checker, n *ast.Node) *ast.Type {
+    if (n.kind == ast.NK.TUnion || n.kind == ast.NK.TTilde) return resolveConstraint(c, n);
+    return resolveTypeOrFamily(c, n);
+}
+
+func resolveConstraint(c *Checker, n *ast.Node) *ast.Type {
+    if (n.kind == ast.NK.TUnion || n.kind == ast.NK.TTilde) {
+        u := ast.NewType(ast.TK.Union);
+        items := make([]*ast.Node);
+        if (n.kind == ast.NK.TUnion) items = n.list; else items.append(n);
+        for (_, it := range items) {
+            tilde := it.kind == ast.NK.TTilde;
+            t := resolveTypeOrFamily(c, tilde ? it.a : it);
+            if (!tilde && t.kind == ast.TK.Interface && len(t.terms) > 0 && len(t.methods) == 0) {
+                for (i, term := range t.terms) { u.terms.append(term); u.tilde.append(t.tilde[i]); }
+                continue;
+            }
+            if (t.kind == ast.TK.Union) {
+                for (i, term := range t.terms) { u.terms.append(term); u.tilde.append(t.tilde[i]); }
+                continue;
+            }
+            u.terms.append(t); u.tilde.append(tilde);
+        }
+        return u;
+    }
+    return resolveTypeOrFamily(c, n);
+}
+
+// resolveType resolves type syntax where a concrete type is required.
+func resolveType(c *Checker, n *ast.Node) *ast.Type {
+    t := resolveTypeOrFamily(c, n);
+    return t;
+}
+
+func typeArgsOf(c *Checker, list []*ast.Node) []*ast.Type {
+    out := make([]*ast.Type);
+    for (_, a := range list) out.append(resolveTypeOrUnion(c, a));
+    return out;
+}
+
+// instantiate applies type arguments to a generic type symbol.
+func instantiate(c *Checker, n *ast.Node, s *ast.Symbol, args []*ast.Type) *ast.Type {
+    resolveSymType(c, s);
+    if (s.kind == ast.SK.Alias) {
+        target := s.ty;
+        if (target.kind == ast.TK.Family) return instantiate(c, n, target.sym, args);
+        err(c, n, "this type does not accept type arguments");
+        return tInvalid;
+    }
+    if (s.kind != ast.SK.Struct && s.kind != ast.SK.Enum && s.kind != ast.SK.Interface) {
+        err(c, n, "this type does not accept type arguments");
+        return tInvalid;
+    }
+    if (len(args) != len(s.typeParams)) { err(c, n, "type argument count mismatch"); return tInvalid; }
+    k := ast.TK.Struct;
+    if (s.kind == ast.SK.Enum) k = ast.TK.Enum;
+    if (s.kind == ast.SK.Interface) k = ast.TK.Interface;
+    t := ast.NewType(k);
+    t.sym = s; t.args = args;
+    if (k == ast.TK.Interface) {
+        env := makeEnv(s.typeParams, args);
+        t.methods = substMethods(c, s.self.methods, env);
+        t.terms = substList(c, s.self.terms, env);
+        t.tilde = s.self.tilde;
+    }
+    for (i, a := range args) {
+        if (!satisfies(c, a, s.typeParams[i].constraint)) { err(c, n, "type argument does not satisfy its constraint"); break; }
+    }
+    return t;
+}
+
+func symToType(c *Checker, n *ast.Node, s *ast.Symbol) *ast.Type {
+    switch (s.kind) {
+    case ast.SK.BuiltinType: return s.ty;
+    case ast.SK.TypeParam: if (nilT(s.ty)) s.ty = ParamType(s); return s.ty;
+    case ast.SK.Alias: return resolveSymType(c, s);
+    case ast.SK.TypeDef: resolveSymType(c, s); return selfType(c, s);
+    case ast.SK.Struct, ast.SK.Enum, ast.SK.Interface:
+        resolveSymType(c, s);
+        if (len(s.typeParams) > 0 || (!nilN(s.node) && len(s.node.list3) > 0)) {
+            f := ast.NewType(ast.TK.Family);
+            f.sym = s;
+            return f;
+        }
+        return selfType(c, s);
+    }
+    err(c, n, "expected a type");
+    return tInvalid;
+}
+
+// resolveTypeOrFamily resolves type syntax, allowing bare generic names.
+func resolveTypeOrFamily(c *Checker, n *ast.Node) *ast.Type {
+    if (nilN(n)) return tVoid;
+    switch (n.kind) {
+    case ast.NK.Ident:
+        if (n.name == "array") { err(c, n, "array requires exactly one element type; use array<any> for any array"); return tInvalid; }
+        if (n.name == "buffer") return tBufferFamily;
+        s := lookup(c, n.name);
+        if (nilS(s)) { err(c, n, "unresolved type: " + n.name); return tInvalid; }
+        n.sym = s;
+        if (s.kind == ast.SK.Var || s.kind == ast.SK.Func || s.kind == ast.SK.Package || s.kind == ast.SK.BuiltinFunc) {
+            err(c, n, "unresolved type: " + n.name); return tInvalid;
+        }
+        return symToType(c, n, s);
+    case ast.NK.Member:
+        s := qualifiedSym(c, n);
+        if (nilS(s)) return tInvalid;
+        n.sym = s;
+        return symToType(c, n, s);
+    case ast.NK.Inst:
+        if (n.a.kind == ast.NK.Ident && n.a.name == "array") {
+            if (len(n.list) != 1) { err(c, n, "array requires exactly one element type; use array<any> for any array"); return tInvalid; }
+            e := resolveTypeOrUnion(c, n.list[0]);
+            return ArrayOf(e, -2);
+        }
+        base := zero(*ast.Symbol);
+        if (n.a.kind == ast.NK.Ident) {
+            base = lookup(c, n.a.name);
+            if (nilS(base)) { err(c, n.a, "unresolved type: " + n.a.name); return tInvalid; }
+        } else if (n.a.kind == ast.NK.Member) {
+            base = qualifiedSym(c, n.a);
+            if (nilS(base)) return tInvalid;
+        } else { err(c, n, "expected a type"); return tInvalid; }
+        n.a.sym = base;
+        args := typeArgsOf(c, n.list);
+        return instantiate(c, n, base, args);
+    case ast.NK.TPtr: return PtrTo(resolveTypeOrFamily(c, n.a));
+    case ast.NK.TSlice:
+        e := resolveTypeOrUnion(c, n.a);
+        if (e.kind == ast.TK.Void) err(c, n, "void is not an array element storage type");
+        return DynOf(e);
+    case ast.NK.TMixed:
+        inner := resolveTypeOrFamily(c, n.a);
+        if (inner.kind != ast.TK.Dyn) { err(c, n, "mixed requires an array type"); return tInvalid; }
+        if (!IsInterface(inner.elem)) { err(c, n, "mixed array element type must be an interface"); return tInvalid; }
+        return MixedOf(inner.elem);
+    case ast.NK.TArray:
+        e := resolveTypeOrUnion(c, n.a);
+        if (e.kind == ast.TK.Void) err(c, n, "void is not an array element storage type");
+        if (n.flag) { t := ArrayOf(e, -3); return t; }
+        if (n.b.kind == ast.NK.IntLit && !n.b.flag) {
+            v := smallLiteral(n.b.text);
+            if (v < 0) { err(c, n, "array length must be nonnegative"); return tInvalid; }
+            return ArrayOf(e, v);
+        }
+        if (n.b.kind == ast.NK.Unary && n.b.op == scanner.Kind.Minus && n.b.a.kind == ast.NK.IntLit) { err(c, n, "array length must be nonnegative"); return tInvalid; }
+        t := ArrayOf(e, -1);
+        t.lenNode = n.b;
+        return t;
+    case ast.NK.TMap:
+        k := resolveTypeOrUnion(c, n.a);
+        v := resolveTypeOrUnion(c, n.b);
+        if (k.kind == ast.TK.Void || v.kind == ast.TK.Void) err(c, n, "void is not a map storage type");
+        return MapOf(k, v);
+    case ast.NK.TFunc:
+        push(c);
+        t := signature(c, n.list, n.list2, n.flag);
+        pop(c);
+        return t;
+    case ast.NK.TBuffer:
+        if (nilN(n.a)) return tBufferFamily;
+        e := resolveTypeOrUnion(c, n.a);
+        if (e.kind == ast.TK.Void) err(c, n, "void is not a buffer element storage type");
+        if (nilN(n.b)) return BufferOf(e, -2);
+        if (n.b.kind == ast.NK.IntLit && !n.b.flag) {
+            v := smallLiteral(n.b.text);
+            if (v <= 0) { err(c, n, "expected buffer<T, size> with a positive size, or buffer<T>"); return tInvalid; }
+            return BufferOf(e, v);
+        }
+        t := BufferOf(e, -1);
+        t.lenNode = n.b;
+        return t;
+    case ast.NK.TVarint:
+        return varintType(n.ival, n.flag);
+    case ast.NK.TInterface:
+        t := ast.NewType(ast.TK.Interface);
+        fillInterface(c, t, n);
+        if (len(t.methods) == 0 && len(t.terms) == 0) return tAny;
+        return t;
+    case ast.NK.TStruct:
+        err(c, n, "anonymous struct types are not supported; declare a named struct");
+        return tInvalid;
+    case ast.NK.TUnion, ast.NK.TTilde: return resolveConstraint(c, n);
+    case ast.NK.Null: err(c, n, "null is not a primitive, addressable value, or storage type"); return tInvalid;
+    }
+    err(c, n, "expected a type");
+    return tInvalid;
+}
+
+// qualifiedSym resolves pkg.Name (and nested member chains on packages).
+func qualifiedSym(c *Checker, n *ast.Node) *ast.Symbol {
+    if (n.a.kind != ast.NK.Ident) { err(c, n, "expected a type"); return zero(*ast.Symbol); }
+    ps := lookup(c, n.a.name);
+    if (nilS(ps)) { err(c, n.a, "unresolved type: " + n.a.name); return zero(*ast.Symbol); }
+    if (ps.kind != ast.SK.Package) { err(c, n, "expected a type"); return zero(*ast.Symbol); }
+    n.a.sym = ps;
+    return packageMember(c, n, ps.importPkg, n.name);
+}
+
+func packageMember(c *Checker, n *ast.Node, p *ast.Package, name string) *ast.Symbol {
+    s := p.scope.LookupLocal(name);
+    qual := n.a.name;
+    if (nilS(s) || !s.exported) {
+        if (nilS(s)) diagPkg(c, n, "package " + qual + " has no declaration " + name);
+        else diagPkg(c, n, "declaration " + name + " is not exported by package " + qual);
+        return zero(*ast.Symbol);
+    }
+    return s;
+}
+
+func diagPkg(c *Checker, n *ast.Node, msg string) {
+    c.errors++;
+    line := n.nameLine > 0 ? n.nameLine : n.line;
+    col := n.nameCol > 0 ? n.nameCol : n.col;
+    c.diags.Error(n.src.path, line, col, "package", msg);
+}
+
+func smallLiteral(text string) int {
+    base := 10; i := 0;
+    if (len(text) > 2 && text[0] == '0') {
+        ch := text[1];
+        if (ch == 'x' || ch == 'X') { base = 16; i = 2; }
+        else if (ch == 'b' || ch == 'B') { base = 2; i = 2; }
+        else if (ch == 'o' || ch == 'O') { base = 8; i = 2; }
+    }
+    v := 0;
+    for (; i < len(text); i++) {
+        ch := text[i];
+        d := 0;
+        if (ch >= '0' && ch <= '9') d = (ch - '0') -> int;
+        else if (ch >= 'a' && ch <= 'f') d = (ch - 'a') -> int + 10;
+        else d = (ch - 'A') -> int + 10;
+        v = v * base + d;
+        if (v > 1000000000000) return 1000000000000;
+    }
+    return v;
+}

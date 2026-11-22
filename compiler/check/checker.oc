@@ -1,0 +1,474 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+struct FuncCtx {
+    node *ast.Node;
+    sym *ast.Symbol;
+    results []*ast.Type;
+    named []*ast.Symbol;
+    outer *FuncCtx;
+    level int;
+    labels map[string]*ast.Node;
+    gotos []*ast.Node;
+    loopDepth int;
+    switchDepth int;
+    forwardDepth int;
+    hasDefer bool;
+    locals []*ast.Symbol;
+    isLiteral bool;
+    typeParams []*ast.Symbol;
+    returnsSeen int;
+}
+
+struct Checker {
+    diags *diag.List;
+    universe *ast.Scope;
+    pkg *ast.Package;
+    src *ast.Source;
+    fn *FuncCtx;
+    scope *ast.Scope;
+    nextId int;
+    builtinPkg *ast.Package;
+    packages []*ast.Package;
+    errors int;
+    resultSym *ast.Symbol;
+    optionalSym *ast.Symbol;
+    globals []*ast.Symbol;
+    funcs []*ast.Symbol;       // all function and method symbols
+    literals []*ast.Node;      // all function literals
+    stdRoot string;
+    fieldCache map[string][]*ast.FieldInfo;
+    variantCache map[string][]*ast.VariantInfo;
+    methodCache map[string][]*ast.Method;
+    inGenericBody bool;
+    osSetArgs *ast.Symbol;
+    editor bool;
+    lastErrorLine int;
+    usesThreads bool;
+    recordTypes map[string]*ast.Type;
+    layoutMemo map[string]*StructLayout;
+    sizeMemo map[string]int;
+    alignMemo map[string]int;
+}
+
+func newSym(c *Checker, k ast.SK, name string, node *ast.Node) *ast.Symbol {
+    s := new(ast.Symbol);
+    s.kind = k; s.name = name; s.node = node;
+    s.pkg = c.pkg; s.src = c.src;
+    c.nextId++;
+    s.id = c.nextId;
+    s.exported = scanner.IsExported(name);
+    return s;
+}
+
+func errAt(c *Checker, src *ast.Source, line int, col int, msg string) {
+    c.errors++;
+    path := nilSrc(src) ? "<source>" : src.path;
+    c.diags.Error(path, line, col, "semantic", msg);
+}
+func nilSrc(s *ast.Source) bool { return (s -> int) == 0; }
+func err(c *Checker, n *ast.Node, msg string) {
+    if (nilN(n)) { errAt(c, c.src, 1, 1, msg); return; }
+    errAt(c, n.src, n.line, n.col, msg);
+}
+func warn(c *Checker, n *ast.Node, msg string) {
+    if (!nilSrc(n.src) && !nilPkg(n.src.pkg) && n.src.pkg == c.builtinPkg) return;
+    c.diags.Warning(n.src.path, n.line, n.col, "semantic", msg);
+}
+func nilPkg(p *ast.Package) bool { return (p -> int) == 0; }
+func pkgErr(c *Checker, src *ast.Source, msg string) {
+    c.errors++;
+    c.diags.Error(src.path, 1, 1, "package", msg);
+}
+
+func mismatch(c *Checker, n *ast.Node, want *ast.Type, got *ast.Type) {
+    msg := "type mismatch: expected " + TypeString(want) + ", got " + TypeString(got);
+    w := want; g := got;
+    if (w.kind == ast.TK.Int && g.kind == ast.TK.Int) msg += "; narrowing integer conversion requires an explicit -> cast";
+    else if (w.kind == ast.TK.Float && g.kind == ast.TK.Float && w.bits < g.bits) msg += "; narrowing floating-point conversion requires an explicit -> cast";
+    err(c, n, msg);
+}
+
+// ---- scopes ----
+
+func push(c *Checker) { c.scope = ast.NewScope(c.scope); }
+func pop(c *Checker) { c.scope = c.scope.parent; }
+
+func declare(c *Checker, sym *ast.Symbol, at *ast.Node) {
+    if (sym.name == "_" || sym.name == "") return;
+    old := c.scope.LookupLocal(sym.name);
+    if (!nilS(old)) { err(c, at, "duplicate declaration: " + sym.name); return; }
+    c.scope.Insert(sym);
+    if (!nilF(c.fn)) {
+        sym.depth = c.fn.level;
+        c.fn.locals.append(sym);
+    }
+}
+func nilF(f *FuncCtx) bool { return (f -> int) == 0; }
+
+// lookup resolves a name through local scopes, file imports, the package,
+// dot imports, and the universe.
+func lookup(c *Checker, name string) *ast.Symbol {
+    s := c.scope.Lookup(name);
+    if (!nilS(s)) return s;
+    if (!nilSrc(c.src)) {
+        imp, ok := c.src.imports[name];
+        if (ok) return imp;
+    }
+    if (!nilPkg(c.pkg)) {
+        ps := c.pkg.scope.LookupLocal(name);
+        if (!nilS(ps)) return ps;
+        if (!nilSrc(c.src)) {
+            found := zero(*ast.Symbol);
+            for (_, dp := range c.src.dotImports) {
+                cand := dp.scope.LookupLocal(name);
+                if (!nilS(cand) && cand.exported) {
+                    if (!nilS(found) && found != cand) { errAt(c, c.src, 1, 1, "ambiguous dot import name: " + name); }
+                    found = cand;
+                }
+            }
+            if (!nilS(found)) return found;
+        }
+    }
+    return c.universe.LookupLocal(name);
+}
+
+// ---- universe ----
+
+func builtinType(c *Checker, name string, t *ast.Type) {
+    s := newSym(c, ast.SK.BuiltinType, name, zero(*ast.Node));
+    s.ty = t;
+    s.exported = true;
+    c.universe.Insert(s);
+}
+
+func initUniverse(c *Checker) {
+    InitTypes();
+    c.universe = ast.NewScope(zero(*ast.Scope));
+    builtinType(c, "int", tInt); builtinType(c, "i64", tInt); builtinType(c, "i8", tI8);
+    builtinType(c, "i16", tI16); builtinType(c, "i32", tI32); builtinType(c, "uint", tUint);
+    builtinType(c, "u64", tUint); builtinType(c, "u8", tU8); builtinType(c, "u16", tU16);
+    builtinType(c, "u32", tU32); builtinType(c, "float", tFloat); builtinType(c, "f64", tFloat);
+    builtinType(c, "f32", tF32); builtinType(c, "bool", tBool); builtinType(c, "string", tString);
+    builtinType(c, "any", tAny); builtinType(c, "void", tVoid);
+    names := []string{"len", "free", "delete", "recover", "true", "false"};
+    for (_, n := range names) {
+        s := newSym(c, ast.SK.BuiltinFunc, n, zero(*ast.Node));
+        s.exported = true;
+        c.universe.Insert(s);
+    }
+}
+
+func BuiltinSource() string {
+    return "package builtin;\n" +
+        "enum Result<T> { value(T), error(string) }\n" +
+        "func (r Result<T>) hasError() bool { return r == Result<T>.error; }\n" +
+        "func (r Result<T>) error() string { match (r) { Result<T>.error(m) => return m; Result => {} } return panic \"Result.error() called on a value result\"; }\n" +
+        "func (r Result<T>) unwrap() T { match (r) { Result<T>.value(v) => return v; Result<T>.error(m) => return panic m; } return zero(T); }\n" +
+        "func (r Result<T>) unwrapOrElse(fallback T) T { match (r) { Result<T>.value(v) => return v; Result => {} } return fallback; }\n" +
+        "func (r Result<T>) unwrapOrZero() T { match (r) { Result<T>.value(v) => return v; Result => {} } return zero(T); }\n" +
+        "enum Optional<T> { none, value(T) }\n" +
+        "func (o Optional<T>) hasValue() bool { return o != Optional<T>.none; }\n" +
+        "func (o Optional<T>) unwrap() T { match (o) { Optional<T>.value(v) => return v; Optional => {} } return panic \"Optional.unwrap() called on none\"; }\n";
+}
+
+// ---- package declarations ----
+
+func addPackageSym(c *Checker, p *ast.Package, sym *ast.Symbol, at *ast.Node) {
+    if (sym.name == "_" || sym.name == "") return;
+    old := p.scope.LookupLocal(sym.name);
+    if (!nilS(old)) {
+        pkgErr(c, at.src, "duplicate package declaration: " + sym.name);
+        return;
+    }
+    sym.global = true;
+    p.scope.Insert(sym);
+    p.syms.append(sym);
+}
+
+func declKind(c *Checker, n *ast.Node) ast.SK {
+    switch (n.kind) {
+    case ast.NK.Func: return ast.SK.Func;
+    case ast.NK.Struct: return ast.SK.Struct;
+    case ast.NK.Enum: return ast.SK.Enum;
+    case ast.NK.Interface: return ast.SK.Interface;
+    case ast.NK.TypeDecl: return n.flag ? ast.SK.Alias : ast.SK.TypeDef;
+    }
+    return ast.SK.Var;
+}
+
+func collectPackage(c *Checker, p *ast.Package) {
+    c.pkg = p;
+    p.scope = ast.NewScope(c.universe);
+    for (_, src := range p.files) {
+        c.src = src;
+        if (nilN(src.file)) continue;
+        for (_, d := range src.file.list) {
+            if (d.kind == ast.NK.Extern) {
+                ex, ok := src.externs[d.name];
+                if (ok) {
+                    if (!sameExtern(ex.node, d)) pkgErr(c, src, "conflicting extern declarations: " + d.name);
+                    d.sym = ex;
+                    continue;
+                }
+                s := newSym(c, ast.SK.Extern, d.name, d);
+                s.global = true;
+                src.externs[d.name] = s;
+                d.sym = s;
+                continue;
+            }
+            if (d.kind == ast.NK.VarDecl) {
+                for (_, id := range d.list) {
+                    s := newSym(c, ast.SK.Var, id.name, id);
+                    s.node = id; s.decl = d;
+                    id.sym = s;
+                    addPackageSym(c, p, s, d);
+                    c.globals.append(s);
+                }
+                continue;
+            }
+            if (d.kind == ast.NK.Func && !nilN(d.a)) continue; // methods later
+            s := newSym(c, declKind(c, d), d.name, d);
+            d.sym = s;
+            if (p == c.builtinPkg) { s.builtin = true; s.exported = true; }
+            if (d.kind == ast.NK.Func) c.funcs.append(s);
+            addPackageSym(c, p, s, d);
+        }
+    }
+    // imports become file-scoped bindings
+    for (_, src := range p.files) {
+        c.src = src;
+        for (_, imp := range src.importNodes) {
+            if (imp.name == "_") continue;
+            if (imp.name == ".") { src.dotImports.append(imp.sym.importPkg); continue; }
+            if (!nilS(p.scope.LookupLocal(imp.name))) pkgErr(c, src, "import name collides with package declaration: " + imp.name);
+            src.imports[imp.name] = imp.sym;
+        }
+    }
+}
+
+func sameTypeSyntax(a *ast.Node, b *ast.Node) bool {
+    if (nilN(a) || nilN(b)) return nilN(a) && nilN(b);
+    return ast.Dump(a) == ast.Dump(b);
+}
+func sameExtern(a *ast.Node, b *ast.Node) bool {
+    if (len(a.list) != len(b.list) || a.flag != b.flag || !sameTypeSyntax(a.a, b.a)) return false;
+    for (i := 0; i < len(a.list); i++) { if (!sameTypeSyntax(a.list[i].a, b.list[i].a)) return false; }
+    return true;
+}
+
+// collectMethods attaches methods to their receiver type symbols.
+func collectMethods(c *Checker, p *ast.Package) {
+    c.pkg = p;
+    for (_, src := range p.files) {
+        c.src = src;
+        if (nilN(src.file)) continue;
+        for (_, d := range src.file.list) {
+            if (d.kind != ast.NK.Func || nilN(d.a)) continue;
+            recv := d.a;
+            base := recv.a;
+            ptr := false;
+            if (base.kind == ast.NK.TPtr) { ptr = true; base = base.a; }
+            owner := p.scope.LookupLocal(base.name);
+            if (nilS(owner) || owner.kind == ast.SK.Alias) {
+                if (!nilS(owner) && owner.kind == ast.SK.Alias) {
+                    // methods on an alias attach to its target
+                    t := resolveSymType(c, owner);
+                    if (!nilT(t) && !nilS(t.sym) && t.sym.pkg == p && (t.kind == ast.TK.Struct || t.kind == ast.TK.Enum || t.kind == ast.TK.Named)) owner = t.sym;
+                    else owner = zero(*ast.Symbol);
+                }
+                if (nilS(owner)) {
+                    u := c.universe.LookupLocal(base.name);
+                    if (!nilS(u) || !nilS(lookupAnyPackage(c, base.name))) err(c, recv, "cannot define a method on a type from another package");
+                    else err(c, recv, "method receiver must name a struct, enum, or defined type");
+                    continue;
+                }
+            }
+            if (owner.kind != ast.SK.Struct && owner.kind != ast.SK.Enum && owner.kind != ast.SK.TypeDef) {
+                err(c, recv, "method receiver must name a struct, enum, or defined type");
+                continue;
+            }
+            m := newSym(c, ast.SK.Func, d.name, d);
+            m.owner = owner; m.recvPtr = ptr;
+            if (p == c.builtinPkg) { m.builtin = true; m.exported = true; }
+            d.sym = m;
+            nTP := 0;
+            if (!nilN(owner.node)) nTP = len(owner.node.list3);
+            if (len(d.list4) != nTP) {
+                if (len(d.list4) > 0 || nTP > 0) { err(c, recv, "receiver type parameter count mismatch"); continue; }
+            }
+            for (_, rp := range d.list4) {
+                if (!nilS(lookup(c, rp.name)) && !nilS(p.scope.LookupLocal(rp.name))) { err(c, rp, "receiver type arguments must declare fresh type parameter names"); }
+                tp := newSym(c, ast.SK.TypeParam, rp.name, rp);
+                m.recvParams.append(tp);
+                rp.sym = tp;
+            }
+            _, dup := owner.methods[d.name];
+            if (dup) { err(c, d, "duplicate method declaration"); continue; }
+            owner.methods[d.name] = m;
+            owner.methodList.append(m);
+            c.funcs.append(m);
+        }
+    }
+}
+
+func lookupAnyPackage(c *Checker, name string) *ast.Symbol {
+    if (nilSrc(c.src)) return zero(*ast.Symbol);
+    s, ok := c.src.imports[name];
+    if (ok) return s;
+    return zero(*ast.Symbol);
+}
+
+// ---- entry point ----
+
+struct Result { errors int; checker *Checker; }
+
+func NewChecker(diags *diag.List) *Checker {
+    c := new(Checker);
+    c.diags = diags;
+    initUniverse(c);
+    return c;
+}
+
+func (c *Checker) Universe() *ast.Scope { return c.universe; }
+func (c *Checker) Errors() int { return c.errors; }
+func (c *Checker) Globals() []*ast.Symbol { return c.globals; }
+func (c *Checker) BuiltinPackage() *ast.Package { return c.builtinPkg; }
+func (c *Checker) Packages() []*ast.Package { return c.packages; }
+
+// SetBuiltin registers the parsed builtin package (Result/Optional).
+func (c *Checker) SetBuiltin(p *ast.Package) { c.builtinPkg = p; }
+
+// Check analyzes packages in dependency order.
+func (c *Checker) Check(order []*ast.Package, stdRoot string) int {
+    c.stdRoot = stdRoot;
+    all := make([]*ast.Package);
+    if (!nilPkg(c.builtinPkg)) all.append(c.builtinPkg);
+    all.append(order...);
+    c.packages = all;
+    for (_, p := range all) collectPackage(c, p);
+    if (!nilPkg(c.builtinPkg)) {
+        r := c.builtinPkg.scope.LookupLocal("Result");
+        o := c.builtinPkg.scope.LookupLocal("Optional");
+        c.resultSym = r; c.optionalSym = o;
+        c.universe.Insert(r); c.universe.Insert(o);
+    }
+    for (_, p := range all) collectMethods(c, p);
+    for (_, p := range all) markIntrinsics(c, p);
+    for (_, p := range all) resolveDecls(c, p);
+    for (_, p := range all) checkBodies(c, p);
+    return c.errors;
+}
+
+func markIntrinsics(c *Checker, p *ast.Package) {
+    if (!p.std) return;
+    for (_, s := range p.syms) {
+        if (s.kind != ast.SK.Func) continue;
+        if (p.path == "reflect" && (s.name == "Fields" || s.name == "IsStruct" || s.name == "IsEnum" || s.name == "EnumVariant")) s.intrinsic = "reflect." + s.name;
+        if (p.path == "threads" && (s.name == "Spawn" || s.name == "Return")) { s.intrinsic = "threads." + s.name; }
+        if (p.path == "os" && s.name == "setArgs") { s.intrinsic = "os.setArgs"; c.osSetArgs = s; }
+    }
+    if (p.path == "threads" || p.path == "sync") c.usesThreads = true;
+}
+
+func (c *Checker) UsesThreads() bool { return c.usesThreads; }
+func (c *Checker) OsSetArgs() *ast.Symbol { return c.osSetArgs; }
+
+func resolveDecls(c *Checker, p *ast.Package) {
+    c.pkg = p;
+    for (_, s := range p.syms) {
+        c.src = s.src;
+        resolveSymType(c, s);
+    }
+    for (_, src := range p.files) {
+        c.src = src;
+        for (_, ex := range src.externs) resolveExtern(c, ex);
+    }
+    for (_, s := range p.syms) {
+        if (s.kind == ast.SK.Struct || s.kind == ast.SK.Enum || s.kind == ast.SK.TypeDef) {
+            for (_, m := range s.methodList) { c.src = m.src; resolveFuncSig(c, m); }
+            checkMethodNames(c, s);
+        }
+    }
+}
+
+func checkMethodNames(c *Checker, s *ast.Symbol) {
+    for (_, m := range s.methodList) {
+        if (s.kind == ast.SK.Struct) {
+            for (_, f := range s.fields) { if (f.name == m.name) err(c, m.node, "method name conflicts with a struct field"); }
+        }
+        if (s.kind == ast.SK.Enum && !s.builtin) {
+            for (_, v := range s.variants) {
+                if (v.name == m.name) err(c, m.node, "method name conflicts with an enum variant");
+                for (_, f := range v.fields) { if (f.name == m.name) err(c, m.node, "method name conflicts with an enum payload field"); }
+            }
+        }
+    }
+}
+
+func checkBodies(c *Checker, p *ast.Package) {
+    c.pkg = p;
+    for (_, src := range p.files) {
+        c.src = src;
+        if (nilN(src.file)) continue;
+        for (_, d := range src.file.list) {
+            if (d.kind == ast.NK.Func) checkFunc(c, d);
+            else if (d.kind == ast.NK.VarDecl) checkGlobal(c, d);
+        }
+    }
+    if (p.name == "main" && !p.test && p == c.packages[len(c.packages) - 1]) checkMain(c, p);
+}
+
+func checkMain(c *Checker, p *ast.Package) {
+    m := p.scope.LookupLocal("main");
+    if (nilS(m) || m.kind != ast.SK.Func) {
+        if (!nilS(m)) err(c, m.node, "main must be a function");
+        else if (len(p.files) > 0) pkgErr(c, p.files[0], "package main must declare func main()");
+        return;
+    }
+    ft := m.ty;
+    if (nilT(ft)) return;
+    if (len(ft.params) != 0 || len(m.typeParams) > 0 || len(ft.results) > 1 ||
+        (len(ft.results) == 1 && !Identical(ft.results[0], tInt))) {
+        err(c, m.node, "main must be declared as func main() or func main() int");
+    }
+}
+
+// ---- type parameter helpers ----
+
+func declareTypeParams(c *Checker, nodes []*ast.Node, owner *ast.Symbol) []*ast.Symbol {
+    out := make([]*ast.Symbol);
+    for (_, n := range nodes) {
+        if (n.name == "array") err(c, n, "array is a reserved type name");
+        s := newSym(c, ast.SK.TypeParam, n.name, n);
+        s.ty = ParamType(s);
+        n.sym = s;
+        out.append(s);
+    }
+    return out;
+}
+
+func withTypeParams(c *Checker, params []*ast.Symbol) {
+    push(c);
+    for (_, s := range params) {
+        if (nilT(s.ty)) s.ty = ParamType(s);
+        c.scope.Insert(s);
+    }
+}
+
+func resolveConstraints(c *Checker, params []*ast.Symbol) {
+    for (_, s := range params) {
+        if (!nilT(s.constraint)) continue;
+        n := s.node;
+        if (nilN(n) || nilN(n.a)) { s.constraint = tAny; continue; }
+        s.constraint = resolveConstraint(c, n.a);
+    }
+}
+
+func itoa(n int) string { return util.Itoa(n); }
+
+func (c *Checker) RecordType(et *ast.Type, v *ast.VariantInfo) *ast.Type { return recordType(c, et, v); }
+func (c *Checker) LitInfo(n *ast.Node) (bool, bool) { l := intLiteral(c, n); return l.ok, l.neg; }

@@ -1,0 +1,72 @@
+package util;
+import "testing";
+
+func TestItoa(t *testing.T) {
+    if (Itoa(0) != "0") t.Error("0");
+    if (Itoa(-45) != "-45") t.Error("-45 got ", Itoa(-45));
+    if (Itoa(-9223372036854775807 - 1) != "-9223372036854775808") t.Error("min");
+    if (Utoa(18446744073709551615->uint) != "18446744073709551615") t.Error("umax");
+    if (Hex(255->uint, 4) != "00ff") t.Error("hex");
+}
+
+func TestStrings(t *testing.T) {
+    if (!HasPrefix("hello", "he") || HasPrefix("he", "hello")) t.Error("prefix");
+    if (!HasSuffix("file_test.oc", "_test.oc")) t.Error("suffix");
+    if (Index("abcabc", "ca") != 2 || Index("abc", "x") != -1) t.Error("index");
+    parts := Split("a/b//c", '/');
+    if (len(parts) != 4 || parts[3] != "c" || parts[2] != "") t.Error("split");
+    if (JoinList(parts, ",") != "a,b,,c") t.Error("join");
+    if (Trim("  x y \n") != "x y") t.Error("trim");
+    if (Replace("aXbXc", "X", "--") != "a--b--c") t.Error("replace");
+    n, ok := Atoi("-42");
+    if (!ok || n != -42) t.Error("atoi");
+    _, bad := Atoi("4x");
+    if (bad) t.Error("atoi bad");
+    if (Quote("a\"\n") != "\"a\\\"\\n\"") t.Error("quote ", Quote("a\"\n"));
+}
+
+func TestSort(t *testing.T) {
+    a := []string{"pear", "apple", "fig", "banana", "Apple"};
+    SortStrings(&a);
+    if (JoinList(a, " ") != "Apple apple banana fig pear") t.Error("sort ", JoinList(a, " "));
+}
+
+func TestBuf(t *testing.T) {
+    b := NewBuf();
+    b.Add("x=").AddInt(12).Addc(';');
+    if (b.String() != "x=12;" || b.Len() != 5 || b.Last() != ';') t.Error("buf");
+    b.Truncate(2);
+    if (b.String() != "x=") t.Error("truncate");
+}
+
+func TestPaths(t *testing.T) {
+    if (Clean("a/./b/../c//") != "a/c") t.Error("clean ", Clean("a/./b/../c//"));
+    if (Clean("/../x") != "/x") t.Error("clean abs");
+    if (Clean("../x") != "../x") t.Error("clean rel");
+    if (Dir("a/b/c") != "a/b" || Dir("c") != "." || Dir("/c") != "/") t.Error("dir");
+    if (Base("a/b/c/") != "c") t.Error("base");
+    if (Rel("/a/b", "/a/b/c/d") != "c/d" || Rel("/a", "/x") != "/x") t.Error("rel");
+    if (JoinPath(".", "x") != "x" || JoinPath("a/", "x") != "a/x") t.Error("joinpath");
+}
+
+func TestFiles(t *testing.T) {
+    dir, ok := MakeTempDir("ocean-util-test-");
+    if (!ok) { t.Fatal("tempdir"); }
+    path := dir + "/f.txt";
+    if (!WriteFile(path, "content\n")) t.Error("write");
+    text, rok := ReadFile(path);
+    if (!rok || text != "content\n") t.Error("read");
+    if (!IsRegular(path) || IsDir(path) || !IsDir(dir) || StatSize(path) != 8) t.Error("stat");
+    MkdirAll(dir + "/x/y");
+    names, _ := ListDir(dir);
+    if (len(names) != 2 || names[0] != "f.txt" || names[1] != "x") t.Error("list");
+    RemoveAll(dir);
+    if (Exists(dir)) t.Error("removeall");
+}
+
+func TestProcess(t *testing.T) {
+    st, out := RunCapture([]string{"sh", "-c", "echo hi; echo err >&2; exit 3"}.array());
+    if (st.Code != 3 || out != "hi\nerr\n") t.Error("capture ", st.Code, " ", out);
+    st2 := Run([]string{"sh", "-c", "kill -9 $$"}.array());
+    if (st2.Signal != 9) t.Error("signal");
+}

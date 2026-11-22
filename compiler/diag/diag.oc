@@ -1,0 +1,82 @@
+package diag;
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+// Diagnostic is one compiler message, reported in ocean-c's format:
+// [file:line:col]: phase severity: message, then a source snippet.
+struct Diagnostic {
+    file string;
+    line int;
+    col int;
+    phase string;
+    severity string;
+    message string;
+}
+
+struct List {
+    items []*Diagnostic;
+    errors int;
+    warnings int;
+    sources map[string]string;
+    // When live is set, diagnostics are written to stderr as they arrive.
+    live bool;
+}
+
+func NewList() *List { l := new(List); l.live = true; return l; }
+
+func (l *List) AddSource(file string, text string) { l.sources[file] = text; }
+
+func (l *List) Report(file string, line int, col int, phase string, severity string, message string) {
+    d := new(Diagnostic);
+    d.file = file; d.line = line; d.col = col; d.phase = phase; d.severity = severity; d.message = message;
+    l.items.append(d);
+    if (severity == "warning") l.warnings++; else l.errors++;
+    if (l.live) util.Stderr(l.Format(d));
+}
+
+func (l *List) Error(file string, line int, col int, phase string, message string) { l.Report(file, line, col, phase, "error", message); }
+func (l *List) Warning(file string, line int, col int, phase string, message string) { l.Report(file, line, col, phase, "warning", message); }
+
+func useColor() bool {
+    _, no := util.Getenv("NO_COLOR");
+    if (no) return false;
+    force, ok := util.Getenv("CLICOLOR_FORCE");
+    if (ok && force != "" && force != "0") return true;
+    return util.IsTerminal(2);
+}
+
+func (l *List) Format(d *Diagnostic) string {
+    b: util.Buf;
+    color := useColor();
+    if (color) b.Add(d.severity == "warning" ? "\x1b[33m" : "\x1b[31m");
+    line := d.line > 0 ? d.line : 1;
+    col := d.col > 0 ? d.col : 1;
+    b.Add("[").Add(d.file == "" ? "<source>" : d.file).Add(":").AddInt(line).Add(":").AddInt(col).Add("]: ");
+    b.Add(d.phase).Add(" ").Add(d.severity).Add(": ").Add(d.message).Add("\n");
+    text, ok := l.sources[d.file];
+    if (ok) b.Add(Snippet(text, line, col));
+    if (color) b.Add("\x1b[0m");
+    return b.String();
+}
+
+// Snippet renders " N | source line" and a caret line.
+func Snippet(text string, line int, col int) string {
+    start := 0;
+    for (n := 1; n < line; n++) {
+        i := start;
+        for (i < len(text) && text[i] != '\n') i++;
+        if (i >= len(text)) return "";
+        start = i + 1;
+    }
+    end := start;
+    for (end < len(text) && text[end] != '\n' && text[end] != '\r' && text[end] != 0) end++;
+    b: util.Buf;
+    prefix := " " + util.Itoa(line) + " | ";
+    b.Add(prefix).Add(text[start:end]).Add("\n");
+    for (i := 0; i < len(prefix); i++) b.Addc(prefix[i] == '|' ? '|'->i8 : ' '->i8);
+    caret := col - 1;
+    if (caret < 0) caret = 0;
+    if (caret > end - start) caret = end - start;
+    for (i := 0; i < caret; i++) b.Addc(text[start + i] == '\t' ? '\t'->i8 : ' '->i8);
+    b.Add("^\n");
+    return b.String();
+}

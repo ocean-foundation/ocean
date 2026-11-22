@@ -1,0 +1,370 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+
+// allowContext lets an untyped literal at n take its type from context.
+func allowContext(c *Checker, n *ast.Node) { n.flag2 = true; }
+
+func checkElem(c *Checker, e *ast.Node, t *ast.Type) {
+    if (e.kind == ast.NK.Composite && nilN(e.a)) allowContext(c, e);
+    expr(c, e, t);
+    coerce(c, e, t, e);
+}
+
+func compositeExpr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
+    if (nilN(n.a)) {
+        if (n.flag2 && !nilT(expected)) return literalOf(c, n, expected);
+        return standaloneLiteral(c, n);
+    }
+    // enum record construction E.V{...}
+    if (n.a.kind == ast.NK.Member) {
+        et, isType := typeOfExpr(c, n.a.a);
+        if (isType && (et.kind == ast.TK.Enum || et.kind == ast.TK.Family)) return enumRecord(c, n, et, expected);
+    }
+    t, isType := typeOfExpr(c, n.a);
+    if (!isType) {
+        if (n.a.kind == ast.NK.Ident && nilS(lookup(c, n.a.name))) { err(c, n.a, "unresolved type: " + n.a.name); return tInvalid; }
+        err(c, n, "literal prefix must name an array, buffer, or struct type");
+        return tInvalid;
+    }
+    if (t.kind == ast.TK.Invalid) return tInvalid;
+    if (t.kind == ast.TK.Array && t.len == -3) {
+        t = ArrayOf(t.elem, len(n.list));
+    }
+    if (t.kind == ast.TK.Array && t.len == -2) { err(c, n, "array<T> cannot instantiate an array; use T[n]"); return tInvalid; }
+    if (t.kind == ast.TK.Family) { err(c, n, "struct literals require concrete type arguments"); return tInvalid; }
+    return literalOf(c, n, t);
+}
+
+func standaloneLiteral(c *Checker, n *ast.Node) *ast.Type {
+    if (len(n.list) == 0) { err(c, n, "cannot infer an empty literal; specify an array, buffer, or struct type"); return tInvalid; }
+    for (_, e := range n.list) { if (!nilN(e.a)) { err(c, n, "literal requires an array, buffer, or struct assignment destination"); return tInvalid; } }
+    first := n.list[0].b;
+    if (first.kind == ast.NK.Null) { err(c, n, "null array elements require an explicit pointer element type"); return tInvalid; }
+    et := valueExpr(c, first);
+    t := ArrayOf(et, len(n.list));
+    for (i := 1; i < len(n.list); i++) checkElem(c, n.list[i].b, et);
+    return t;
+}
+
+func literalOf(c *Checker, n *ast.Node, t *ast.Type) *ast.Type {
+    n.tyAlt = t;
+    u := Underlying(t);
+    switch (u.kind) {
+    case ast.TK.Array, ast.TK.Dyn, ast.TK.Buffer:
+        if (u.kind == ast.TK.Buffer && nilT(u.elem)) { err(c, n, "zero requires a concrete buffer element type"); return tInvalid; }
+        if (u.kind == ast.TK.Buffer && u.len == -1) { err(c, n, "runtime-sized buffers cannot have initializers"); return tInvalid; }
+        if (u.kind == ast.TK.Array && u.len == -1) { err(c, n, "runtime-sized arrays cannot have initializers"); return tInvalid; }
+        if (u.kind == ast.TK.Array && u.len == -2) { err(c, n, "array<T> cannot instantiate an array; use T[n]"); return tInvalid; }
+        for (_, e := range n.list) {
+            if (!nilN(e.a)) { err(c, e, "array and buffer literals require positional elements"); return t; }
+        }
+        if ((u.kind == ast.TK.Array || u.kind == ast.TK.Buffer) && u.len >= 0 && len(n.list) > u.len) {
+            err(c, n, u.kind == ast.TK.Buffer ? "too many elements in buffer initializer" : "too many elements in array initializer");
+        }
+        for (_, e := range n.list) checkElem(c, e.b, u.elem);
+        if (u.kind == ast.TK.Dyn && !u.isMixed && IsInterface(u.elem)) homogeneous(c, n);
+        return t;
+    case ast.TK.Map:
+        for (_, e := range n.list) {
+            if (nilN(e.a)) { err(c, e, "map literals require key: value entries"); continue; }
+            checkElem(c, e.a, u.key);
+            checkElem(c, e.b, u.elem);
+        }
+        return t;
+    case ast.TK.Struct: return structLiteral(c, n, t, c.FieldsOf(u));
+    case ast.TK.Interface:
+        err(c, n, "literal requires an array, buffer, or struct assignment destination");
+        return tInvalid;
+    }
+    if (t.kind != ast.TK.Invalid) err(c, n, "literal prefix must name an array, buffer, or struct type");
+    return tInvalid;
+}
+
+func homogeneous(c *Checker, n *ast.Node) {
+    first := zero(*ast.Type);
+    for (_, e := range n.list) {
+        et := dynamicTypeHint(c, e.b);
+        if (nilT(et)) continue;
+        if (nilT(first)) { first = et; continue; }
+        if (!Identical(first, et)) { err(c, e, "homogeneous array elements must have the same type"); return; }
+    }
+}
+
+// dynamicTypeHint gives the concrete static type of an element expression (nil if an interface).
+func dynamicTypeHint(c *Checker, e *ast.Node) *ast.Type {
+    t := e.ty;
+    if (nilT(t) || IsInterface(t) || t.kind == ast.TK.Null || t.kind == ast.TK.Union) return zero(*ast.Type);
+    return t;
+}
+
+func structLiteral(c *Checker, n *ast.Node, t *ast.Type, fields []*ast.FieldInfo) *ast.Type {
+    keyed := len(n.list) > 0 && !nilN(n.list[0].a);
+    seen := make([]bool);
+    for (i := 0; i < len(fields); i++) seen.append(false);
+    if (keyed) {
+        for (_, e := range n.list) {
+            if (e.a.kind != ast.NK.Ident) { err(c, e, "struct literal keys must be field names"); continue; }
+            idx := -1;
+            for (i, f := range fields) { if (f.name == e.a.name) idx = i; }
+            if (idx < 0) { err(c, e, "unknown composite field or too many struct literal elements"); continue; }
+            if (seen[idx]) { err(c, e, "duplicate struct field initializer"); continue; }
+            seen[idx] = true;
+            e.ival = idx;
+            checkElem(c, e.b, fields[idx].ty);
+        }
+    } else {
+        if (len(n.list) > len(fields)) err(c, n, "unknown composite field or too many struct literal elements");
+        for (i, e := range n.list) {
+            if (i >= len(fields)) break;
+            seen[i] = true;
+            e.ival = i;
+            checkElem(c, e.b, fields[i].ty);
+        }
+    }
+    for (i, f := range fields) {
+        if (f.valueParam && !seen[i]) { err(c, n, "missing struct parameter initializer"); break; }
+    }
+    return t;
+}
+
+func enumRecord(c *Checker, n *ast.Node, et *ast.Type, expected *ast.Type) *ast.Type {
+    if (et.kind == ast.TK.Family) {
+        if (!nilT(expected) && expected.kind == ast.TK.Enum && expected.sym == et.sym) et = expected;
+        else { err(c, n, "generic enum constructor requires explicit type arguments"); return tInvalid; }
+    }
+    v := variantOf(c, et, n.a.name);
+    if (nilV(v)) { err(c, n.a, "unknown enum variant: " + n.a.name); return tInvalid; }
+    checkVariantExport(c, n.a, et, n.a.name);
+    if (v.vkind != 2) { err(c, n, "only record enum variants use brace construction"); return et; }
+    n.sem = ast.Sem.CallEnum; n.ival = v.index; n.tyAlt = et;
+    n.a.sem = ast.Sem.EnumSelector; n.a.ty = et; n.a.ival = v.index;
+    structLiteral(c, n, et, v.fields);
+    return et;
+}
+
+// recordType synthesizes the immutable payload struct of a record variant.
+func recordType(c *Checker, et *ast.Type, v *ast.VariantInfo) *ast.Type {
+    key := TypeKey(et) + "." + v.name;
+    cached, ok := c.recordTypes[key];
+    if (ok) return cached;
+    s := newSym(c, ast.SK.Struct, et.sym.name + "." + v.name, v.node);
+    s.fields = v.fields; s.state = 2; s.immutable = true; s.pkg = et.sym.pkg;
+    t := selfType(c, s);
+    s.ty = t;
+    c.recordTypes[key] = t;
+    return t;
+}
+
+// ---- assertions / extraction ----
+
+func assertExpr(c *Checker, n *ast.Node) *ast.Type {
+    xt := valueExpr(c, n.a);
+    if (xt.kind == ast.TK.Invalid) return tInvalid;
+    if (xt.kind == ast.TK.Enum) return extractExpr(c, n, xt);
+    target := resolveTypeOrUnion(c, n.b);
+    n.tyAlt = target;
+    if (xt.kind != ast.TK.Interface && xt.kind != ast.TK.Union && xt.kind != ast.TK.Param && xt.kind != ast.TK.Family &&
+        !(xt.kind == ast.TK.Buffer && nilT(xt.elem)) && !(xt.kind == ast.TK.Array && xt.len == -2)) {
+        err(c, n, "type assertion requires an interface or any value");
+        return target;
+    }
+    if (target.kind == ast.TK.Array && target.len == -3) { err(c, n, "Inferred array length requires a literal body"); return tInvalid; }
+    if (n.flag2) return target;
+    return target;
+}
+
+func extractExpr(c *Checker, n *ast.Node, xt *ast.Type) *ast.Type {
+    pat := n.b;
+    if (pat.kind == ast.NK.Inst || pat.kind == ast.NK.Ident) { err(c, n, "enum extraction requires a concrete variant"); return tInvalid; }
+    if (pat.kind != ast.NK.Member) { err(c, n, "enum extraction requires a concrete variant"); return tInvalid; }
+    et, isType := typeOfExpr(c, pat.a);
+    if (!isType || (et.kind != ast.TK.Enum && et.kind != ast.TK.Family)) { err(c, n, "enum extraction requires a value of the same enum"); return tInvalid; }
+    if (et.sym != xt.sym) { err(c, n, "enum extraction requires a value of the same enum"); return tInvalid; }
+    if (et.kind == ast.TK.Enum && !Identical(et, xt)) { err(c, n, "enum extraction type arguments do not match the source"); return tInvalid; }
+    if (HasParams(xt) && false) { err(c, n, "enum extraction requires a concrete specialization"); }
+    v := variantOf(c, xt, pat.name);
+    if (nilV(v)) { err(c, pat, "unknown enum variant: " + pat.name); return tInvalid; }
+    checkVariantExport(c, pat, xt, pat.name);
+    n.sem = ast.Sem.EnumSelector; n.ival = v.index; n.tyAlt = xt;
+    pat.ival = v.index;
+    if (v.vkind == 0) { err(c, n, "unit enum variant has no payload"); return tInvalid; }
+    if (v.vkind == 3) return v.fixedType;
+    if (v.vkind == 1) {
+        if (len(v.types) == 1) return v.types[0];
+        return TupleOf(v.types);
+    }
+    // record
+    if (n.flag) {
+        out := make([]*ast.Type);
+        for (_, e := range n.list) {
+            name := "";
+            if (e.b.kind == ast.NK.Ident) name = e.b.name;
+            else if (e.b.kind == ast.NK.Assign && e.b.b.kind == ast.NK.Ident && e.b.a.kind == ast.NK.Ident) name = e.b.b.name;
+            else { err(c, e, "enum pattern bindings and fields must be names"); return tInvalid; }
+            idx := -1;
+            for (i, f := range v.fields) { if (f.name == name) idx = i; }
+            if (idx < 0) { err(c, e, "unknown enum payload field: " + name); return tInvalid; }
+            e.ival = idx;
+            out.append(v.fields[idx].ty);
+        }
+        if (len(out) == 1) return out[0];
+        return TupleOf(out);
+    }
+    return recordType(c, xt, v);
+}
+
+// ---- casts and builtins ----
+
+func castExpr(c *Checker, n *ast.Node) *ast.Type {
+    target := resolveTypeOrFamily(c, n.b);
+    n.tyAlt = target;
+    st := expr(c, n.a, zero(*ast.Type));
+    if (target.kind == ast.TK.Invalid || st.kind == ast.TK.Invalid) return target;
+    if (st.kind == ast.TK.UntypedInt) {
+        u := Underlying(target);
+        l := intLiteral(c, n.a);
+        if (u.kind == ast.TK.Int && litFits(l, u.bits, u.signed)) { setLitType(c, n.a, u); return target; }
+        if (u.kind == ast.TK.Float) {
+            setLitType(c, n.a, u);
+            if (u.bits == 32 && l.mag.BitLen() > 128) warn(c, n, "integer literal is out of range for f32 and becomes infinity; cast it with ->f64 if that is intended");
+            return target;
+        }
+        st = defaultType(c, n.a, st);
+        if (u.kind == ast.TK.Ptr) return target;
+    }
+    if (st.kind == ast.TK.UntypedFloat) {
+        u := Underlying(target);
+        if (u.kind == ast.TK.Float) { setLitType(c, n.a, u); checkF32Literal(c, n.a, u); return target; }
+        st = defaultType(c, n.a, st);
+    }
+    if (st.kind == ast.TK.Interface && target.kind != ast.TK.Interface && !IsAny(target)) {
+        // `any` values convert with assertions, not casts; ocean-c permits
+        // primitive casts of boxed values, handled as assertions.
+        u := Underlying(target);
+        if (u.kind == ast.TK.Int || u.kind == ast.TK.Float || u.kind == ast.TK.Bool || u.kind == ast.TK.String) { n.sem = ast.Sem.CallIface; return target; }
+        err(c, n, "invalid conversion");
+        return target;
+    }
+    if (target.kind == ast.TK.Array && target.len == -3) { err(c, n, "Inferred array length requires a literal body"); return tInvalid; }
+    if (!c.Convertible(st, target)) {
+        ua := Underlying(st); ud := Underlying(target);
+        if (ua.kind == ast.TK.Ptr && ud.kind == ast.TK.Ptr) err(c, n, "cannot cast between pointers to immutable strings and mutable values");
+        else err(c, n, "invalid conversion");
+    }
+    return target;
+}
+
+func storageType(c *Checker, n *ast.Node, t *ast.Type, what string) bool {
+    if (t.kind == ast.TK.Void) { err(c, n, "void has no storage size"); return false; }
+    return true;
+}
+
+func zeroExpr(c *Checker, n *ast.Node) *ast.Type {
+    t := resolveTypeOrFamily(c, n.a);
+    n.tyAlt = t;
+    if (t.kind == ast.TK.Void) { err(c, n, "void has no value representation"); return tInvalid; }
+    if (IsAny(t) && n.a.kind == ast.NK.Ident && n.a.name == "any") { err(c, n, "zero requires a storage type or a type parameter, not any"); return tInvalid; }
+    if (t.kind == ast.TK.Buffer && (nilT(t.elem) || t.len == -1)) { err(c, n, "zero requires a fixed-size buffer type; use buffer<T, N> or buffer<T>"); return tInvalid; }
+    if (t.kind == ast.TK.Array && (t.len == -2 || t.len == -1)) { err(c, n, "array<T> cannot instantiate an array; use T[n]"); return tInvalid; }
+    if (t.kind == ast.TK.Family) { err(c, n, "struct literals require concrete type arguments"); return tInvalid; }
+    return t;
+}
+
+func newExpr(c *Checker, n *ast.Node) *ast.Type {
+    t := resolveTypeOrFamily(c, n.a);
+    n.tyAlt = t;
+    if (t.kind == ast.TK.Void || (t.kind == ast.TK.Array && t.len < 0) || t.kind == ast.TK.Family || (t.kind == ast.TK.Buffer && t.len <= 0)) {
+        err(c, n, "new requires a storage type"); return tInvalid;
+    }
+    return PtrTo(t);
+}
+
+func makeExpr(c *Checker, n *ast.Node) *ast.Type {
+    t := resolveTypeOrFamily(c, n.a);
+    n.tyAlt = t;
+    if (t.kind != ast.TK.Dyn && t.kind != ast.TK.Map) { err(c, n, "make requires a dynamic array type T[] or map[K]V"); return tInvalid; }
+    return t;
+}
+
+func sizeofExpr(c *Checker, n *ast.Node) *ast.Type {
+    t, isType := typeOfExpr(c, n.a);
+    if (!isType) {
+        t = valueExpr(c, n.a);
+    }
+    if (t.kind == ast.TK.Void) err(c, n, "void has no storage size");
+    if (t.kind == ast.TK.Array && t.len == -3) t = tInvalid;
+    n.tyAlt = t;
+    return tInt;
+}
+
+func arrayAllocExpr(c *Checker, n *ast.Node) *ast.Type {
+    if (n.flag) { err(c, n, "Inferred array length requires a literal body"); return tInvalid; }
+    e := resolveTypeOrUnion(c, n.a);
+    lt := expr(c, n.b, tInt);
+    if (isUntyped(lt)) defaultType(c, n.b, lt);
+    if (!IsInteger(n.b.ty) && n.b.ty.kind != ast.TK.Invalid) err(c, n.b, "invalid allocation length");
+    l := intLiteral(c, n.b);
+    if (l.ok && l.neg) err(c, n, "array item count must not be negative");
+    if (IsInterface(e) && !IsAny(e)) { err(c, n, "interface array allocation requires a concrete element type; use an array literal"); }
+    n.tyAlt = e;
+    return DynOf(e);
+}
+
+func bufferAllocExpr(c *Checker, n *ast.Node) *ast.Type {
+    if (nilN(n.a) || nilN(n.b)) { err(c, n, "Array type expression requires a literal body"); return tInvalid; }
+    e := resolveTypeOrUnion(c, n.a);
+    lt := expr(c, n.b, tInt);
+    if (isUntyped(lt)) defaultType(c, n.b, lt);
+    if (!IsInteger(n.b.ty) && n.b.ty.kind != ast.TK.Invalid) err(c, n.b, "invalid runtime buffer size");
+    n.tyAlt = e;
+    return BufferOf(e, -2);
+}
+
+// ---- function literals ----
+
+func funcLit(c *Checker, n *ast.Node) *ast.Type {
+    ft := signature(c, n.list, n.list2, n.flag);
+    c.literals.append(n);
+    f := new(FuncCtx);
+    f.node = n; f.outer = c.fn; f.isLiteral = true;
+    f.level = nilF(c.fn) ? 1 : c.fn.level + 1;
+    f.results = ft.results;
+    saved := c.fn;
+    c.fn = f;
+    push(c);
+    c.scope.isFunc = true;
+    declareParams(c, n.list, n.list2, f);
+    funcBody(c, n.b, f);
+    pop(c);
+    c.fn = saved;
+    n.ty = ft;
+    return ft;
+}
+
+func declareParams(c *Checker, params []*ast.Node, results []*ast.Node, f *FuncCtx) {
+    for (_, p := range params) {
+        if (p.name == "" || p.name == "_") continue;
+        s := newSym(c, ast.SK.Var, p.name, p);
+        s.param = true; s.ty = p.ty;
+        p.sym = s;
+        declare(c, s, p);
+    }
+    for (_, r := range results) {
+        if (r.name == "" || r.name == "_") {
+            if (r.name == "_") {
+                s := newSym(c, ast.SK.Var, "_", r);
+                s.result = true; s.ty = r.ty; r.sym = s;
+                f.named.append(s);
+            }
+            continue;
+        }
+        s := newSym(c, ast.SK.Var, r.name, r);
+        s.result = true; s.ty = r.ty;
+        r.sym = s;
+        declare(c, s, r);
+        f.named.append(s);
+    }
+}
+
+func isScanKind(c *Checker, k scanner.Kind) bool { return k == scanner.Kind.EOF; }

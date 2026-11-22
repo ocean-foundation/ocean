@@ -1,0 +1,363 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+
+struct Env { params []*ast.Symbol; args []*ast.Type; }
+
+func makeEnv(params []*ast.Symbol, args []*ast.Type) *Env {
+    e := new(Env);
+    e.params = params; e.args = args;
+    return e;
+}
+func nilE(e *Env) bool { return (e -> int) == 0; }
+func MakeEnv(params []*ast.Symbol, args []*ast.Type) *Env { return makeEnv(params, args); }
+func (e *Env) Extend(params []*ast.Symbol, args []*ast.Type) *Env {
+    out := new(Env);
+    out.params = e.params + params;
+    out.args = e.args + args;
+    return out;
+}
+
+func (e *Env) lookup(s *ast.Symbol) *ast.Type {
+    for (i := 0; i < len(e.params) && i < len(e.args); i++) { if (e.params[i] == s) return e.args[i]; }
+    return zero(*ast.Type);
+}
+
+// Subst replaces type parameters bound in env.
+func Subst(t *ast.Type, env *Env) *ast.Type {
+    if (nilT(t) || nilE(env) || len(env.params) == 0) return t;
+    switch (t.kind) {
+    case ast.TK.Param:
+        r := env.lookup(t.sym);
+        if (!nilT(r)) return r;
+        return t;
+    case ast.TK.Ptr, ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
+        if (nilT(t.elem)) return t;
+        e := Subst(t.elem, env);
+        if (e == t.elem) return t;
+        n := ast.NewType(t.kind);
+        n.elem = e; n.len = t.len; n.isMixed = t.isMixed; n.lenNode = t.lenNode;
+        return n;
+    case ast.TK.Map:
+        k := Subst(t.key, env); v := Subst(t.elem, env);
+        if (k == t.key && v == t.elem) return t;
+        return MapOf(k, v);
+    case ast.TK.Func, ast.TK.Tuple:
+        changed := false;
+        ps := make([]*ast.Type); rs := make([]*ast.Type);
+        for (_, p := range t.params) { q := Subst(p, env); if (q != p) changed = true; ps.append(q); }
+        for (_, r := range t.results) { q := Subst(r, env); if (q != r) changed = true; rs.append(q); }
+        if (!changed) return t;
+        n := ast.NewType(t.kind);
+        n.params = ps; n.results = rs; n.variadic = t.variadic;
+        return n;
+    case ast.TK.Struct, ast.TK.Enum, ast.TK.Interface:
+        if (len(t.args) == 0) return t;
+        changed := false;
+        argl := make([]*ast.Type);
+        for (_, a := range t.args) { q := Subst(a, env); if (q != a) changed = true; argl.append(q); }
+        if (!changed) return t;
+        n := ast.NewType(t.kind);
+        n.sym = t.sym; n.args = argl;
+        if (t.kind == ast.TK.Interface) {
+            for (_, m := range t.methods) {
+                nm := new(ast.Method);
+                nm.name = m.name; nm.ty = Subst(m.ty, env); nm.typeParams = m.typeParams; nm.sym = m.sym;
+                n.methods.append(nm);
+            }
+            for (_, term := range t.terms) n.terms.append(Subst(term, env));
+            n.tilde = t.tilde;
+        }
+        return n;
+    case ast.TK.Union:
+        changed := false;
+        ts := make([]*ast.Type);
+        for (_, term := range t.terms) { q := Subst(term, env); if (q != term) changed = true; ts.append(q); }
+        if (!changed) return t;
+        n := ast.NewType(ast.TK.Union);
+        n.terms = ts; n.tilde = t.tilde;
+        return n;
+    }
+    return t;
+}
+
+func substList(c *Checker, ts []*ast.Type, env *Env) []*ast.Type {
+    out := make([]*ast.Type);
+    for (_, t := range ts) out.append(Subst(t, env));
+    return out;
+}
+
+func substMethods(c *Checker, ms []*ast.Method, env *Env) []*ast.Method {
+    out := make([]*ast.Method);
+    for (_, m := range ms) {
+        nm := new(ast.Method);
+        nm.name = m.name; nm.ty = Subst(m.ty, env); nm.typeParams = m.typeParams; nm.sym = m.sym;
+        out.append(nm);
+    }
+    return out;
+}
+
+// HasParams reports whether a type mentions any type parameter.
+func HasParams(t *ast.Type) bool {
+    if (nilT(t)) return false;
+    switch (t.kind) {
+    case ast.TK.Param: return true;
+    case ast.TK.Ptr, ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer: return !nilT(t.elem) && HasParams(t.elem);
+    case ast.TK.Map: return HasParams(t.key) || HasParams(t.elem);
+    case ast.TK.Func, ast.TK.Tuple:
+        for (_, p := range t.params) { if (HasParams(p)) return true; }
+        for (_, r := range t.results) { if (HasParams(r)) return true; }
+        return false;
+    case ast.TK.Struct, ast.TK.Enum, ast.TK.Interface:
+        for (_, a := range t.args) { if (HasParams(a)) return true; }
+        return false;
+    case ast.TK.Union:
+        for (_, a := range t.terms) { if (HasParams(a)) return true; }
+        return false;
+    }
+    return false;
+}
+
+// ---- struct fields / enum variants / methods of instantiated types ----
+
+func (c *Checker) FieldsOf(t *ast.Type) []*ast.FieldInfo {
+    s := t.sym;
+    resolveSymType(c, s);
+    if (len(t.args) == 0 || len(s.typeParams) == 0) return s.fields;
+    key := TypeKey(t);
+    cached, ok := c.fieldCache[key];
+    if (ok) return cached;
+    env := makeEnv(s.typeParams, t.args);
+    out := make([]*ast.FieldInfo);
+    for (_, f := range s.fields) {
+        nf := new(ast.FieldInfo);
+        nf.name = f.name; nf.bits = f.bits; nf.valueParam = f.valueParam; nf.node = f.node;
+        nf.ty = Subst(f.ty, env);
+        out.append(nf);
+    }
+    c.fieldCache[key] = out;
+    return out;
+}
+
+func (c *Checker) VariantsOf(t *ast.Type) []*ast.VariantInfo {
+    s := t.sym;
+    resolveSymType(c, s);
+    if (len(t.args) == 0 || len(s.typeParams) == 0) return s.variants;
+    key := TypeKey(t);
+    cached, ok := c.variantCache[key];
+    if (ok) return cached;
+    env := makeEnv(s.typeParams, t.args);
+    out := make([]*ast.VariantInfo);
+    for (_, v := range s.variants) {
+        nv := new(ast.VariantInfo);
+        nv.name = v.name; nv.vkind = v.vkind; nv.index = v.index; nv.node = v.node;
+        nv.fixedValue = v.fixedValue;
+        nv.fixedType = Subst(v.fixedType, env);
+        for (_, ty := range v.types) nv.types.append(Subst(ty, env));
+        for (_, f := range v.fields) {
+            nf := new(ast.FieldInfo);
+            nf.name = f.name; nf.node = f.node; nf.ty = Subst(f.ty, env);
+            nv.fields.append(nf);
+        }
+        out.append(nv);
+    }
+    c.variantCache[key] = out;
+    return out;
+}
+
+// methodsOf returns the method set of an interface type.
+func methodsOf(c *Checker, t *ast.Type) []*ast.Method {
+    if (t.kind != ast.TK.Interface) return make([]*ast.Method);
+    if (!nilS(t.sym)) {
+        resolveSymType(c, t.sym);
+        if (len(t.args) == 0) return t.sym.self.methods;
+        if (len(t.methods) > 0) return t.methods;
+        env := makeEnv(t.sym.typeParams, t.args);
+        return substMethods(c, t.sym.self.methods, env);
+    }
+    return t.methods;
+}
+func (c *Checker) MethodsOf(t *ast.Type) []*ast.Method { return methodsOf(c, t); }
+
+struct MethodRef { sym *ast.Symbol; env *Env; ty *ast.Type; ptr bool; ok bool; }
+
+// FindMethod locates a concrete method on a struct/enum/defined type.
+func (c *Checker) FindMethod(t *ast.Type, name string) MethodRef {
+    r: MethodRef;
+    if (t.kind != ast.TK.Struct && t.kind != ast.TK.Enum && t.kind != ast.TK.Named) return r;
+    s := t.sym;
+    resolveSymType(c, s);
+    m, ok := s.methods[name];
+    if (!ok) return r;
+    resolveFuncSig(c, m);
+    r.sym = m; r.ok = true; r.ptr = m.recvPtr;
+    r.env = makeEnv(m.recvParams, t.args);
+    r.ty = Subst(m.ty, r.env);
+    return r;
+}
+
+// sameSignature compares a concrete method with an interface requirement.
+func sameSignature(c *Checker, m MethodRef, req *ast.Method) bool {
+    if (len(m.sym.typeParams) != len(req.typeParams)) return false;
+    ty := m.ty;
+    if (len(req.typeParams) > 0) {
+        args := make([]*ast.Type);
+        for (_, tp := range req.typeParams) { if (nilT(tp.ty)) tp.ty = ParamType(tp); args.append(tp.ty); }
+        ty = Subst(ty, makeEnv(m.sym.typeParams, args));
+        for (i, tp := range m.sym.typeParams) {
+            resolveConstraints(c, m.sym.typeParams);
+            resolveConstraints(c, req.typeParams);
+            a := Subst(tp.constraint, makeEnv(m.sym.typeParams, args));
+            if (!sameConstraint(c, a, req.typeParams[i].constraint)) return false;
+        }
+    }
+    return Identical(ty, req.ty);
+}
+
+// Implements reports whether t satisfies a method interface.
+func (c *Checker) Implements(t *ast.Type, iface *ast.Type) bool {
+    reqs := methodsOf(c, iface);
+    if (len(iface.terms) > 0 && !inTerms(c, t, iface)) return false;
+    if (len(reqs) == 0) return true;
+    if (t.kind == ast.TK.Interface) {
+        have := methodsOf(c, t);
+        for (_, r := range reqs) {
+            found := false;
+            for (_, h := range have) { if (h.name == r.name && Identical(h.ty, r.ty)) found = true; }
+            if (!found) return false;
+        }
+        return true;
+    }
+    if (t.kind == ast.TK.Param) {
+        if (nilT(t.sym.constraint)) return false;
+        return c.Implements(t.sym.constraint, iface);
+    }
+    base := t;
+    ptr := false;
+    if (t.kind == ast.TK.Ptr) { base = t.elem; ptr = true; }
+    if (base.kind != ast.TK.Struct && base.kind != ast.TK.Enum && base.kind != ast.TK.Named) return false;
+    if (len(base.args) > 0 && !nilS(base.sym) && len(base.sym.typeParams) > 0 && HasParams(base) && false) return false;
+    for (_, r := range reqs) {
+        m := c.FindMethod(base, r.name);
+        if (!m.ok) return false;
+        if (m.ptr && !ptr) return false;
+        if (!sameSignature(c, m, r)) return false;
+    }
+    return true;
+}
+
+func inTerms(c *Checker, t *ast.Type, u *ast.Type) bool {
+    for (i, term := range u.terms) {
+        if (matchTerm(c, t, term, u.tilde[i])) return true;
+    }
+    return false;
+}
+
+// matchTerm checks one constraint term against a type.
+func matchTerm(c *Checker, t *ast.Type, term *ast.Type, tilde bool) bool {
+    if (tilde) return Identical(Underlying(t), Underlying(term));
+    if (Identical(t, term)) return true;
+    switch (term.kind) {
+    case ast.TK.Interface:
+        if (IsAny(term)) return true;
+        return c.Implements(t, term);
+    case ast.TK.Family:
+        return (t.kind == ast.TK.Struct || t.kind == ast.TK.Enum || t.kind == ast.TK.Family) && t.sym == term.sym;
+    case ast.TK.Buffer:
+        if (t.kind != ast.TK.Buffer) return false;
+        if (nilT(term.elem)) return true;
+        if (nilT(t.elem)) return false;
+        if (term.len == -2) return Identical(t.elem, term.elem);
+        return false;
+    case ast.TK.Array:
+        if (t.kind != ast.TK.Array) return false;
+        if (term.len == -2) return IsAny(term.elem) || Identical(t.elem, term.elem) || matchTerm(c, t.elem, term.elem, false);
+        return false;
+    case ast.TK.Dyn:
+        if (t.kind != ast.TK.Dyn) return false;
+        if (term.isMixed) return (t.isMixed && Identical(t.elem, term.elem)) || (!t.isMixed && (Identical(t.elem, term.elem) || satisfies(c, t.elem, term.elem)));
+        return false;
+    case ast.TK.Struct, ast.TK.Enum:
+        if (t.kind != term.kind || t.sym != term.sym || len(t.args) != len(term.args)) return false;
+        for (i := 0; i < len(t.args); i++) {
+            if (!Identical(t.args[i], term.args[i]) && !(term.args[i].kind == ast.TK.Family && matchTerm(c, t.args[i], term.args[i], false))) return false;
+        }
+        return true;
+    case ast.TK.Union: return inTerms(c, t, term);
+    }
+    return false;
+}
+
+// satisfies checks a (possibly parametric) type against a constraint.
+func satisfies(c *Checker, t *ast.Type, constraint *ast.Type) bool {
+    if (nilT(constraint) || IsAny(constraint)) return true;
+    if (t.kind == ast.TK.Invalid) return true;
+    if (t.kind == ast.TK.Param) {
+        tc := t.sym.constraint;
+        if (nilT(tc) || IsAny(tc)) return false;
+        if (tc.kind == ast.TK.Union || (tc.kind == ast.TK.Interface && len(tc.terms) > 0)) {
+            for (_, term := range tc.terms) { if (!satisfies(c, term, constraint)) return false; }
+            return true;
+        }
+        if (tc.kind == ast.TK.Interface) return constraint.kind == ast.TK.Interface && c.Implements(t, constraint);
+        return satisfies(c, tc, constraint);
+    }
+    if (t.kind == ast.TK.Union) {
+        for (i, term := range t.terms) { if (t.tilde[i] || !satisfies(c, term, constraint)) return false; }
+        return true;
+    }
+    if (constraint.kind == ast.TK.Union) return inTerms(c, t, constraint);
+    if (constraint.kind == ast.TK.Interface) {
+        if (len(constraint.terms) > 0 && len(methodsOf(c, constraint)) == 0) return inTerms(c, t, constraint);
+        return c.Implements(t, constraint);
+    }
+    return matchTerm(c, t, constraint, false);
+}
+func (c *Checker) Satisfies(t *ast.Type, constraint *ast.Type) bool { return satisfies(c, t, constraint); }
+
+// constraintTerms lists the concrete types a type parameter or union admits
+// (empty when unbounded, e.g. any or a method interface).
+func constraintTerms(c *Checker, t *ast.Type) []*ast.Type {
+    out := make([]*ast.Type);
+    if (t.kind == ast.TK.Param) {
+        if (nilT(t.sym.constraint)) return out;
+        return constraintTerms(c, t.sym.constraint);
+    }
+    if (t.kind == ast.TK.Union || (t.kind == ast.TK.Interface && len(t.terms) > 0)) {
+        for (i, term := range t.terms) {
+            if (t.tilde[i]) { out.append(term); continue; }
+            sub := constraintTerms(c, term);
+            if (len(sub) > 0) out.append(sub...); else out.append(term);
+        }
+    }
+    return out;
+}
+
+func (e *Env) Args() []*ast.Type { return e.args; }
+func (e *Env) Params() []*ast.Symbol { return e.params; }
+
+// sameConstraint compares constraints by their admitted term sets.
+func sameConstraint(c *Checker, a *ast.Type, b *ast.Type) bool {
+    if (nilT(a) || nilT(b)) return nilT(a) == nilT(b);
+    if (IsAny(a) && IsAny(b)) return true;
+    if (Identical(a, b)) return true;
+    ta := flatTerms(a); tb := flatTerms(b);
+    if (len(ta.terms) == 0 || len(ta.terms) != len(tb.terms)) return false;
+    for (i, x := range ta.terms) {
+        found := false;
+        for (j, y := range tb.terms) { if (ta.tilde[i] == tb.tilde[j] && Identical(x, y)) found = true; }
+        if (!found) return false;
+    }
+    return true;
+}
+func flatTerms(t *ast.Type) *ast.Type {
+    u := ast.NewType(ast.TK.Union);
+    if (t.kind == ast.TK.Union || (t.kind == ast.TK.Interface && len(t.terms) > 0)) {
+        for (i, x := range t.terms) {
+            if (!t.tilde[i] && (x.kind == ast.TK.Union || (x.kind == ast.TK.Interface && len(x.terms) > 0))) {
+                sub := flatTerms(x);
+                for (j, y := range sub.terms) { u.terms.append(y); u.tilde.append(sub.tilde[j]); }
+            } else { u.terms.append(x); u.tilde.append(t.tilde[i]); }
+        }
+    }
+    return u;
+}

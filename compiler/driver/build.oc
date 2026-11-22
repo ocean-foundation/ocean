@@ -1,0 +1,77 @@
+package driver;
+import "github.com/ocean-foundation/ocean/compiler/loader";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+func loaderValidModulePath(s string) bool { return loader.ValidModulePath(s); }
+
+struct BuildOptions {
+    run bool;
+    check bool;
+    emit bool;
+    staticLink bool;
+    output string;
+    location string;
+    programArgs []string;
+}
+
+func packageMain(args []string) int {
+    o: BuildOptions;
+    o.run = args[1] == "run";
+    o.check = args[1] == "check";
+    argumentStart := len(args);
+    for (i := 2; i < len(args); i++) {
+        a := args[i];
+        if (a == "--") {
+            argumentStart = i + 1;
+            if (o.run) { for (j := i + 1; j < len(args); j++) o.programArgs.append(args[j]); }
+            break;
+        }
+        if (a == "-o") {
+            i++;
+            if (i >= len(args)) { util.Stderr("ocean: -o requires an output path\n"); return 1; }
+            o.output = args[i];
+        } else if (a == "--emit-llvm") o.emit = true;
+        else if (a == "--check") o.check = true;
+        else if (a == "--static" || a == "-s") o.staticLink = true;
+        else if (len(a) > 0 && a[0] == '-') {
+            if (o.run && o.location != "") { o.programArgs.append(a); continue; }
+            util.Stderr("ocean: unknown option: " + a + "\n"); return 1;
+        } else if (o.location == "") o.location = a;
+        else if (o.run) o.programArgs.append(a);
+        else { util.Stderr("ocean build accepts one package location\n"); return 1; }
+    }
+    if ((o.staticLink && (o.check || o.emit)) || (o.run && (o.output != "" || o.emit || o.check)) ||
+        (o.check && (o.output != "" || o.emit)) || (!o.run && argumentStart != len(args))) {
+        util.Stderr("ocean: incompatible build/run options\n"); return 1;
+    }
+    if (o.location == "") o.location = ".";
+    return buildPackage(&o);
+}
+
+func buildPackage(o *BuildOptions) int {
+    diags := newDiags();
+    prog := Frontend(o.location, false, "", diags);
+    if (prog.fatal) return 1;
+    if (ast_nil(prog)) return 1;
+    if (prog.build.Errors() > 0 || prog.name == "") return 1;
+    if (o.staticLink && prog.isLibrary) { util.Stderr("ocean: --static requires a main package executable\n"); return 1; }
+    if (o.run && prog.isLibrary) { util.Stderr("ocean run: package " + prog.name + " is not main\n"); return 1; }
+    if (!prog.ok) return 1;
+    if (o.run && targetWasm()) { util.Stderr("ocean run: WebAssembly output must be run by a WebAssembly host\n"); return 1; }
+    if (o.check) {
+        failed := checkBackend(prog);
+        if (!failed && prog.build.HasTestSources(o.location)) {
+            harness, _ := util.MakeTempDir(".ocean-check-harness-");
+            tdiags := newDiags();
+            tprog := Frontend(o.location, true, harness, tdiags);
+            failed = tprog.fatal || !tprog.ok;
+            if (!failed) failed = checkBackend(tprog);
+            util.RemoveAll(harness);
+        }
+        return failed ? 1 : 0;
+    }
+    return emitAndLink(prog, o);
+}
+
+func ast_nil(p *Program) bool { return (p -> int) == 0; }
+func targetWasm() bool { os, _ := util.Getenv("OCOS"); arch, _ := util.Getenv("OCARCH"); return os == "js" && arch == "wasm"; }

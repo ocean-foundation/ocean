@@ -1,0 +1,841 @@
+package parser;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/legacy";
+
+struct Parser {
+    src *ast.Source;
+    toks []*scanner.Token;
+    pos int;
+    split int;
+    diags *diag.List;
+    failed bool;
+    trial int;
+    funcDepth int;
+    depth int;
+    recover bool;
+    packageName string;
+    sawPackage bool;
+    fix bool;
+    rewrites []*FixRewrite;
+    known map[string]bool;
+    typeParamNames []string;
+}
+
+// FixRewrite replaces source bytes [start, end) with text (ocean fix).
+struct FixRewrite { start int; end int; text string; }
+
+// recordFix records a legacy span starting at token start and skips past it.
+func recordFix(p *Parser, start int, r legacy.Rewrite) {
+    w := new(FixRewrite);
+    w.start = p.toks[start].off;
+    w.end = p.toks[start + r.consumed - 1].end;
+    w.text = r.text;
+    p.rewrites.append(w);
+    p.pos = start + r.consumed;
+    if (p.pos >= len(p.toks)) p.pos = len(p.toks) - 1;
+    p.split = 0;
+}
+
+// ParseForFix collects legacy type rewrites in a file. known lists declared
+// type names (plain or qualifier.Name) eligible for expression rewrites.
+func ParseForFix(src *ast.Source, diags *diag.List, known map[string]bool) []*FixRewrite {
+    p := new(Parser);
+    p.src = src; p.toks = src.tokens; p.diags = diags; p.recover = true; p.fix = true; p.known = known;
+    p.trial = 1;
+    if (!is(p, scanner.Kind.KwPackage)) return p.rewrites;
+    next(p);
+    if (tk(p) == scanner.Kind.Ident) next(p);
+    accept(p, scanner.Kind.Semi);
+    for (!is(p, scanner.Kind.EOF)) {
+        start := p.pos;
+        topLevel(p, node(p, ast.NK.File));
+        if (p.failed) { p.failed = false; recoverTop(p, start); }
+    }
+    return p.rewrites;
+}
+
+func tok(p *Parser) *scanner.Token { return p.toks[p.pos]; }
+
+// k returns the effective current token kind, accounting for a partially
+// consumed >> / >= / >>= when closing type arguments.
+func tk(p *Parser) scanner.Kind {
+    if (p.failed) return scanner.Kind.EOF;
+    t := p.toks[p.pos].kind;
+    if (p.split > 0) {
+        if (t == scanner.Kind.Shr) return scanner.Kind.Gt;
+        if (t == scanner.Kind.GtEq) return scanner.Kind.Assign;
+        if (t == scanner.Kind.ShrEq) return p.split == 1 ? scanner.Kind.GtEq : scanner.Kind.Assign;
+    }
+    return t;
+}
+func peek(p *Parser, n int) scanner.Kind {
+    if (p.failed) return scanner.Kind.EOF;
+    i := p.pos + n;
+    if (i >= len(p.toks)) return scanner.Kind.EOF;
+    return p.toks[i].kind;
+}
+func peekTok(p *Parser, n int) *scanner.Token {
+    i := p.pos + n;
+    if (i >= len(p.toks)) i = len(p.toks) - 1;
+    return p.toks[i];
+}
+func next(p *Parser) {
+    if (p.failed) return;
+    p.split = 0;
+    if (p.pos < len(p.toks) - 1) p.pos++;
+}
+func is(p *Parser, k scanner.Kind) bool { return tk(p) == k; }
+func isIdent(p *Parser, name string) bool { return tk(p) == scanner.Kind.Ident && tok(p).text == name; }
+func accept(p *Parser, k scanner.Kind) bool {
+    if (tk(p) == k) { next(p); return true; }
+    return false;
+}
+
+func errTok(p *Parser, t *scanner.Token, col int, msg string) {
+    if (p.failed) return;
+    p.failed = true;
+    if (p.trial > 0) return;
+    p.diags.Error(p.src.path, t.line, col, "syntax", msg);
+}
+func err(p *Parser, msg string) { t := tok(p); errTok(p, t, t.col + p.split, msg); }
+func errNode(p *Parser, n *ast.Node, msg string) {
+    if (p.failed) return;
+    p.failed = true;
+    if (p.trial > 0) return;
+    p.diags.Error(p.src.path, n.line, n.col, "syntax", msg);
+}
+func expect(p *Parser, k scanner.Kind, msg string) bool {
+    if (tk(p) == k) { next(p); return true; }
+    err(p, msg);
+    return false;
+}
+
+struct mark { pos int; split int; }
+func save(p *Parser) mark { m: mark; m.pos = p.pos; m.split = p.split; return m; }
+func restore(p *Parser, m mark) { p.pos = m.pos; p.split = m.split; p.failed = false; }
+
+func node(p *Parser, k ast.NK) *ast.Node {
+    t := tok(p);
+    n := ast.NewNode(k, t, p.src);
+    n.col = t.col + p.split;
+    return n;
+}
+func nodeAt(p *Parser, k ast.NK, at *ast.Node) *ast.Node {
+    n := new(ast.Node);
+    n.kind = k; n.src = p.src; n.line = at.line; n.col = at.col; n.off = at.off; n.end = at.end;
+    return n;
+}
+// finish records the end offset of a node as the end of the previous token.
+func finish(p *Parser, n *ast.Node) *ast.Node {
+    if (p.pos > 0) {
+        e := p.toks[p.pos - 1].end;
+        if (e > n.end) n.end = e;
+    }
+    return n;
+}
+
+func ellipsis(p *Parser) bool {
+    return tk(p) == scanner.Kind.Dot && peek(p, 1) == scanner.Kind.Dot && peek(p, 2) == scanner.Kind.Dot;
+}
+func skipEllipsis(p *Parser) { next(p); next(p); next(p); }
+
+func ident(p *Parser, msg string) string {
+    if (tk(p) != scanner.Kind.Ident) { err(p, msg); return ""; }
+    s := tok(p).text;
+    next(p);
+    return s;
+}
+
+// closeAngle consumes one '>' (possibly half of '>>').
+func closeAngle(p *Parser) bool {
+    k := tk(p);
+    if (k == scanner.Kind.Gt) { next(p); return true; }
+    t := tok(p).kind;
+    if (k == scanner.Kind.Shr || k == scanner.Kind.GtEq || (t == scanner.Kind.ShrEq && k != scanner.Kind.Assign)) {
+        p.split++;
+        return true;
+    }
+    return false;
+}
+
+// ParseFile parses one source file. Returns false on a syntax error.
+func ParseFile(src *ast.Source, diags *diag.List, recover bool) (*ast.Node, bool) {
+    p := new(Parser);
+    p.src = src; p.toks = src.tokens; p.diags = diags; p.recover = recover;
+    f := node(p, ast.NK.File);
+    if (!is(p, scanner.Kind.KwPackage)) {
+        t := tok(p);
+        diags.Error(src.path, t.line, t.col, "package", "expected package declaration at the top of the file");
+        return f, false;
+    }
+    next(p);
+    if (tk(p) != scanner.Kind.Ident) {
+        if (is(p, scanner.Kind.Str)) err(p, "Expected unquoted package name"); else err(p, "Expected identifier");
+        return f, false;
+    }
+    f.name = tok(p).text;
+    f.nameLine = tok(p).line; f.nameCol = tok(p).col;
+    next(p);
+    if (!expect(p, scanner.Kind.Semi, "Expected semicolon after package declaration")) return f, false;
+    for (!is(p, scanner.Kind.EOF)) {
+        start := p.pos;
+        topLevel(p, f);
+        if (p.failed) {
+            if (!p.recover) return f, false;
+            p.failed = false;
+            recoverTop(p, start);
+        }
+    }
+    return f, !p.failed;
+}
+
+func recoverTop(p *Parser, start int) {
+    if (p.pos <= start) next(p);
+    for (!is(p, scanner.Kind.EOF)) {
+        k := tk(p);
+        t := tok(p);
+        if (t.col == 1 && (k == scanner.Kind.KwFunc || k == scanner.Kind.KwStruct || k == scanner.Kind.KwEnum ||
+            k == scanner.Kind.KwInterface || k == scanner.Kind.KwType || k == scanner.Kind.KwImport ||
+            k == scanner.Kind.KwExtern || k == scanner.Kind.Ident)) return;
+        next(p);
+    }
+}
+
+func topLevel(p *Parser, f *ast.Node) {
+    k := tk(p);
+    if (k == scanner.Kind.KwImport) { importDecl(p, f); return; }
+    if (k == scanner.Kind.KwPackage) { err(p, "Duplicate package declaration"); return; }
+    if (k == scanner.Kind.Semi) { next(p); return; }
+    if (k == scanner.Kind.KwReturn) { err(p, "Return is only allowed inside a function"); return; }
+    if (k == scanner.Kind.KwPanic) { err(p, "Panic is only allowed inside a function"); return; }
+    if (k == scanner.Kind.KwDefer) { err(p, "Defer is only allowed inside a function"); return; }
+    if (k == scanner.Kind.KwGoto || k == scanner.Kind.KwBreak || k == scanner.Kind.KwContinue || k == scanner.Kind.KwFallthrough) {
+        err(p, "Branch statement is not valid in this context"); return;
+    }
+    if (k == scanner.Kind.KwAsm) { err(p, "Unexpected 'asm', expected expression"); return; }
+    if (isIdent(p, "forward") && peek(p, 1) == scanner.Kind.KwPanic) { err(p, "Forward panic is only allowed inside a function"); return; }
+    d := declaration(p, true);
+    if (!ast.Nil(d)) { f.list.append(d); return; }
+    if (p.failed) return;
+    // Any other statement at file scope.
+    s := statement(p);
+    if (!p.failed) errNode(p, s, "statement is not allowed at file scope");
+}
+
+// declaration parses a type/function/extern/var declaration, or returns nil.
+func declaration(p *Parser, top bool) *ast.Node {
+    k := tk(p);
+    if (k == scanner.Kind.KwFunc) {
+        if (!top && peek(p, 1) != scanner.Kind.Ident) return zero(*ast.Node);
+        return funcDecl(p);
+    }
+    if (k == scanner.Kind.KwExtern) {
+        if (peek(p, 1) == scanner.Kind.Dot) return zero(*ast.Node);
+        if (!top) { err(p, "Extern declarations are only allowed at file scope"); return zero(*ast.Node); }
+        return externDecl(p);
+    }
+    if (k == scanner.Kind.KwStruct) return structDecl(p);
+    if (k == scanner.Kind.KwEnum) return enumDecl(p);
+    if (k == scanner.Kind.KwInterface && peek(p, 1) == scanner.Kind.Ident) return interfaceDecl(p);
+    if (k == scanner.Kind.KwType) return typeDecl(p);
+    if (top && (k == scanner.Kind.Ident || k == scanner.Kind.Blank)) {
+        if (isDeclStart(p)) {
+            d := varDecl(p);
+            expect(p, scanner.Kind.Semi, "Expected semicolon");
+            return d;
+        }
+    }
+    return zero(*ast.Node);
+}
+
+func importDecl(p *Parser, f *ast.Node) {
+    next(p);
+    if (accept(p, scanner.Kind.LParen)) {
+        for (!is(p, scanner.Kind.RParen) && !is(p, scanner.Kind.EOF)) {
+            line := tok(p).line;
+            importSpec(p, f);
+            if (p.failed) return;
+            if (accept(p, scanner.Kind.Comma) || accept(p, scanner.Kind.Semi)) continue;
+            if (is(p, scanner.Kind.RParen)) break;
+            if (tok(p).line > line) continue;
+            err(p, "Expected separator between imports"); return;
+        }
+        expect(p, scanner.Kind.RParen, "Expected right paren");
+        accept(p, scanner.Kind.Semi);
+        return;
+    }
+    importSpec(p, f);
+    expect(p, scanner.Kind.Semi, "Expected semicolon after import");
+}
+
+func importSpec(p *Parser, f *ast.Node) {
+    n := node(p, ast.NK.Import);
+    alias := ""; hasAlias := false;
+    if (is(p, scanner.Kind.Ident) || is(p, scanner.Kind.Blank)) { alias = tok(p).text; hasAlias = true; next(p); }
+    else if (is(p, scanner.Kind.Dot)) { alias = "."; hasAlias = true; next(p); }
+    if (!is(p, scanner.Kind.Str)) { err(p, "Expected quoted import path"); return; }
+    n.text = tok(p).text;
+    n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    if (n.text == "") { err(p, "Import path must not be empty"); return; }
+    next(p);
+    if (accept(p, scanner.Kind.KwAs)) {
+        if (hasAlias) { err(p, "Import alias specified twice"); return; }
+        if (is(p, scanner.Kind.Ident) || is(p, scanner.Kind.Blank)) { alias = tok(p).text; next(p); }
+        else if (is(p, scanner.Kind.Dot)) { alias = "."; next(p); }
+        else { err(p, "Expected import alias after as"); return; }
+    }
+    n.name = alias;
+    finish(p, n);
+    f.list2.append(n);
+}
+
+// ---- type parameters, parameters, results ----
+
+func typeParams(p *Parser, enumDecl bool) []*ast.Node {
+    out := make([]*ast.Node);
+    if (is(p, scanner.Kind.LBrack)) {
+        if (enumDecl) { err(p, "Enum type parameters require angle brackets <...>"); return out; }
+        next(p);
+        typeParamList(p, &out, scanner.Kind.RBrack);
+        expect(p, scanner.Kind.RBrack, "Expected closing type argument angle");
+        return out;
+    }
+    if (!is(p, scanner.Kind.Lt)) return out;
+    next(p);
+    typeParamList(p, &out, scanner.Kind.Gt);
+    if (!closeAngle(p)) err(p, "Expected closing type argument angle");
+    return out;
+}
+
+func typeParamList(p *Parser, out *[]*ast.Node, close scanner.Kind) {
+    pending := make([]*ast.Node);
+    for (!is(p, close) && !is(p, scanner.Kind.EOF)) {
+        if (close == scanner.Kind.Gt && (is(p, scanner.Kind.Shr) || is(p, scanner.Kind.GtEq))) break;
+        if (!is(p, scanner.Kind.Ident)) { err(p, "Expected type parameter name"); return; }
+        n := node(p, ast.NK.TypeParam);
+        n.name = tok(p).text;
+        next(p);
+        pending.append(n);
+        (*out).append(n);
+        if (!is(p, scanner.Kind.Comma) && !is(p, close) && !(close == scanner.Kind.Gt && (is(p, scanner.Kind.Shr) || is(p, scanner.Kind.GtEq)))) {
+            c := constraint(p);
+            for (_, q := range pending) q.a = c;
+            pending = make([]*ast.Node);
+        }
+        if (!accept(p, scanner.Kind.Comma)) break;
+    }
+}
+
+struct paramElem { name string; nameNode *ast.Node; ty *ast.Node; variadic bool; bare bool; }
+
+func startsType(p *Parser) bool {
+    k := tk(p);
+    return k == scanner.Kind.Ident || k == scanner.Kind.KwAny || k == scanner.Kind.Star || k == scanner.Kind.LBrack ||
+        k == scanner.Kind.KwFunc || k == scanner.Kind.KwMixed || k == scanner.Kind.KwVarint || k == scanner.Kind.KwVaruint ||
+        k == scanner.Kind.KwInterface || k == scanner.Kind.KwStruct || k == scanner.Kind.Tilde;
+}
+
+// paramList parses '(' ... ')' for parameters (allowVariadic) or results.
+func paramList(p *Parser, allowVariadic bool, what string) []*ast.Node {
+    out := make([]*ast.Node);
+    if (!expect(p, scanner.Kind.LParen, "Expected function parameter list")) return out;
+    elems := make([]*paramElem);
+    anyNamed := false;
+    for (!is(p, scanner.Kind.RParen) && !is(p, scanner.Kind.EOF)) {
+        e := new(paramElem);
+        if (is(p, scanner.Kind.Ident) && (peek(p, 1) == scanner.Kind.Comma || peek(p, 1) == scanner.Kind.RParen)) {
+            e.bare = true; e.name = tok(p).text; e.nameNode = node(p, ast.NK.Ident); e.nameNode.name = e.name;
+            finish(p, e.nameNode); next(p);
+        } else if ((is(p, scanner.Kind.Ident) || is(p, scanner.Kind.Blank)) && namedParamFollows(p)) {
+            e.name = tok(p).text; e.nameNode = node(p, ast.NK.Ident); e.nameNode.name = e.name; next(p);
+            anyNamed = true;
+            if (ellipsis(p)) { skipEllipsis(p); e.variadic = true; }
+            e.ty = constraintChecked(p);
+        } else {
+            if (ellipsis(p)) { skipEllipsis(p); e.variadic = true; }
+            e.ty = constraintChecked(p);
+        }
+        elems.append(e);
+        if (p.failed) return out;
+        if (!accept(p, scanner.Kind.Comma)) break;
+        if (is(p, scanner.Kind.RParen)) break;
+    }
+    if (!is(p, scanner.Kind.RParen)) { err(p, "Expected comma or closing parenthesis"); return out; }
+    next(p);
+    if (anyNamed) {
+        // Bare identifiers are names sharing the next named element's type.
+        for (i := 0; i < len(elems); i++) {
+            e := elems[i];
+            if (!e.bare && e.name == "") { errNode(p, e.ty, "Cannot mix named and unnamed parameters"); return out; }
+            if (e.bare) {
+                j := i;
+                for (j < len(elems) && elems[j].bare) j++;
+                if (j >= len(elems)) { errNode(p, e.nameNode, "Cannot mix named and unnamed parameters"); return out; }
+                if (elems[j].variadic) { errNode(p, e.nameNode, "Variadic parameter must have one name"); return out; }
+                e.ty = elems[j].ty;
+            }
+        }
+    }
+    for (i, e := range elems) {
+        n := new(ast.Node);
+        n.kind = ast.NK.Param; n.src = p.src;
+        if (e.bare && !anyNamed) {
+            n.a = e.nameNode;
+            n.line = e.nameNode.line; n.col = e.nameNode.col; n.off = e.nameNode.off; n.end = e.nameNode.end;
+        } else {
+            at := ast.Nil(e.nameNode) ? e.ty : e.nameNode;
+            n.line = at.line; n.col = at.col; n.off = at.off; n.end = at.end;
+            n.name = e.name; n.a = e.ty;
+            if (!ast.Nil(e.nameNode)) { n.nameLine = e.nameNode.line; n.nameCol = e.nameNode.col; }
+        }
+        n.flag = e.variadic;
+        if (e.variadic) {
+            if (!allowVariadic) { errNode(p, n, "Variadic parameter must be last"); return out; }
+            if (i != len(elems) - 1) { errNode(p, n, "Variadic parameter must be last"); return out; }
+        }
+        out.append(n);
+    }
+    return out;
+}
+
+func namedParamFollows(p *Parser) bool {
+    k := peek(p, 1);
+    if (k == scanner.Kind.Dot) return peek(p, 2) == scanner.Kind.Dot;
+    return k == scanner.Kind.Ident || k == scanner.Kind.KwAny || k == scanner.Kind.Star || k == scanner.Kind.LBrack ||
+        k == scanner.Kind.KwFunc || k == scanner.Kind.KwMixed || k == scanner.Kind.KwVarint || k == scanner.Kind.KwVaruint ||
+        k == scanner.Kind.KwInterface || k == scanner.Kind.KwStruct || k == scanner.Kind.Tilde;
+}
+
+// results parses an optional result list after parameters.
+func results(p *Parser) []*ast.Node {
+    if (is(p, scanner.Kind.LParen)) return paramList(p, false, "result");
+    out := make([]*ast.Node);
+    if (startsType(p) && !is(p, scanner.Kind.LBrace)) {
+        n := node(p, ast.NK.Param);
+        n.a = constraintChecked(p);
+        finish(p, n);
+        out.append(n);
+    }
+    return out;
+}
+
+func checkDuplicateNames(p *Parser, fn *ast.Node) {
+    seen: map[string]bool;
+    lists := [3][]*ast.Node{fn.list, fn.list2, make([]*ast.Node)};
+    if (!ast.Nil(fn.a)) {
+        seen[fn.a.name] = true;
+    }
+    for (li := 0; li < 2; li++) {
+        for (_, prm := range lists[li]) {
+            if (prm.name == "" || prm.name == "_") continue;
+            _, dup := seen[prm.name];
+            if (dup) {
+                if (!ast.Nil(fn.a) && prm.name == fn.a.name) errNode(p, prm, "Parameter or result duplicates method receiver");
+                else if (li == 1) errNode(p, prm, "Result name duplicates a parameter name");
+                else errNode(p, prm, "Duplicate name in function signature");
+                return;
+            }
+            seen[prm.name] = true;
+        }
+    }
+}
+
+func funcDecl(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Func);
+    next(p);
+    if (is(p, scanner.Kind.LParen)) {
+        // method receiver
+        next(p);
+        r := node(p, ast.NK.Param);
+        if (!is(p, scanner.Kind.Ident)) { err(p, "Expected one named method receiver"); return n; }
+        r.name = tok(p).text; r.nameLine = tok(p).line; r.nameCol = tok(p).col;
+        next(p);
+        if (ellipsis(p)) { err(p, "Method receivers cannot be variadic"); return n; }
+        rt := node(p, ast.NK.TPtr);
+        ptr := accept(p, scanner.Kind.Star);
+        if (!is(p, scanner.Kind.Ident)) { err(p, "Expected a struct receiver type or pointer to one"); return n; }
+        base := node(p, ast.NK.Ident);
+        base.name = tok(p).text;
+        next(p);
+        finish(p, base);
+        if (is(p, scanner.Kind.Lt) || is(p, scanner.Kind.LBrack)) {
+            closeK := is(p, scanner.Kind.Lt) ? scanner.Kind.Gt : scanner.Kind.RBrack;
+            next(p);
+            for (!is(p, closeK) && !is(p, scanner.Kind.EOF)) {
+                if (!is(p, scanner.Kind.Ident)) { err(p, "Receiver type arguments must be type parameter names"); return n; }
+                a := node(p, ast.NK.TypeParam);
+                a.name = tok(p).text;
+                for (_, prev := range n.list4) { if (prev.name == a.name) { err(p, "Duplicate receiver type parameter"); return n; } }
+                if (a.name == r.name) { err(p, "Receiver name duplicates a receiver type parameter"); return n; }
+                next(p);
+                n.list4.append(a);
+                if (!accept(p, scanner.Kind.Comma)) break;
+            }
+            if (closeK == scanner.Kind.Gt) { if (!closeAngle(p)) { err(p, "Invalid receiver type parameters"); return n; } }
+            else if (!accept(p, closeK)) { err(p, "Invalid receiver type parameters"); return n; }
+        }
+        if (ptr) { rt.a = base; finish(p, rt); r.a = rt; } else r.a = base;
+        if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected one named method receiver"); return n; }
+        finish(p, r);
+        n.a = r;
+    }
+    if (!is(p, scanner.Kind.Ident)) { err(p, "Expected function name"); return n; }
+    n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    next(p);
+    n.list3 = typeParams(p, false);
+    savedTP := len(p.typeParamNames);
+    for (_, tp := range n.list3) p.typeParamNames.append(tp.name);
+    for (_, rp := range n.list4) p.typeParamNames.append(rp.name);
+    for (_, tp := range n.list3) {
+        for (_, rp := range n.list4) {
+            if (rp.name == tp.name) { errNode(p, tp, "Method type parameter redeclares a receiver type parameter"); return n; }
+        }
+    }
+    if (!is(p, scanner.Kind.LParen)) { err(p, "Expected function parameter list"); return n; }
+    n.list = paramList(p, true, "parameter");
+    if (len(n.list) > 0 && n.list[len(n.list) - 1].flag) n.flag = true;
+    n.list2 = results(p);
+    checkDuplicateNames(p, n);
+    if (!is(p, scanner.Kind.LBrace)) { err(p, "Expected function body"); return n; }
+    p.funcDepth++;
+    n.b = block(p);
+    p.funcDepth--;
+    for (len(p.typeParamNames) > savedTP) p.typeParamNames.pop();
+    return finish(p, n);
+}
+
+func externDecl(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Extern);
+    next(p);
+    if (isIdent(p, "void") && peek(p, 1) == scanner.Kind.Ident) next(p);
+    else n.a = typeChecked(p);
+    if (!is(p, scanner.Kind.Ident)) { err(p, "Expected extern function name after return type"); return n; }
+    n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    next(p);
+    if (!accept(p, scanner.Kind.LParen)) { err(p, "Expected extern function parameter list"); return n; }
+    if (isIdent(p, "void") && peek(p, 1) == scanner.Kind.RParen) { next(p); }
+    else {
+        for (!is(p, scanner.Kind.RParen) && !is(p, scanner.Kind.EOF)) {
+            if (ellipsis(p)) {
+                if (len(n.list) == 0) { err(p, "C variadic declarations require a fixed parameter"); return n; }
+                skipEllipsis(p); n.flag = true;
+                break;
+            }
+            prm := node(p, ast.NK.Param);
+            prm.a = typeChecked(p);
+            if (is(p, scanner.Kind.Ident) || is(p, scanner.Kind.Blank)) { prm.name = tok(p).text; next(p); }
+            finish(p, prm);
+            n.list.append(prm);
+            if (p.failed) return n;
+            if (!accept(p, scanner.Kind.Comma)) break;
+        }
+    }
+    if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected comma or closing parenthesis"); return n; }
+    expect(p, scanner.Kind.Semi, "Expected semicolon after extern function");
+    return finish(p, n);
+}
+
+func fieldDecls(p *Parser, n *ast.Node, valueNames map[string]bool) {
+    for (!is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
+        if (accept(p, scanner.Kind.Semi)) continue;
+        names := make([]*ast.Node);
+        for (;;) {
+            if (!is(p, scanner.Kind.Ident)) { err(p, "Expected struct field name before type"); return; }
+            f := node(p, ast.NK.Field);
+            f.name = tok(p).text; f.nameLine = f.line; f.nameCol = f.col;
+            _, dupValue := valueNames[f.name];
+            if (dupValue) { err(p, "Struct field duplicates a value parameter"); return; }
+            next(p);
+            names.append(f);
+            if (!accept(p, scanner.Kind.Comma)) break;
+        }
+        if (ellipsis(p)) { err(p, "Variadic fields are not allowed"); return; }
+        t := typeChecked(p);
+        bits := 0;
+        if (accept(p, scanner.Kind.Colon)) {
+            if (!is(p, scanner.Kind.Int) || tok(p).isChar) { err(p, "bitfield size must be an integer literal from 1 through 64"); return; }
+            v := smallInt(tok(p).text);
+            if (v < 1 || v > 64) { err(p, "bitfield size must be an integer literal from 1 through 64"); return; }
+            bits = v;
+            next(p);
+        }
+        for (_, f := range names) { f.a = t; f.ival = bits; finish(p, f); n.list.append(f); }
+        if (!accept(p, scanner.Kind.Semi)) {
+            if (is(p, scanner.Kind.RBrace)) break;
+            err(p, "Expected semicolon after struct fields"); return;
+        }
+    }
+}
+
+// smallInt parses a small literal (decimal/hex/binary/octal); -1 if too large.
+func smallInt(text string) int {
+    base := 10; i := 0;
+    if (len(text) > 2 && text[0] == '0') {
+        c := text[1];
+        if (c == 'x' || c == 'X') { base = 16; i = 2; }
+        else if (c == 'b' || c == 'B') { base = 2; i = 2; }
+        else if (c == 'o' || c == 'O') { base = 8; i = 2; }
+    }
+    v := 0;
+    for (; i < len(text); i++) {
+        c := text[i];
+        d := 0;
+        if (c >= '0' && c <= '9') d = (c - '0') -> int;
+        else if (c >= 'a' && c <= 'f') d = (c - 'a') -> int + 10;
+        else d = (c - 'A') -> int + 10;
+        v = v * base + d;
+        if (v > 100000000) return -1;
+    }
+    return v;
+}
+
+func structDecl(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Struct);
+    next(p);
+    if (!is(p, scanner.Kind.Ident)) { err(p, "Expected struct name"); return n; }
+    n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    next(p);
+    n.list3 = typeParams(p, false);
+    valueNames: map[string]bool;
+    if (is(p, scanner.Kind.LParen)) {
+        prms := paramList(p, true, "value parameter");
+        for (_, prm := range prms) {
+            if (prm.name == "") { errNode(p, prm, "Struct value parameters require names"); return n; }
+            if (prm.flag) { errNode(p, prm, "Struct value parameters cannot be variadic"); return n; }
+            for (_, tp := range n.list3) { if (tp.name == prm.name) { errNode(p, prm, "Struct value parameter duplicates a type parameter"); return n; } }
+            valueNames[prm.name] = true;
+        }
+        n.list2 = prms;
+    }
+    if (!accept(p, scanner.Kind.LBrace)) { err(p, "Expected struct body"); return n; }
+    fieldDecls(p, n, valueNames);
+    expect(p, scanner.Kind.RBrace, "Expected end of block");
+    return finish(p, n);
+}
+
+func enumDecl(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Enum);
+    next(p);
+    if (!is(p, scanner.Kind.Ident)) { err(p, "Expected enum name"); return n; }
+    n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    next(p);
+    n.list3 = typeParams(p, true);
+    if (!accept(p, scanner.Kind.LBrace)) { err(p, "Expected enum body"); return n; }
+    seen: map[string]bool;
+    for (!is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
+        if (!is(p, scanner.Kind.Ident)) { err(p, "Expected enum member name"); return n; }
+        v := node(p, ast.NK.Variant);
+        v.name = tok(p).text;
+        _, dup := seen[v.name];
+        if (dup) { err(p, "Duplicate enum member"); return n; }
+        seen[v.name] = true;
+        next(p);
+        if (accept(p, scanner.Kind.LParen)) {
+            v.ival = 1;
+            for (!is(p, scanner.Kind.RParen) && !is(p, scanner.Kind.EOF)) {
+                if (is(p, scanner.Kind.Ident) && namedParamFollows(p) && peek(p, 1) != scanner.Kind.Dot) { err(p, "Enum tuple payloads require unnamed types"); return n; }
+                v.list.append(typeChecked(p));
+                if (!accept(p, scanner.Kind.Comma)) break;
+            }
+            if (!accept(p, scanner.Kind.RParen)) { err(p, "Expected comma or closing parenthesis"); return n; }
+            if (is(p, scanner.Kind.Assign) || is(p, scanner.Kind.Colon)) { err(p, "Payload variants cannot have fixed values"); return n; }
+        } else if (accept(p, scanner.Kind.LBrace)) {
+            v.ival = 2;
+            for (!is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
+                names := make([]*ast.Node);
+                for (;;) {
+                    if (!is(p, scanner.Kind.Ident)) { err(p, "Expected struct field name before type"); return n; }
+                    f := node(p, ast.NK.Field);
+                    f.name = tok(p).text;
+                    next(p);
+                    names.append(f);
+                    if (!accept(p, scanner.Kind.Comma)) break;
+                }
+                t := typeChecked(p);
+                if (is(p, scanner.Kind.Colon)) { err(p, "Bitfields are not supported in enum payloads"); return n; }
+                for (_, f := range names) { f.a = t; v.list.append(f); }
+                if (!accept(p, scanner.Kind.Comma) && !accept(p, scanner.Kind.Semi)) {
+                    if (is(p, scanner.Kind.RBrace)) break;
+                    err(p, "Expected comma between enum fields"); return n;
+                }
+            }
+            if (!accept(p, scanner.Kind.RBrace)) { err(p, "Expected end of block"); return n; }
+            if (is(p, scanner.Kind.Assign) || is(p, scanner.Kind.Colon)) { err(p, "Payload variants cannot have fixed values"); return n; }
+        } else if (accept(p, scanner.Kind.Colon)) {
+            v.ival = 3;
+            if (!is(p, scanner.Kind.Assign)) v.b = typeChecked(p);
+            if (!accept(p, scanner.Kind.Assign)) { err(p, "Expected := before enum value"); return n; }
+            v.a = assignExpr(p);
+        } else if (accept(p, scanner.Kind.Assign)) {
+            v.ival = 3;
+            v.a = assignExpr(p);
+        }
+        finish(p, v);
+        n.list.append(v);
+        if (p.failed) return n;
+        if (!accept(p, scanner.Kind.Comma)) {
+            if (is(p, scanner.Kind.RBrace)) break;
+            err(p, "Expected comma after enum member"); return n;
+        }
+    }
+    expect(p, scanner.Kind.RBrace, "Expected end of block");
+    return finish(p, n);
+}
+
+func methodSpecStart(p *Parser) bool {
+    if (is(p, scanner.Kind.KwFunc)) return true;
+    if (!is(p, scanner.Kind.Ident)) return false;
+    if (peek(p, 1) == scanner.Kind.LParen) return true;
+    if (peek(p, 1) == scanner.Kind.Lt || peek(p, 1) == scanner.Kind.LBrack) {
+        // m<T ...>(...): find the matching close and check for '('.
+        m := save(p);
+        next(p);
+        p.trial++;
+        typeParams(p, false);
+        ok := !p.failed && is(p, scanner.Kind.LParen);
+        p.trial--;
+        restore(p, m);
+        return ok;
+    }
+    return false;
+}
+
+func interfaceBody(p *Parser, n *ast.Node) {
+    if (!accept(p, scanner.Kind.LBrace)) { err(p, "Expected interface body"); return; }
+    if (is(p, scanner.Kind.RBrace)) { next(p); return; }
+    if (!methodSpecStart(p) && !is(p, scanner.Kind.Semi)) {
+        n.a = constraintChecked(p);
+        accept(p, scanner.Kind.Semi);
+        if (!accept(p, scanner.Kind.RBrace)) {
+            if (methodSpecStart(p)) err(p, "Interface must contain methods or one type list");
+            else err(p, "Expected end of interface type list");
+        }
+        return;
+    }
+    seen: map[string]bool;
+    for (!is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
+        if (accept(p, scanner.Kind.Semi)) continue;
+        if (!methodSpecStart(p)) { err(p, "Interface must contain methods or one type list"); return; }
+        accept(p, scanner.Kind.KwFunc);
+        if (is(p, scanner.Kind.LParen)) { err(p, "Interface methods have an implied receiver"); return; }
+        m := node(p, ast.NK.MethodSpec);
+        m.name = tok(p).text;
+        _, dup := seen[m.name];
+        if (dup) { err(p, "Duplicate interface method"); return; }
+        seen[m.name] = true;
+        next(p);
+        m.list3 = typeParams(p, false);
+        m.list = paramList(p, true, "parameter");
+        if (len(m.list) > 0 && m.list[len(m.list) - 1].flag) m.flag = true;
+        m.list2 = results(p);
+        finish(p, m);
+        n.list.append(m);
+        if (p.failed) return;
+        if (!accept(p, scanner.Kind.Semi)) {
+            if (is(p, scanner.Kind.RBrace)) break;
+            err(p, "Expected semicolon after composite type member"); return;
+        }
+    }
+    expect(p, scanner.Kind.RBrace, "Expected end of block");
+}
+
+func interfaceDecl(p *Parser) *ast.Node {
+    n := node(p, ast.NK.Interface);
+    next(p);
+    if (!is(p, scanner.Kind.Ident)) { err(p, "Expected interface name"); return n; }
+    n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    next(p);
+    n.list3 = typeParams(p, false);
+    interfaceBody(p, n);
+    return finish(p, n);
+}
+
+func typeDecl(p *Parser) *ast.Node {
+    n := node(p, ast.NK.TypeDecl);
+    next(p);
+    if (!is(p, scanner.Kind.Ident)) { err(p, "Expected type name"); return n; }
+    n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    next(p);
+    if (accept(p, scanner.Kind.Assign)) n.flag = true;
+    n.a = typeChecked(p);
+    expect(p, scanner.Kind.Semi, "Expected semicolon after type declaration");
+    return finish(p, n);
+}
+
+// isDeclStart reports whether the statement at the cursor is a variable
+// declaration: names ':' followed by '=' or a complete type then ';' or '='.
+func isDeclStart(p *Parser) bool {
+    i := 0;
+    for (;;) {
+        k := peek(p, i);
+        if (k != scanner.Kind.Ident && k != scanner.Kind.Blank) return false;
+        i++;
+        if (peek(p, i) == scanner.Kind.Comma) { i++; continue; }
+        break;
+    }
+    if (peek(p, i) != scanner.Kind.Colon) return false;
+    if (peek(p, i + 1) == scanner.Kind.Assign) return true;
+    if (i > 1) return true;
+    m := save(p);
+    for (j := 0; j <= i; j++) next(p);
+    p.trial++;
+    typ(p);
+    ok := !p.failed && (is(p, scanner.Kind.Semi) || is(p, scanner.Kind.Assign) || is(p, scanner.Kind.Lt) && false);
+    // a legacy postfix suffix still indicates a declaration (reported later)
+    if (!p.failed && (is(p, scanner.Kind.LBrack) || is(p, scanner.Kind.Star))) ok = true;
+    p.trial--;
+    restore(p, m);
+    return ok;
+}
+
+func varDecl(p *Parser) *ast.Node {
+    n := node(p, ast.NK.VarDecl);
+    for (;;) {
+        id := node(p, is(p, scanner.Kind.Blank) ? ast.NK.Blank : ast.NK.Ident);
+        id.name = tok(p).text;
+        next(p);
+        finish(p, id);
+        n.list.append(id);
+        if (!accept(p, scanner.Kind.Comma)) break;
+    }
+    if (!accept(p, scanner.Kind.Colon)) { err(p, "Expected identifier"); return n; }
+    if (!is(p, scanner.Kind.Assign)) n.a = typeChecked(p);
+    if (accept(p, scanner.Kind.Assign)) {
+        for (;;) {
+            n.list2.append(assignExpr(p));
+            if (p.failed) return n;
+            if (!accept(p, scanner.Kind.Comma)) break;
+        }
+    } else if (ast.Nil(n.a)) { err(p, "Expected equals for variable declaration"); }
+    return finish(p, n);
+}
+
+// legacyCheck reports removed postfix type syntax when a '[' or '*' follows a
+// type that started at token index start.
+func legacyCheck(p *Parser, start int) bool {
+    if (p.failed) return false;
+    if (!is(p, scanner.Kind.LBrack) && !is(p, scanner.Kind.Star)) return false;
+    r := legacy.TypeRewrite(&p.toks, start, p.src.text, true);
+    if (!r.ok) return false;
+    if (p.fix) { recordFix(p, start, r); return true; }
+    t := p.toks[start];
+    errTok(p, t, t.col, legacy.Message(r.text, r.kinds));
+    return true;
+}
+
+// typeChecked parses a type in a declaration context and rejects postfix syntax.
+func typeChecked(p *Parser) *ast.Node {
+    start := p.pos;
+    t := typ(p);
+    legacyCheck(p, start);
+    return t;
+}
+
+func constraintChecked(p *Parser) *ast.Node {
+    start := p.pos;
+    t := constraint(p);
+    legacyCheck(p, start);
+    return t;
+}

@@ -1,0 +1,51 @@
+package scanner;
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+extern float strtod(buffer<i8> text, *int end);
+extern f32 strtof(buffer<i8> text, *int end);
+
+// hexForm converts a binary or octal float literal to an exact C hex-float spelling.
+func hexForm(text string) string {
+    base := 10;
+    if (len(text) > 2 && text[0] == '0' && (text[1] == 'b' || text[1] == 'B')) base = 2;
+    if (len(text) > 2 && text[0] == '0' && (text[1] == 'o' || text[1] == 'O')) base = 8;
+    if (base == 10) return text;
+    bitsPer := base == 2 ? 1 : 3;
+    // Collect all digits as one binary string and count fraction bits.
+    bits := make([]i8);
+    fracBits := 0; afterDot := false;
+    for (i := 2; i < len(text); i++) {
+        c := text[i];
+        if (c == '.') { afterDot = true; continue; }
+        v := (c - '0') -> int;
+        for (k := bitsPer - 1; k >= 0; k--) bits.append(((v >> k) & 1) -> i8);
+        if (afterDot) fracBits += bitsPer;
+    }
+    // Pad to a multiple of 4 on the left.
+    for (len(bits) % 4 != 0) bits.prepend(0);
+    b: util.Buf;
+    b.Add("0x");
+    for (i := 0; i < len(bits); i += 4) {
+        v := (bits[i] * 8 + bits[i + 1] * 4 + bits[i + 2] * 2 + bits[i + 3]) -> int;
+        b.Addc(util.HexDigit(v));
+    }
+    b.Add("p-").AddInt(fracBits);
+    return b.String();
+}
+
+func ParseF64(text string) float {
+    c := util.CStr(hexForm(text));
+    end: int;
+    return extern.strtod(c.data, &end);
+}
+
+func ParseF32(text string) f32 {
+    c := util.CStr(hexForm(text));
+    end: int;
+    return extern.strtof(c.data, &end);
+}
+
+func FloatFinite(text string) bool {
+    v := ParseF64(text);
+    return v == v && v - v == 0.0;
+}
