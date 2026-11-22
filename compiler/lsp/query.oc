@@ -1,0 +1,271 @@
+package lsp;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/loader";
+import "github.com/ocean-foundation/ocean/compiler/parser";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+struct Analysis { build *loader.Build; checker *check.Checker; diags *diag.List; src *ast.Source; doc *Document; }
+
+func builtinPackage(diags *diag.List) *ast.Package {
+    p := new(ast.Package);
+    p.name = "builtin"; p.path = "builtin"; p.dir = "<builtin>"; p.id = -1;
+    src := new(ast.Source);
+    src.path = "<builtin>"; src.abs = "<builtin>"; src.text = check.BuiltinSource(); src.pkg = p;
+    toks, _ := scanner.Scan(src.path, src.text, diags, false);
+    src.tokens = toks;
+    f, _ := parser.ParseFile(src, diags, false);
+    src.file = f;
+    p.files.append(src);
+    return p;
+}
+
+// analyze loads the document's package with editor overlays and recovery.
+func analyze(s *Server, d *Document) *Analysis {
+    a := new(Analysis);
+    a.doc = d;
+    diags := diag.NewList();
+    diags.live = false;
+    a.diags = diags;
+    b := loader.NewBuild(diags);
+    b.SetRecover(true);
+    for (_, o := range s.docs) b.AddOverlay(o.path, o.text);
+    if (findDoc(s, d.uri) < 0) b.AddOverlay(d.path, d.text);
+    a.build = b;
+    dir := util.Dir(d.path);
+    if (b.HasTestSources(dir)) b.LoadTestPackage(dir, "/tmp/.ocean-check-harness");
+    else b.LoadPackage(dir);
+    if (b.IsFatal() || ast.NilPkg(b.Root())) return a;
+    c := check.NewChecker(diags);
+    c.SetBuiltin(builtinPackage(diags));
+    c.EnableIndex();
+    a.checker = c;
+    c.Check(b.Order(), b.StandardSource());
+    for (_, p := range b.Order()) {
+        for (_, src := range p.files) { if (src.abs == d.path) a.src = src; }
+    }
+    return a;
+}
+
+func nilA(a *Analysis) bool { return (a -> int) == 0; }
+func nilC(c *check.Checker) bool { return (c -> int) == 0; }
+func nilSrc(s *ast.Source) bool { return (s -> int) == 0; }
+
+func answer(s *Server, d *Document, method string, params *J) string {
+    a := analyze(s, d);
+    if (method == "diagnostics") return diagnosticsJSON(a);
+    if (nilC(a.checker) || nilSrc(a.src)) return fallback(method);
+    pos := params.Get("position");
+    line := pos.Get("line").Int(0) + 1;
+    off := offsetAt(d.text, line, pos.Get("character").Int(0));
+    switch (method) {
+    case "textDocument/hover": return hover(a, off);
+    case "textDocument/definition", "textDocument/declaration": return definition(a, off);
+    case "textDocument/typeDefinition": return typeDefinition(a, off);
+    case "textDocument/references": return references(a, off, params.Get("context").Get("includeDeclaration").kind == 't');
+    case "textDocument/prepareRename": return prepareRename(a, off);
+    case "textDocument/rename": return rename(a, off, params.Get("newName").Str());
+    case "textDocument/completion": return completion(a, off);
+    }
+    return "null";
+}
+
+// ---- positions ----
+
+func lineStart(text string, line int) int {
+    i := 0;
+    for (n := 1; n < line && i < len(text); i++) { if (text[i] == '\n') n++; }
+    return i;
+}
+
+// offsetAt converts a 1-based line and UTF-16 character to a byte offset.
+func offsetAt(text string, line int, character int) int {
+    i := lineStart(text, line);
+    units := 0;
+    for (i < len(text) && text[i] != '\n' && text[i] != '\r' && units < character) {
+        c := (text[i] -> int) & 255;
+        n := 1;
+        if (c >= 240) n = 4; else if (c >= 224) n = 3; else if (c >= 192) n = 2;
+        units += n == 4 ? 2 : 1;
+        i += n;
+    }
+    return i;
+}
+
+// utf16Col converts a 1-based byte column to a 0-based UTF-16 character.
+func utf16Col(text string, line int, col int) int {
+    i := lineStart(text, line);
+    end := i + col - 1;
+    units := 0;
+    for (i < end && i < len(text) && text[i] != '\n') {
+        c := (text[i] -> int) & 255;
+        if ((c & 192) != 128) units += c >= 240 ? 2 : 1;
+        i++;
+    }
+    return units;
+}
+
+func textOf(a *Analysis, src *ast.Source) string { return src.abs == a.doc.path ? a.doc.text : src.text; }
+
+func rangeJSON(text string, line int, col int, length int) string {
+    sc := utf16Col(text, line, col);
+    ec := utf16Col(text, line, col + length);
+    return "{\"start\":{\"line\":" + util.Itoa(line - 1) + ",\"character\":" + util.Itoa(sc) + "},\"end\":{\"line\":" + util.Itoa(line - 1) + ",\"character\":" + util.Itoa(ec) + "}}";
+}
+
+func refRange(a *Analysis, r *check.Ref) string { return rangeJSON(textOf(a, r.src), r.line, r.col, len(r.name)); }
+func refLocation(a *Analysis, r *check.Ref) string { return "{\"uri\":" + Quote(pathURI(r.src.abs)) + ",\"range\":" + refRange(a, r) + "}"; }
+
+// ---- diagnostics ----
+
+func diagnosticsJSON(a *Analysis) string {
+    display := loader.RelativeSourcePath(a.doc.path);
+    b: util.Buf;
+    n := 0;
+    for (_, d := range a.diags.items) {
+        if (d.file != display || d.phase == "backend") continue;
+        if (n > 0) b.Add(",");
+        n++;
+        line := d.line > 0 ? d.line : 1;
+        col := utf16Col(a.doc.text, line, d.col > 0 ? d.col : 1);
+        r := "{\"start\":{\"line\":" + util.Itoa(line - 1) + ",\"character\":" + util.Itoa(col) + "},\"end\":{\"line\":" + util.Itoa(line - 1) + ",\"character\":" + util.Itoa(col) + "}}";
+        sev := d.severity == "warning" ? "2" : "1";
+        b.Add("{\"range\":").Add(r).Add(",\"severity\":").Add(sev).Add(",\"source\":\"ocean\",\"message\":").Add(Quote(d.phase + " " + d.severity + ": " + d.message)).Add("}");
+    }
+    return b.String();
+}
+
+// ---- references at a position ----
+
+func refAt(a *Analysis, off int) *check.Ref {
+    idx := a.checker.Index();
+    text := a.doc.text;
+    best := zero(*check.Ref);
+    for (_, r := range idx.refs) {
+        if (r.src != a.src) continue;
+        start := lineStart(text, r.line) + r.col - 1;
+        if (off < start || off > start + len(r.name)) continue;
+        if (off == start + len(r.name) && (best -> int) != 0) continue;
+        best = r;
+        if (off < start + len(r.name)) return r;
+    }
+    return best;
+}
+func nilR(r *check.Ref) bool { return (r -> int) == 0; }
+
+func navigable(r *check.Ref) bool {
+    if (nilR(r)) return false;
+    if (!ast.NilSym(r.sym) && (r.sym.builtin || r.sym.kind == ast.SK.BuiltinType || r.sym.kind == ast.SK.BuiltinFunc)) return false;
+    return true;
+}
+
+func declOf(a *Analysis, r *check.Ref) *check.Ref {
+    d, ok := a.checker.Index().decls[r.key];
+    if (!ok) return zero(*check.Ref);
+    if (d.src.abs == "<builtin>") return zero(*check.Ref);
+    return d;
+}
+
+func refType(a *Analysis, r *check.Ref) *ast.Type {
+    if (!nilT(r.ty)) return r.ty;
+    if (!ast.NilSym(r.sym)) return a.checker.TypeOfSymbol(r.sym);
+    return r.ty;
+}
+
+func hover(a *Analysis, off int) string {
+    r := refAt(a, off);
+    if (nilR(r)) return "null";
+    t := refType(a, r);
+    detail := r.name;
+    if (!nilT(t)) detail += " " + check.TypeString(t);
+    if (r.kind == 7) detail = "package " + r.name;
+    return "{\"contents\":{\"kind\":\"markdown\",\"value\":" + Quote("```ocean\n" + detail + "\n```") + "},\"range\":" + refRange(a, r) + "}";
+}
+
+func definition(a *Analysis, off int) string {
+    r := refAt(a, off);
+    if (!navigable(r)) return "[]";
+    d := declOf(a, r);
+    if (nilR(d)) return "[]";
+    return "[" + refLocation(a, d) + "]";
+}
+
+func typeDefinition(a *Analysis, off int) string {
+    r := refAt(a, off);
+    if (nilR(r)) return "[]";
+    t := refType(a, r);
+    if (nilT(t)) return "[]";
+    for (t.kind == ast.TK.Ptr) t = t.elem;
+    if (ast.NilSym(t.sym) || t.sym.builtin) return "[]";
+    d, ok := a.checker.Index().decls["s" + util.Itoa(t.sym.id)];
+    if (!ok) return "[]";
+    return "[" + refLocation(a, d) + "]";
+}
+
+func references(a *Analysis, off int, includeDecl bool) string {
+    r := refAt(a, off);
+    if (!navigable(r)) return "[]";
+    b: util.Buf;
+    n := 0;
+    for (_, x := range a.checker.Index().refs) {
+        if (x.key != r.key || (x.decl && !includeDecl) || x.src.abs == "<builtin>") continue;
+        if (n > 0) b.Add(",");
+        n++;
+        b.Add(refLocation(a, x));
+    }
+    return "[" + b.String() + "]";
+}
+
+func prepareRename(a *Analysis, off int) string {
+    r := refAt(a, off);
+    if (!navigable(r) || nilR(declOf(a, r)) || r.kind == 7) return "null";
+    return refRange(a, r);
+}
+
+func validIdentifier(s string) bool {
+    if (s == "" || s == "_" || scanner.IsKeyword(s)) return false;
+    d := diag.NewList(); d.live = false;
+    toks, ok := scanner.Scan("<name>", s, d, false);
+    return ok && len(toks) == 2 && toks[0].kind == scanner.Kind.Ident;
+}
+
+func rename(a *Analysis, off int, newName string) string {
+    r := refAt(a, off);
+    if (!navigable(r) || r.kind == 7) return "!symbol cannot be renamed";
+    decl := declOf(a, r);
+    if (nilR(decl)) return "!symbol cannot be renamed";
+    if (!validIdentifier(newName)) return "!invalid identifier: " + newName;
+    refs := make([]*check.Ref);
+    for (_, x := range a.checker.Index().refs) { if (x.key == r.key) refs.append(x); }
+    crossPackage := false;
+    for (_, x := range refs) { if (x.src.pkg != decl.src.pkg) crossPackage = true; }
+    if (crossPackage && scanner.IsExported(r.name) && !scanner.IsExported(newName)) return "!renaming would unexport a symbol used by another package";
+    // conflicts with a visible binding at any reference site
+    if (r.kind == 1 || r.kind == 2 || r.kind == 3) {
+        for (_, x := range refs) {
+            xoff := lineStart(textOf(a, x.src), x.line) + x.col - 1;
+            other := a.checker.LookupAt(x.src, xoff, newName);
+            if (!ast.NilSym(other) && (ast.NilSym(r.sym) || other != r.sym) && other.kind != ast.SK.BuiltinType && other.kind != ast.SK.BuiltinFunc) return "!" + newName + " is already declared in this scope";
+        }
+    }
+    files := make([]string);
+    edits: map[string]string;
+    for (_, x := range refs) {
+        uri := pathURI(x.src.abs);
+        e := "{\"range\":" + refRange(a, x) + ",\"newText\":" + Quote(newName) + "}";
+        prev, ok := edits[uri];
+        if (!ok) { files.append(uri); edits[uri] = e; } else edits[uri] = prev + "," + e;
+    }
+    b: util.Buf;
+    b.Add("{\"changes\":{");
+    for (i, f := range files) {
+        if (i > 0) b.Add(",");
+        b.Add(Quote(f)).Add(":[").Add(edits[f]).Add("]");
+    }
+    b.Add("}}");
+    return b.String();
+}
+
+func nilT(t *ast.Type) bool { return (t -> int) == 0; }

@@ -1,0 +1,297 @@
+package lsp;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/check";
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/loader";
+import "github.com/ocean-foundation/ocean/compiler/parser";
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+struct Item { label string; kind int; detail string; edit string; }
+
+struct Items { list []*Item; seen map[string]bool; prefix string; }
+
+func add(items *Items, label string, kind int, detail string) {
+    if (!util.HasPrefix(label, items.prefix) || label == "" || label == "_") return;
+    _, dup := items.seen[label];
+    if (dup) return;
+    items.seen[label] = true;
+    it := new(Item);
+    it.label = label; it.kind = kind; it.detail = detail;
+    items.list.append(it);
+}
+
+func identByte(c i8) bool { return util.IsLetter(c) || util.IsDigit(c) || c == '_' || ((c -> int) & 255) >= 128; }
+
+// receiverStart scans back over a receiver expression ending at end.
+func receiverStart(text string, end int) int {
+    i := end;
+    for (i > 0) {
+        c := text[i - 1];
+        if (identByte(c) || c == '.') { i--; continue; }
+        if (c == ')' || c == ']' || c == '>') {
+            open: i8 = '<';
+            if (c == ')') open = '('; else if (c == ']') open = '[';
+            depth := 0; j := i - 1;
+            for (j >= 0) {
+                if (text[j] == c) depth++;
+                else if (text[j] == open) { depth--; if (depth == 0) break; }
+                j--;
+            }
+            if (j < 0) return i;
+            i = j;
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
+func kindOf(s *ast.Symbol) int {
+    switch (s.kind) {
+    case ast.SK.Var: return 6;
+    case ast.SK.Func, ast.SK.Extern: return 3;
+    case ast.SK.Struct: return 22;
+    case ast.SK.Enum: return 13;
+    case ast.SK.Interface: return 8;
+    case ast.SK.Package: return 9;
+    case ast.SK.TypeParam: return 25;
+    case ast.SK.BuiltinFunc: return 3;
+    }
+    return 7;
+}
+
+func detailOf(a *Analysis, s *ast.Symbol) string {
+    if (s.kind == ast.SK.Package) return s.importPkg.path;
+    if (s.kind == ast.SK.BuiltinFunc || s.kind == ast.SK.BuiltinType) return "";
+    t := a.checker.TypeOfSymbol(s);
+    if (nilT(t)) return "";
+    return check.TypeString(t);
+}
+
+func completion(a *Analysis, off int) string {
+    text := a.doc.text;
+    start := off;
+    for (start > 0 && identByte(text[start - 1])) start--;
+    items := new(Items);
+    items.prefix = text[start:off];
+    if (start > 0 && text[start - 1] == '.') memberItems(a, items, text, start - 1, off);
+    else scopeItems(a, items, off);
+    b: util.Buf;
+    b.Add("{\"isIncomplete\":false,\"items\":[");
+    for (i, it := range items.list) {
+        if (i > 0) b.Add(",");
+        b.Add("{\"label\":").Add(Quote(it.label)).Add(",\"kind\":").AddInt(it.kind);
+        if (it.detail != "") b.Add(",\"detail\":").Add(Quote(it.detail));
+        if (it.edit != "") b.Add(",\"additionalTextEdits\":[").Add(it.edit).Add("]");
+        b.Add("}");
+    }
+    b.Add("]}");
+    return b.String();
+}
+
+func memberItems(a *Analysis, items *Items, text string, dot int, off int) {
+    rs := receiverStart(text, dot);
+    if (rs >= dot) return;
+    recvText := text[rs:dot];
+    // a package qualifier
+    if (util.IndexByte(recvText, '.') < 0 && util.IndexByte(recvText, '(') < 0 && util.IndexByte(recvText, '<') < 0) {
+        s := a.checker.LookupAt(a.src, off, recvText);
+        if (!ast.NilSym(s) && s.kind == ast.SK.Package) {
+            for (_, m := range s.importPkg.syms) { if (m.exported) add(items, m.name, kindOf(m), detailOf(a, m)); }
+            return;
+        }
+    }
+    d := diag.NewList(); d.live = false;
+    src := new(ast.Source);
+    src.path = a.src.path; src.text = recvText; src.pkg = a.src.pkg;
+    toks, _ := scanner.Scan(src.path, recvText, d, true);
+    src.tokens = toks;
+    e, ok := parser.ParseExpression(src, d);
+    if (!ok) return;
+    t := a.checker.TypeAt(a.src, off, e);
+    if (nilT(t)) return;
+    if (e.sem == ast.Sem.TypeName || ((e.kind == ast.NK.Ident || e.kind == ast.NK.Inst || e.kind == ast.NK.Member) && !nilT(e.tyAlt) && e.tyAlt == t && e.sem == ast.Sem.TypeName)) {
+        typeItems(a, items, t);
+        return;
+    }
+    valueItems(a, items, t);
+}
+
+func typeItems(a *Analysis, items *Items, t *ast.Type) {
+    if (t.kind == ast.TK.Enum) { for (_, v := range a.checker.VariantsOf(t)) add(items, v.name, 20, ""); return; }
+    if (t.kind == ast.TK.Family && !ast.NilSym(t.sym)) { for (_, v := range t.sym.variants) add(items, v.name, 20, ""); }
+}
+
+func valueItems(a *Analysis, items *Items, t0 *ast.Type) {
+    t := t0;
+    for (t.kind == ast.TK.Ptr) t = t.elem;
+    u := check.Underlying(t);
+    if (u.kind == ast.TK.Struct) { for (_, f := range a.checker.FieldsOf(u)) add(items, f.name, 5, check.TypeString(f.ty)); }
+    if (t.kind == ast.TK.Struct || t.kind == ast.TK.Enum || t.kind == ast.TK.Named) {
+        if (!ast.NilSym(t.sym)) {
+            for (_, m := range t.sym.methodList) {
+                if (!m.exported && !m.builtin && m.pkg != a.src.pkg) continue;
+                mr := a.checker.FindMethod(t, m.name);
+                add(items, m.name, 2, mr.ok ? check.TypeString(mr.ty) : "");
+            }
+        }
+    }
+    if (t.kind == ast.TK.Interface) { for (_, m := range a.checker.MethodsOf(t)) add(items, m.name, 2, check.TypeString(m.ty)); }
+    if (t.kind == ast.TK.Param && !nilT(t.sym.constraint) && t.sym.constraint.kind == ast.TK.Interface) {
+        for (_, m := range a.checker.MethodsOf(t.sym.constraint)) add(items, m.name, 2, check.TypeString(m.ty));
+    }
+    if (u.kind == ast.TK.Dyn) {
+        for (_, n := range []string{"length", "capacity", "size", "data"}) add(items, n, 5, "");
+        for (_, n := range []string{"append", "prepend", "add", "remove", "pop", "array"}) add(items, n, 2, "");
+    }
+    if (u.kind == ast.TK.String) { for (_, n := range []string{"length", "capacity", "size", "data"}) add(items, n, 5, ""); add(items, "array", 2, ""); }
+    if (u.kind == ast.TK.Array) { add(items, "size", 5, ""); add(items, "data", 5, ""); }
+}
+
+func declaredBefore(a *Analysis, s *ast.Symbol, off int) bool {
+    if (s.global || ast.Nil(s.node)) return true;
+    if (s.node.src != a.src) return true;
+    return s.node.off < off;
+}
+
+func scopeItems(a *Analysis, items *Items, off int) {
+    c := a.checker;
+    sp := c.SpanAt(a.src, off);
+    pkgScope := a.src.pkg.scope;
+    if ((sp -> int) != 0) {
+        for (sc := sp.scope; !ast.NilScope(sc) && sc != pkgScope && sc != c.Universe(); sc = sc.parent) {
+            for (i := len(sc.order) - 1; i >= 0; i--) {
+                s := sc.order[i];
+                if (s.kind == ast.SK.Var && !declaredBefore(a, s, off)) continue;
+                _, shadowed := items.seen[s.name];
+                if (shadowed) continue;
+                add(items, s.name, kindOf(s), detailOf(a, s));
+            }
+        }
+    }
+    for (_, s := range pkgScope.order) add(items, s.name, kindOf(s), detailOf(a, s));
+    for (name, s := range a.src.imports) add(items, name, 9, s.importPkg.path);
+    for (_, dp := range a.src.dotImports) { for (_, s := range dp.syms) { if (s.exported) add(items, s.name, kindOf(s), detailOf(a, s)); } }
+    for (_, s := range c.Universe().order) add(items, s.name, s.kind == ast.SK.BuiltinType ? 7 : kindOf(s), "");
+    for (_, kw := range []string{"make", "zero", "new", "sizeof", "null"}) add(items, kw, 14, "");
+    if (items.prefix != "") packageItems(a, items);
+}
+
+// ---- unimported package suggestions ----
+
+struct Candidate { name string; path string; dir string; }
+
+// headerName reads the package name from a file header (skipping comments).
+func headerName(path string) string {
+    text, ok := util.ReadFile(path);
+    if (!ok) return "";
+    i := 0;
+    for (i < len(text)) {
+        c := text[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { i++; continue; }
+        if (c == '/' && i + 1 < len(text) && text[i + 1] == '/') { for (i < len(text) && text[i] != '\n') i++; continue; }
+        if (c == '/' && i + 1 < len(text) && text[i + 1] == '*') {
+            depth := 1; i += 2;
+            for (i < len(text) && depth > 0) {
+                if (text[i] == '/' && i + 1 < len(text) && text[i + 1] == '*') { depth++; i += 2; }
+                else if (text[i] == '*' && i + 1 < len(text) && text[i + 1] == '/') { depth--; i += 2; }
+                else i++;
+            }
+            continue;
+        }
+        break;
+    }
+    if (i + 7 > len(text) || text[i:i + 7] != "package") return "";
+    i += 7;
+    for (i < len(text) && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\r')) i++;
+    s := i;
+    for (i < len(text) && (util.IsLetter(text[i]) || util.IsDigit(text[i]) || text[i] == '_')) i++;
+    return text[s:i];
+}
+
+func candidateDir(out *[]*Candidate, dir string, importPath string, depth int, budget *int, skipModules bool) {
+    if (depth > 12 || *budget <= 0) return;
+    *budget = *budget - 1;
+    names, ok := util.ListDir(dir);
+    if (!ok) return;
+    name := "";
+    for (_, n := range names) {
+        if (!util.HasSuffix(n, ".oc") || util.HasSuffix(n, "_test.oc")) continue;
+        name = headerName(dir + "/" + n);
+        if (name != "") break;
+    }
+    if (name != "" && importPath != "" && name != "main") {
+        cand := new(Candidate); cand.name = name; cand.path = importPath; cand.dir = dir;
+        (*out).append(cand);
+    }
+    for (_, n := range names) {
+        if (n[0] == '.' || n == "vendor" || n == "node_modules" || n == "testdata") continue;
+        child := dir + "/" + n;
+        if (!util.IsDir(child) || util.IsSymlink(child)) continue;
+        if (skipModules && util.Exists(child + "/ocean.mod")) continue;
+        candidateDir(out, child, importPath == "" ? n : importPath + "/" + n, depth + 1, budget, skipModules);
+    }
+}
+
+func candidates(a *Analysis) []*Candidate {
+    out := make([]*Candidate);
+    budget := 2000;
+    b := a.build;
+    std := b.StandardSource();
+    if (std != "" && util.IsDir(std)) candidateDir(&out, std, "", 0, &budget, false);
+    m := b.FindModule(util.Dir(a.doc.path));
+    if ((m -> int) != 0 && m.path != "") {
+        candidateDir(&out, m.root, m.path, 0, &budget, true);
+        for (name, r := range m.replaces) {
+            if (len(r) > 0 && (r[0] == '.' || r[0] == '/')) {
+                root := r[0] == '/' ? r : m.root + "/" + r;
+                candidateDir(&out, root, name, 0, &budget, true);
+            }
+        }
+        cache, ok := util.Getenv("OCEAN_MOD_CACHE");
+        if (!ok) { home, hok := util.Getenv("HOME"); cache = (hok ? home : "/tmp") + "/.cache/ocean/modules"; }
+        for (name, v := range m.requires) {
+            _, replaced := m.replaces[name];
+            if (replaced) continue;
+            dir := cache + "/" + name + "@" + (v == "" ? "latest" : v);
+            if (util.IsDir(dir)) candidateDir(&out, dir, name, 0, &budget, true);
+        }
+    }
+    return out;
+}
+
+// packageClauseEnd is the byte offset just after "package name;".
+func packageClauseEnd(a *Analysis) int {
+    toks := a.src.tokens;
+    for (i := 0; i + 2 < len(toks); i++) {
+        if (toks[i].kind == scanner.Kind.KwPackage) return toks[i + 2].kind == scanner.Kind.Semi ? toks[i + 2].end : toks[i + 1].end;
+    }
+    return 0;
+}
+
+func packageItems(a *Analysis, items *Items) {
+    imported: map[string]bool;
+    for (_, imp := range a.src.importNodes) imported[imp.text] = true;
+    if (!ast.Nil(a.src.file)) { for (_, imp := range a.src.file.list2) imported[imp.text] = true; }
+    selfDir := util.Dir(a.doc.path);
+    at := packageClauseEnd(a);
+    line := 1; lstart := 0;
+    for (i := 0; i < at && i < len(a.doc.text); i++) { if (a.doc.text[i] == '\n') { line++; lstart = i + 1; } }
+    pos := "{\"line\":" + util.Itoa(line - 1) + ",\"character\":" + util.Itoa(utf16Col(a.doc.text, line, at - lstart + 1)) + "}";
+    for (_, cand := range candidates(a)) {
+        _, done := imported[cand.path];
+        if (done || !util.HasPrefix(cand.name, items.prefix)) continue;
+        _, taken := items.seen[cand.name];
+        if (taken) continue;
+        rd, _ := util.Realpath(cand.dir);
+        if (rd == selfDir) continue;
+        items.seen[cand.name] = true;
+        it := new(Item);
+        it.label = cand.name; it.kind = 9; it.detail = cand.path;
+        it.edit = "{\"range\":{\"start\":" + pos + ",\"end\":" + pos + "},\"newText\":" + Quote("\nimport \"" + cand.path + "\";") + "}";
+        items.list.append(it);
+    }
+}
+
+func unusedLoader(b *loader.Build) bool { return (b -> int) == 0; }

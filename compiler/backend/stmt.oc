@@ -7,10 +7,34 @@ import "github.com/ocean-foundation/ocean/compiler/util";
 func genBlock(g *Gen, n *ast.Node) {
     if (nilN(n)) return;
     if (n.kind != ast.NK.Block) { genStmt(g, n); return; }
+    pushScope(g);
     for (_, s := range n.list) genStmt(g, s);
+    popScope(g);
 }
 
+// genStmt generates one statement; its unconsumed temporaries are released at
+// the end (or forgotten when the statement transferred control).
 func genStmt(g *Gen, n *ast.Node) {
+    mark := len(g.fn.temps);
+    genStmt1(g, n);
+    dropTemps(g, mark, true);
+}
+
+// genCond evaluates a condition, releasing its temporaries before branching.
+func genCond(g *Gen, n *ast.Node) V {
+    mark := len(g.fn.temps);
+    c := genExpr(g, n);
+    dropTemps(g, mark, true);
+    return c;
+}
+
+// leaveTo releases temporaries and scopes left by a jump to an enclosing loop.
+func leaveTo(g *Gen, lp *Loop) {
+    dropTemps(g, lp.tempMark, false);
+    dropScopesTo(g, lp.scopeDepth);
+}
+
+func genStmt1(g *Gen, n *ast.Node) {
     switch (n.kind) {
     case ast.NK.Block: genBlock(g, n);
     case ast.NK.Empty, ast.NK.Struct, ast.NK.Enum, ast.NK.Interface, ast.NK.TypeDecl:
@@ -45,10 +69,10 @@ func genStmt(g *Gen, n *ast.Node) {
         genStmt(g, n.a);
     case ast.NK.Break:
         target := findLoop(g, n, false);
-        if (target != "") br(g, target);
+        if (target != "") { leaveTo(g, g.fn.lastLoop); br(g, target); }
     case ast.NK.Continue:
         target := findLoop(g, n, true);
-        if (target != "") br(g, target);
+        if (target != "") { leaveTo(g, g.fn.lastLoop); br(g, target); }
     case ast.NK.Goto:
         if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
         br(g, labelFor(g, n.name));
@@ -72,7 +96,8 @@ func findLoop(g *Gen, n *ast.Node, cont bool) string {
     for (i := len(g.fn.loops) - 1; i >= 0; i--) {
         lp := g.fn.loops[i];
         if (!nilN(n.ref) && lp.node != n.ref) continue;
-        if (cont) { if (lp.cont == "") continue; return lp.cont; }
+        if (cont) { if (lp.cont == "") continue; g.fn.lastLoop = lp; return lp.cont; }
+        g.fn.lastLoop = lp;
         return lp.brk;
     }
     fail(g, n, "branch target not found");
@@ -82,6 +107,7 @@ func findLoop(g *Gen, n *ast.Node, cont bool) string {
 func pushLoop(g *Gen, n *ast.Node, brk string, cont string) {
     lp := new(Loop);
     lp.node = n; lp.brk = brk; lp.cont = cont;
+    lp.tempMark = len(g.fn.temps); lp.scopeDepth = len(g.fn.scopes);
     g.fn.loops.append(lp);
 }
 func popLoop(g *Gen) { g.fn.loops.pop(); }
@@ -95,8 +121,8 @@ func genVarDecl(g *Gen, n *ast.Node) {
             if (nilS(id.sym)) continue;
             vt := sub(g, id.sym.ty);
             v := copyV(g, conv(g, load(g, rts[i], gep(g, tv.r, tupleOffset(g, rts, i))), vt));
-            p := localStorage(g, id.sym, vt);
-            store(g, vt, p, v);
+            p := ownedLocal(g, id.sym, vt);
+            storeReplace(g, vt, p, v);
         }
         return;
     }
@@ -105,22 +131,19 @@ func genVarDecl(g *Gen, n *ast.Node) {
             if (nilS(id.sym)) continue;
             vt := sub(g, id.sym.ty);
             u := under(vt);
-            p := localStorage(g, id.sym, vt);
+            p := ownedLocal(g, id.sym, vt);
+            if (g.trackTemps && owned(g, vt)) emit(g, "call void @oc_drop(ptr " + p + ", ptr " + desc(g, vt) + ")");
             if (u.kind == ast.TK.Array && u.len == -1 && !nilN(vt.lenNode)) {
-                cnt := genAs(g, vt.lenNode, check.TInt());
-                blk := tmp(g);
-                emit(g, blk + " = call ptr @oc_block_new(i64 " + cnt.r + ", ptr " + desc(g, u.elem) + ")");
-                emit(g, "store ptr " + blk + ", ptr " + p);
+                emit(g, "store ptr " + newRuntimeArray(g, vt) + ", ptr " + p);
                 continue;
             }
             if (u.kind == ast.TK.Buffer && u.len == -1 && !nilN(vt.lenNode)) {
                 cnt := genAs(g, vt.lenNode, check.TInt());
-                bytes := tmp(g); emit(g, bytes + " = mul i64 " + cnt.r + ", " + itoa(sizeOf(g, u.elem)));
-                b := tmp(g); emit(g, b + " = call ptr @oc_alloc(i64 " + bytes + ")");
-                emit(g, "store ptr " + b + ", ptr " + p);
+                emit(g, "store ptr " + runtimeBuffer(g, u.elem, cnt.r) + ", ptr " + p);
                 continue;
             }
             zeroInto(g, vt, p);
+            if (hasRuntimeElems(vt)) initRuntimeElems(g, vt, p);
         }
         return;
     }
@@ -135,14 +158,17 @@ func genVarDecl(g *Gen, n *ast.Node) {
     for (i, id := range names) {
         if (nilS(id.sym)) continue;
         vt := sub(g, id.sym.ty);
-        p := localStorage(g, id.sym, vt);
-        store(g, vt, p, conv(g, vals[i], vt));
+        p := ownedLocal(g, id.sym, vt);
+        // a fixed array that later grows (+=) is stored at its initial type
+        it := vt;
+        if (!nilT(id.ty) && under(id.ty).kind == ast.TK.Array && under(vt).kind == ast.TK.Array && under(id.ty).len >= 0 && under(id.ty).len < under(vt).len) it = sub(g, id.ty);
+        storeReplace(g, it, p, conv(g, vals[i], it));
     }
 }
 
 func genIf(g *Gen, n *ast.Node) {
     if (!nilN(n.a)) genStmt(g, n.a);
-    c := genExpr(g, n.b);
+    c := genCond(g, n.b);
     yes := newLabel(g, "if"); no := newLabel(g, "else"); done := newLabel(g, "fi");
     condBr(g, c.r, yes, nilN(n.d) ? done : no);
     label(g, yes);
@@ -157,7 +183,7 @@ func genFor(g *Gen, n *ast.Node) {
     head := newLabel(g, "for"); body := newLabel(g, "loop"); post := newLabel(g, "post"); done := newLabel(g, "endfor");
     if (n.flag) br(g, body); else br(g, head);
     label(g, head);
-    if (!nilN(n.b)) { c := genExpr(g, n.b); condBr(g, c.r, body, done); }
+    if (!nilN(n.b)) { c := genCond(g, n.b); condBr(g, c.r, body, done); }
     else br(g, body);
     label(g, body);
     if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
@@ -166,7 +192,7 @@ func genFor(g *Gen, n *ast.Node) {
     popLoop(g);
     br(g, post);
     label(g, post);
-    if (!nilN(n.c)) genExpr(g, n.c);
+    if (!nilN(n.c)) genCond(g, n.c);
     br(g, head);
     label(g, done);
 }
@@ -189,6 +215,7 @@ func genRange(g *Gen, n *ast.Node) {
         emit(g, "call void @oc_map_snapshot(ptr " + cv.r + ", ptr " + desc(g, u.key) + ", ptr " + desc(g, u.elem) + ", ptr " + ks + ", ptr " + vs + ")");
         keys = tmp(g); emit(g, keys + " = load ptr, ptr " + ks);
         vals = tmp(g); emit(g, vals + " = load ptr, ptr " + vs);
+        freshV(g, keys, check.DynOf(u.key)); freshV(g, vals, check.DynOf(u.elem));
         count = tmp(g); emit(g, count + " = call i64 @oc_arr_len(ptr " + keys + ")");
         kt = u.key; vt = u.elem;
     } else {
@@ -206,18 +233,18 @@ func genRange(g *Gen, n *ast.Node) {
     if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
     b0 := n.list[0];
     if (!nilS(b0.sym)) {
-        p := localStorage(g, b0.sym, kt);
+        p := ownedLocal(g, b0.sym, kt);
         if (u.kind == ast.TK.Map) {
             kd := tmp(g); emit(g, kd + " = call ptr @oc_arr_data(ptr " + keys + ")");
-            store(g, kt, p, copyV(g, load(g, kt, gepDyn(g, kd, i, sizeOf(g, kt)))));
+            storeReplace(g, kt, p, copyV(g, load(g, kt, gepDyn(g, kd, i, sizeOf(g, kt)))));
         } else emit(g, "store i64 " + i + ", ptr " + p);
     }
     if (len(n.list) > 1 && !nilS(n.list[1].sym)) {
-        p := localStorage(g, n.list[1].sym, vt);
+        p := ownedLocal(g, n.list[1].sym, vt);
         src := "";
         if (u.kind == ast.TK.Map) { vd := tmp(g); emit(g, vd + " = call ptr @oc_arr_data(ptr " + vals + ")"); src = gepDyn(g, vd, i, sizeOf(g, vt)); }
         else src = gepDyn(g, data, i, sizeOf(g, vt));
-        store(g, vt, p, copyV(g, load(g, vt, src)));
+        storeReplace(g, vt, p, copyV(g, load(g, vt, src)));
     }
     pushLoop(g, n, done, post);
     genStmt(g, n.d);
@@ -249,7 +276,7 @@ func genSwitch(g *Gen, n *ast.Node) {
                 fake := new(ast.Node);
                 fake.kind = ast.NK.Binary; fake.op = scanner.Kind.EqEq; fake.a = n.b; fake.b = e;
                 c = equality(g, fake, tag, ev);
-            } else c = genExpr(g, e).r;
+            } else c = genCond(g, e).r;
             condBr(g, c, bodies[i], next);
             label(g, next);
         }
@@ -272,7 +299,7 @@ func genTypeSwitch(g *Gen, n *ast.Node) {
     if (!nilN(n.a)) genStmt(g, n.a);
     sv := genExpr(g, n.b);
     iv := sv;
-    if (under(sv.t).kind != ast.TK.Interface && under(sv.t).kind != ast.TK.Union) iv = box(g, sv);
+    if (!isBoxed(sv.t)) iv = box(g, sv);
     d := extract(g, iv.r, 0);
     data := extract(g, iv.r, 1);
     done := newLabel(g, "endtswitch");
@@ -286,7 +313,7 @@ func genTypeSwitch(g *Gen, n *ast.Node) {
             t := sub(g, ct);
             c := "";
             if (check.IsAny(t)) { c = "true"; }
-            else c = typeTest(g, d, t);
+            else c = typeTestData(g, d, data, t);
             condBr(g, c, bodies[i], next);
             label(g, next);
         }
@@ -297,9 +324,9 @@ func genTypeSwitch(g *Gen, n *ast.Node) {
         label(g, bodies[i]);
         if (!nilS(cl.sym)) {
             bt := sub(g, cl.sym.ty);
-            p := localStorage(g, cl.sym, bt);
-            if (under(bt).kind == ast.TK.Interface || under(bt).kind == ast.TK.Union) store(g, bt, p, mkV(iv.r, bt));
-            else store(g, bt, p, unboxAs(g, d, data, iv, bt));
+            p := ownedLocal(g, cl.sym, bt);
+            if (isBoxed(bt)) storeReplace(g, bt, p, copyV(g, mkV(iv.r, bt)));
+            else storeReplace(g, bt, p, unboxAs(g, d, data, iv, bt));
         }
         for (_, s := range cl.list2) genStmt(g, s);
         br(g, done);
@@ -332,15 +359,15 @@ func genMatch(g *Gen, n *ast.Node) {
             for (i, b := range p.list) {
                 if (nilS(b.sym)) continue;
                 ft := fs[i].ty;
-                slot := localStorage(g, b.sym, ft);
-                store(g, ft, slot, copyV(g, load(g, ft, gep(g, base, l.places[i].offset))));
+                slot := ownedLocal(g, b.sym, ft);
+                storeReplace(g, ft, slot, copyV(g, load(g, ft, gep(g, base, l.places[i].offset))));
             }
         } else if (p.ival == 2) {
             for (_, b := range p.list) {
                 if (nilS(b.sym)) continue;
                 ft := fs[b.ival].ty;
-                slot := localStorage(g, b.sym, ft);
-                store(g, ft, slot, copyV(g, load(g, ft, gep(g, base, l.places[b.ival].offset))));
+                slot := ownedLocal(g, b.sym, ft);
+                storeReplace(g, ft, slot, copyV(g, load(g, ft, gep(g, base, l.places[b.ival].offset))));
             }
         }
         genStmt(g, arm.b);
@@ -356,7 +383,7 @@ func genMatch(g *Gen, n *ast.Node) {
 func genReturn(g *Gen, n *ast.Node) {
     f := g.fn;
     rts := f.resultTypes;
-    if (len(n.list) == 0) { br(g, "exit"); return; }
+    if (len(n.list) == 0) { dropTemps(g, 0, false); br(g, "exit"); return; }
     vals := make([]V);
     if (n.flag2) {
         tv := genExpr(g, n.list[0]);
@@ -373,6 +400,7 @@ func genReturn(g *Gen, n *ast.Node) {
         if (f.hasDefer) storeVolatile(g, rts[i], f.resultSlots[i], conv(g, v, rts[i]));
         else store(g, rts[i], f.resultSlots[i], conv(g, v, rts[i]));
     }
+    dropTemps(g, 0, false);
     br(g, "exit");
 }
 
@@ -426,8 +454,12 @@ func genDefer(g *Gen, n *ast.Node) {
         }
     case ast.Sem.CallExtern:
         kind = 3;
+        declareExtern(g, c.sym);
+        if (c.sym.ty.variadic && needsFFI(g, c, c.sym.ty)) kind = 6;
     case ast.Sem.CallBuiltin:
         if (c.text == "recover") kind = 4;
+        else if (c.text == "free" || c.text == "delete") kind = 7;
+        else if (c.text == "append" || c.text == "prepend" || c.text == "add" || c.text == "pop" || c.text == "remove") kind = 8;
         else { fail(g, n, "deferred builtin calls are not supported"); return; }
     }
     if (c.sem == ast.Sem.CallIface || kind == 2) {
@@ -439,7 +471,30 @@ func genDefer(g *Gen, n *ast.Node) {
         ft = sub(g, mem.ty);
         if (c.a.kind == ast.NK.Inst) ft = sub(g, c.a.ty);
     }
-    if (kind == 3) {
+    if (kind == 6) items.append(ffiCapture(g, c)...);
+    else if (kind == 8) {
+        recv := memberOf(c).a;
+        rt := under(typeOf(g, recv)); if (rt.kind == ast.TK.Ptr) rt = under(rt.elem);
+        items.append(mkV(arraySlot(g, recv), check.PtrTo(rt)));
+        for (i, a := range c.list) {
+            if ((c.text == "add" && i == 0) || c.text == "remove") items.append(genAs(g, a, check.TInt()));
+            else if (c.flag && i == len(c.list) - 1) items.append(copyV(g, genExpr(g, a)));
+            else items.append(genAs(g, a, rt.elem));
+        }
+    }
+    else if (kind == 7 && c.text == "free" && isLvalue(c.list[0]) &&
+        (under(typeOf(g, c.list[0])).kind == ast.TK.Dyn || under(typeOf(g, c.list[0])).kind == ast.TK.String)) {
+        // deferred free of a variable: release (and empty) the variable itself
+        kind = 9;
+        items.append(mkV(lvalueAddr(g, c.list[0]), check.PtrTo(typeOf(g, c.list[0]))));
+    }
+    else if (kind == 7) {
+        // free/delete: capture the operand value(s); the map/array header is shared
+        for (i, a := range c.list) {
+            if (c.text == "delete" && i == 1) { items.append(genAs(g, a, under(typeOf(g, c.list[0])).key)); continue; }
+            items.append(genExpr(g, a));
+        }
+    } else if (kind == 3) {
         // extern: evaluate arguments as values
         for (i, a := range c.list) {
             v := genExpr(g, a);
@@ -526,6 +581,52 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
     if (kind == 4) {
         out := alloca(g, check.TAny());
         emit(g, "call void @oc_recover(ptr " + out + ")");
+    } else if (kind == 6) {
+        ffiCall(g, c.sym, vals, check.TVoid());
+    } else if (kind == 8) {
+        slot := vals[0].r;
+        elem := under(vals[0].t.elem).elem;
+        es := sizeOf(g, elem);
+        st := itoa(site(g, site0));
+        if (c.text == "pop" || c.text == "remove") {
+            out := alloca(g, elem);
+            if (c.text == "pop") emit(g, "call void @oc_arr_pop(ptr " + slot + ", i64 " + itoa(es) + ", ptr " + out + ", i64 " + st + ")");
+            else emit(g, "call void @oc_arr_remove(ptr " + slot + ", i64 " + vals[1].r + ", i64 " + itoa(es) + ", ptr " + out + ", i64 " + st + ")");
+        } else {
+            first := 1;
+            index := "";
+            if (c.text == "add") { index = vals[1].r; first = 2; }
+            else if (c.text == "prepend") index = "0";
+            else { cur := tmp(g); emit(g, cur + " = load ptr, ptr " + slot); l := tmp(g); emit(g, l + " = call i64 @oc_arr_len(ptr " + cur + ")"); index = l; }
+            for (i := first; i < len(vals); i++) {
+                v := vals[i];
+                if (c.flag && i == len(vals) - 1) {
+                    emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + index + ", ptr " + arrayDataPtr(g, v) + ", i64 " + collectionLen(g, v) + ", ptr " + desc(g, elem) + ", i64 " + st + ")");
+                    continue;
+                }
+                p := tmp(g);
+                emit(g, p + " = call ptr @oc_arr_insert(ptr " + slot + ", i64 " + index + ", i64 1, i64 " + itoa(es) + ", i64 " + st + ")");
+                store(g, elem, p, v);
+                ni := tmp(g); emit(g, ni + " = add i64 " + index + ", 1"); index = ni;
+            }
+        }
+    } else if (kind == 9) {
+        vt := under(vals[0].t).elem;
+        if (under(vt).kind == ast.TK.Dyn) emit(g, "call void @oc_arr_free(ptr " + vals[0].r + ", ptr " + desc(g, under(vt).elem) + ")");
+        else if (g.trackTemps) emit(g, "call void @oc_drop(ptr " + vals[0].r + ", ptr " + desc(g, vt) + ")");
+    } else if (kind == 7) {
+        u := under(vals[0].t);
+        if (c.text == "free") {
+            if (u.kind == ast.TK.Dyn) { slot := spill(g, vals[0]); emit(g, "call void @oc_arr_free(ptr " + slot + ", ptr " + desc(g, u.elem) + ")"); }
+            else if (u.kind == ast.TK.Ptr) {
+                pd := "null";
+                if (g.trackTemps && owned(g, u.elem)) pd = desc(g, u.elem);
+                emit(g, "call void @oc_free_ptr(ptr " + vals[0].r + ", ptr " + pd + ")");
+            }
+        } else {
+            slot := spill(g, vals[0]);
+            emit(g, "call void @oc_map_delete(ptr " + slot + ", ptr " + spill(g, vals[1]) + ", ptr " + desc(g, u.key) + ")");
+        }
     } else if (kind == 3) {
         s := c.sym;
         declareExtern(g, s);

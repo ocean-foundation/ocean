@@ -16,7 +16,7 @@ func checkArgs(c *Checker, n *ast.Node, ft *ast.Type, args []*ast.Node, spread b
             fixedN := len(params);
             if (ft.variadic) fixedN--;
             if (len(t.results) < fixedN || (!ft.variadic && len(t.results) != fixedN)) {
-                err(c, n, "argument count mismatch: Expected " + itoa(fixedN) + " args, but got " + itoa(len(t.results)) + ".");
+                err(c, callSite(n), "argument count mismatch: Expected " + itoa(fixedN) + " args, but got " + itoa(len(t.results)) + ".");
                 return;
             }
             for (i, r := range t.results) {
@@ -32,8 +32,8 @@ func checkArgs(c *Checker, n *ast.Node, ft *ast.Type, args []*ast.Node, spread b
     if (ft.variadic) fixed--;
     if (isExtern && ft.variadic) fixed = len(params);
     if (len(args) < fixed || (!ft.variadic && len(args) > fixed)) {
-        if (ft.variadic) err(c, n, "argument count mismatch: Expected at least " + itoa(fixed) + " args, but got " + itoa(len(args)) + ".");
-        else err(c, n, "argument count mismatch: Expected " + itoa(fixed) + " args, but got " + itoa(len(args)) + ".");
+        if (ft.variadic) err(c, callSite(n), "argument count mismatch: Expected at least " + itoa(fixed) + " args, but got " + itoa(len(args)) + ".");
+        else err(c, callSite(n), "argument count mismatch: Expected " + itoa(fixed) + " args, but got " + itoa(len(args)) + ".");
         if (!prechecked) { for (_, a := range args) valueExpr(c, a); }
         return;
     }
@@ -42,6 +42,7 @@ func checkArgs(c *Checker, n *ast.Node, ft *ast.Type, args []*ast.Node, spread b
             t := valueExpr(c, a);
             if (t.kind == ast.TK.Tuple) { err(c, a, "expanded argument must be an array, not multiple return values"); continue; }
             if (isExtern) {
+                if (!ft.variadic || i < len(ft.params)) { err(c, a, "expanded argument requires an Ocean variadic function and its fixed parameters"); continue; }
                 if (t.kind != ast.TK.Dyn && t.kind != ast.TK.Array) err(c, a, "expanded argument must be an array");
                 continue;
             }
@@ -53,11 +54,11 @@ func checkArgs(c *Checker, n *ast.Node, ft *ast.Type, args []*ast.Node, spread b
             if (!Identical(t.elem, ve) && !(IsInterface(ve) && c.Assignable(t.elem, ve))) mismatch(c, a, params[len(params) - 1], t);
             continue;
         }
-        argCheckOne(c, a, ft, i, isExtern, prechecked);
+        argCheckOne(c, a, ft, i, isExtern, prechecked, n);
     }
 }
 
-func argCheckOne(c *Checker, a *ast.Node, ft *ast.Type, i int, isExtern bool, prechecked bool) {
+func argCheckOne(c *Checker, a *ast.Node, ft *ast.Type, i int, isExtern bool, prechecked bool, call *ast.Node) {
     params := ft.params;
     if (isExtern) {
         if (i < len(params)) {
@@ -74,6 +75,15 @@ func argCheckOne(c *Checker, a *ast.Node, ft *ast.Type, i int, isExtern bool, pr
     if (ft.variadic && i >= len(params) - 1) pt = params[len(params) - 1].elem;
     else pt = params[i];
     if (!prechecked) expr(c, a, pt);
+    // an interface value passed for a concrete parameter: ocean-c reports this
+    // from lowering ("value type mismatch") at the call
+    at := a.ty;
+    if (!nilT(at) && Underlying(at).kind == ast.TK.Interface && !nilT(pt) && !IsInterface(Underlying(pt)) && pt.kind != ast.TK.Param &&
+        Underlying(pt).kind != ast.TK.Union && Underlying(pt).kind != ast.TK.Family && !c.Assignable(at, pt)) {
+        c.errors++;
+        c.diags.Error(nilSrc(call.src) ? "<source>" : call.src.path, call.line, call.col, "backend", "value type mismatch");
+        return;
+    }
     coerce(c, a, pt, a);
 }
 
@@ -90,6 +100,20 @@ func checkCVariadic(c *Checker, a *ast.Node, t *ast.Type) {
     err(c, a, "C variadic arguments must be scalars or pointers");
 }
 
+// callSite gives the location used for call diagnostics: the callee name.
+func callSite(n *ast.Node) *ast.Node {
+    f := n.a;
+    if (f.kind == ast.NK.Inst) f = f.a;
+    if (f.kind == ast.NK.Member) {
+        at := new(ast.Node);
+        at.src = f.src;
+        at.line = f.nameLine; at.col = f.nameCol;
+        if (f.a.kind == ast.NK.Ident && !nilS(f.a.sym) && f.a.sym.kind == ast.SK.Package) at.col = f.nameCol - 1;
+        return at;
+    }
+    return f;
+}
+
 func resultType(c *Checker, ft *ast.Type) *ast.Type {
     if (len(ft.results) == 0) return tVoid;
     if (len(ft.results) == 1) return ft.results[0];
@@ -102,7 +126,7 @@ func callExpr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
     if (f.kind == ast.NK.Ident) {
         s := lookup(c, f.name);
         if (!nilS(s) && s.kind == ast.SK.BuiltinFunc && f.name != "true" && f.name != "false") return builtinCall(c, n, f.name);
-        if (nilS(s) && (f.name == "compilerReflectFields" || f.name == "compilerReflectIsStruct" || f.name == "compilerReflectIsEnum" || f.name == "compilerReflectEnumVariant" || f.name == "compilerThreadSpawn" || f.name == "compilerThreadReturn")) return intrinsicCall(c, n, f.name);
+        if (nilS(s) && (f.name == "compilerReflectFields" || f.name == "compilerReflectIsStruct" || f.name == "compilerReflectIsEnum" || f.name == "compilerReflectEnumVariant" || f.name == "compilerReflectVarInteger" || f.name == "compilerThreadSpawn" || f.name == "compilerThreadReturn")) return intrinsicCall(c, n, f.name);
     }
     if (f.kind == ast.NK.ExternRef) {
         ex := zero(*ast.Symbol);
@@ -126,7 +150,9 @@ func callExpr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
         et, isType := typeOfExpr(c, mem.a);
         if (isType && (et.kind == ast.TK.Enum || et.kind == ast.TK.Family)) return enumConstruct(c, n, mem, et, expected);
         if (!isType || !nilS(pkgOf(c, mem.a))) {
+            c.genericCallee = f.kind == ast.NK.Inst;
             ft := expr(c, mem, zero(*ast.Type));
+            c.genericCallee = false;
             if (mem.sem == ast.Sem.Method && mem.text != "") return collectionMethod(c, n, mem);
             if (mem.sem == ast.Sem.Method) return methodCall(c, n, f, mem, ft);
             if (mem.sem == ast.Sem.IfaceMethod) return ifaceCall(c, n, f, mem, ft);
@@ -174,6 +200,7 @@ func pkgOf(c *Checker, n *ast.Node) *ast.Symbol {
 
 func valueCall(c *Checker, n *ast.Node, ft *ast.Type) *ast.Type {
     if (ft.kind == ast.TK.Invalid) { for (_, a := range n.list) valueExpr(c, a); return tInvalid; }
+    ft = Underlying(ft);
     if (ft.kind != ast.TK.Func) { err(c, n, "value is not callable"); for (_, a := range n.list) valueExpr(c, a); return tInvalid; }
     n.sem = ast.Sem.CallValue;
     checkArgs(c, n, ft, n.list, n.flag, false);
@@ -257,6 +284,7 @@ func ifaceCall(c *Checker, n *ast.Node, f *ast.Node, mem *ast.Node, ft *ast.Type
         if (len(args) != len(meth.typeParams)) { err(c, f, "type argument count mismatch"); return tInvalid; }
         n.targs = args;
         ft = Subst(ft, makeEnv(meth.typeParams, args));
+        f.ty = ft;
     }
     checkArgs(c, n, ft, n.list, n.flag, false);
     return resultType(c, ft);
@@ -289,7 +317,11 @@ func collectionMethod(c *Checker, n *ast.Node, mem *ast.Node) *ast.Type {
         return elem;
     }
     if (name == "remove") {
-        if (len(n.list) != 1) { err(c, n, "remove requires exactly one index; pop requires no arguments"); return elem; }
+        if (len(n.list) != 1 || n.flag) {
+            err(c, n, "remove requires exactly one index; pop requires no arguments");
+            for (_, a := range n.list) exprExpect(c, a, tInt);
+            return elem;
+        }
         exprExpect(c, n.list[0], tInt);
         return elem;
     }
@@ -323,6 +355,8 @@ func builtinCall(c *Checker, n *ast.Node, name string) *ast.Type {
         t := valueExpr(c, n.list[0]);
         u := Underlying(t);
         if (u.kind == ast.TK.Array || u.kind == ast.TK.Dyn || u.kind == ast.TK.String || u.kind == ast.TK.Map) return tInt;
+        // a sized buffer parameter is a view of the caller's storage
+        if (u.kind == ast.TK.Buffer && u.len > 0 && n.list[0].kind == ast.NK.Ident && !nilS(n.list[0].sym) && n.list[0].sym.param) { err(c, n, "len requires an array, dynamic array, string, or buffer with known length"); return tInt; }
         if (u.kind == ast.TK.Buffer && u.len > 0) return tInt;
         if (u.kind == ast.TK.Buffer && u.len == -1) return tInt;
         if (u.kind == ast.TK.Param) return tInt;
@@ -358,7 +392,20 @@ func intrinsicCall(c *Checker, n *ast.Node, name string) *ast.Type {
     n.sem = ast.Sem.CallIntrinsic;
     n.text = name;
     isReflect := name != "compilerThreadSpawn" && name != "compilerThreadReturn";
-    allowed := !nilPkg(c.pkg) && c.pkg.std && c.pkg.path == (isReflect ? "reflect" : "threads");
+    // only the matching marked standard-library function may use an intrinsic
+    required := "";
+    switch (name) {
+    case "compilerReflectFields": required = "reflect.Fields";
+    case "compilerReflectIsStruct": required = "reflect.IsStruct";
+    case "compilerReflectIsEnum": required = "reflect.IsEnum";
+    case "compilerReflectEnumVariant": required = "reflect.EnumVariant";
+    case "compilerReflectVarInteger": required = "reflect.varIntegerBytes";
+    case "compilerThreadSpawn": required = "threads.Spawn";
+    case "compilerThreadReturn": required = "threads.Return";
+    }
+    f := c.fn;
+    for (!nilF(f) && !nilF(f.outer)) f = f.outer;
+    allowed := !nilF(f) && !nilS(f.sym) && f.sym.intrinsic == required;
     if (!allowed) {
         err(c, n, isReflect ? "reflection intrinsics are restricted to the standard library reflect package" : "thread intrinsics are restricted to the standard library threads package");
         return tInvalid;
@@ -370,7 +417,7 @@ func intrinsicCall(c *Checker, n *ast.Node, name string) *ast.Type {
             fs := c.pkg.scope.LookupLocal("Field");
             return ArrayOf(selfType(c, fs), -2);
         }
-        if (name == "compilerReflectEnumVariant") return tString;
+        if (name == "compilerReflectEnumVariant" || name == "compilerReflectVarInteger") return tString;
         return tBool;
     }
     c.usesThreads = true;
@@ -411,7 +458,7 @@ func enumConstruct(c *Checker, n *ast.Node, mem *ast.Node, et *ast.Type, expecte
 
 func indexExpr(c *Checker, n *ast.Node) *ast.Type {
     if (legacyIndexType(c, n)) return tInvalid;
-    t := valueExpr(c, n.a);
+    t := paramBound(valueExpr(c, n.a));
     if (t.kind == ast.TK.Invalid) { valueExpr(c, n.b); return tInvalid; }
     u := Underlying(t);
     if (u.kind == ast.TK.Map) {
@@ -441,11 +488,12 @@ func indexExpr(c *Checker, n *ast.Node) *ast.Type {
 
 func sliceExpr(c *Checker, n *ast.Node) *ast.Type {
     t := valueExpr(c, n.a);
-    if (!nilN(n.b)) { bt := expr(c, n.b, tInt); if (isUntyped(bt)) defaultType(c, n.b, bt); }
-    if (!nilN(n.c)) { ct := expr(c, n.c, tInt); if (isUntyped(ct)) defaultType(c, n.c, ct); }
+    if (!nilN(n.b)) { bt := expr(c, n.b, tInt); if (isUntyped(bt)) bt = defaultType(c, n.b, bt); if (!IsInteger(bt) && bt.kind != ast.TK.Invalid) mismatch(c, n.b, tInt, bt); }
+    if (!nilN(n.c)) { ct := expr(c, n.c, tInt); if (isUntyped(ct)) ct = defaultType(c, n.c, ct); if (!IsInteger(ct) && ct.kind != ast.TK.Invalid) mismatch(c, n.c, tInt, ct); }
     if (t.kind == ast.TK.Invalid) return tInvalid;
     u := Underlying(t);
     if (u.kind == ast.TK.String) return tString;
+    if (u.kind == ast.TK.Dyn && u.isMixed) return MixedOf(u.elem);
     if (u.kind == ast.TK.Array || u.kind == ast.TK.Dyn) return DynOf(u.elem);
     if (u.kind == ast.TK.Buffer && !nilT(u.elem)) {
         if (u.len == -2 && nilN(n.c)) err(c, n, "slicing an unsized buffer requires an explicit end bound");
@@ -482,7 +530,10 @@ func assignExpr(c *Checker, n *ast.Node) *ast.Type {
         valueExpr(c, n.b);
         return tVoid;
     }
+    // plain assignment re-creates a freed variable rather than using it
+    c.assignTarget = n.op == scanner.Kind.Assign && target.kind == ast.NK.Ident;
     tt := expr(c, target, zero(*ast.Type));
+    c.assignTarget = false;
     if (tt.kind == ast.TK.Invalid) { valueExpr(c, n.b); return tInvalid; }
     // .data copy assignment
     if (target.kind == ast.NK.Member && target.sem == ast.Sem.ArrayData) {
@@ -496,19 +547,37 @@ func assignExpr(c *Checker, n *ast.Node) *ast.Type {
         if (n.op == scanner.Kind.PlusEq && (u.kind == ast.TK.Dyn || u.kind == ast.TK.Array)) {
             vt := expr(c, n.b, u.elem);
             if (isUntyped(vt)) { coerce(c, n.b, u.elem, n.b); vt = n.b.ty; }
-            if (u.kind == ast.TK.Dyn && IsAny(u.elem) && !IsInterface(vt) && vt.kind == ast.TK.Dyn) { err(c, n, "array += cannot widen the element type to any"); return tt; }
             if (Identical(vt, tt) || c.Assignable(vt, u.elem) || (vt.kind == ast.TK.Array && Identical(vt.elem, u.elem)) || (vt.kind == ast.TK.Dyn && Identical(vt.elem, u.elem))) {
-                if (u.kind == ast.TK.Array && u.len >= 0) { err(c, n, "array += requires a writable variable"); }
+                if (u.kind == ast.TK.Array && u.len >= 0) {
+                    // a fixed-array variable is replaced by the concatenation (§9.3.3):
+                    // its type becomes the longer fixed array from here on
+                    vu := Underlying(vt);
+                    add := -1;
+                    if (vu.kind == ast.TK.Array && vu.len >= 0 && Identical(vu.elem, u.elem)) add = vu.len;
+                    else if (vu.kind != ast.TK.Array && vu.kind != ast.TK.Dyn && c.Assignable(vt, u.elem)) add = 1;
+                    s := target.kind == ast.NK.Ident ? target.sym : zero(*ast.Symbol);
+                    if (add < 0 || nilS(s) || s.kind != ast.SK.Var || s.global || s.param || tt.kind == ast.TK.Named) { err(c, n, "array += requires a writable variable"); return tt; }
+                    nt := ArrayOf(u.elem, u.len + add);
+                    s.ty = nt;
+                    return nt;
+                }
                 return tt;
             }
             err(c, n, "array addition requires matching arrays or a compatible element");
             return tt;
         }
         vt := expr(c, n.b, zero(*ast.Type));
-        if (isUntyped(vt)) vt = unifyLiteral(c, n.b, tt);
+        if (vt.kind == ast.TK.UntypedFloat && Underlying(tt).kind == ast.TK.Float) { setLitType(c, n.b, tt); vt = tt; }
+        else if (isUntyped(vt)) vt = unifyLiteral(c, n.b, tt);
+        if (u.kind == ast.TK.Ptr) {
+            bop := compoundBase(n.op);
+            if ((bop != scanner.Kind.Plus && bop != scanner.Kind.Minus) || !IsInteger(vt)) { err(c, n, "invalid pointer arithmetic operands"); return tt; }
+            ptrArith(c, n, u);
+            return tt;
+        }
         r := binaryTypes(c, n, compoundBase(n.op), tt, vt);
         if (r.kind == ast.TK.Invalid) return tt;
-        if (!c.Assignable(r, tt) && !(tt.kind == ast.TK.Ptr)) mismatch(c, n, tt, r);
+        if (!c.Assignable(r, tt)) mismatch(c, n, tt, r);
         return tt;
     }
     checkWritable(c, target, "assignment requires a writable value");
@@ -527,7 +596,7 @@ func dataAssign(c *Checker, n *ast.Node, target *ast.Node) *ast.Type {
     at := target.a.ty;
     if (!nilT(at) && at.kind == ast.TK.Ptr) at = at.elem;
     u := Underlying(at);
-    if (u.kind == ast.TK.String) { err(c, n, "string data is read-only; copy to i8[] for mutable access"); return tVoid; }
+    if (u.kind == ast.TK.String) { err(c, n, "strings are immutable; reassign the string instead"); return tVoid; }
     v := n.b;
     if (v.kind == ast.NK.Composite) {
         for (_, e := range v.list) {
@@ -577,7 +646,7 @@ func multiAssign(c *Checker, n *ast.Node) {
         if (nilT(tts[i])) { valueExpr(c, v); continue; }
         if (v.kind == ast.NK.Composite && nilN(v.a)) allowContext(c, v);
         expr(c, v, tts[i]);
-        coerce(c, v, tts[i], v);
+        coerce(c, v, tts[i], targets[i]);
     }
 }
 

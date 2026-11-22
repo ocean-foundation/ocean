@@ -134,12 +134,13 @@ func sizeOf1(c *Checker, t *ast.Type) int {
     case ast.TK.Int: return intSize(t.bits);
     case ast.TK.Float: return t.bits / 8;
     case ast.TK.String, ast.TK.Ptr, ast.TK.Dyn, ast.TK.Map: return 8;
-    case ast.TK.Interface, ast.TK.Func, ast.TK.Union: return 16;
+    case ast.TK.Interface, ast.TK.Func, ast.TK.Union, ast.TK.Family: return 16;
     case ast.TK.Named: return c.SizeOf(Underlying(t));
     case ast.TK.Array:
         if (t.len < 0) return 8;
         return align(c.ArrayDataOffset(t.elem) + t.len * c.SizeOf(t.elem), c.AlignOf(t));
     case ast.TK.Buffer:
+        if (nilT(t.elem)) return 16;
         if (t.len > 0) return t.len * c.SizeOf(t.elem);
         return 8;
     case ast.TK.Struct: return c.StructLayoutOf(t).size;

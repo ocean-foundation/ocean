@@ -1,5 +1,0 @@
-package driver;
-import "github.com/ocean-foundation/ocean/compiler/util";
-
-func lspMain() int { return 1; }
-func cleanCache() int { return 0; }

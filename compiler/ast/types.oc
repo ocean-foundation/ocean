@@ -112,6 +112,7 @@ struct Symbol {
     local bool;             // declared in a function body
     scope *Scope;           // resolution scope for local type declarations
     fixedVariant int;
+    valueSyms []*Symbol;    // struct: value parameters visible to field dimensions
 }
 
 struct Scope {

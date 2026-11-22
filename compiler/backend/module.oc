@@ -20,6 +20,7 @@ func runtimeDecls() string {
         "declare i64 @oc_str_cmp(ptr, ptr)\n" +
         "declare i64 @oc_str_eq(ptr, ptr)\n" +
         "declare ptr @oc_str_cdata(ptr)\n" +
+        "declare ptr @oc_str_cdup(ptr)\n" +
         "declare ptr @oc_arr_data(ptr)\n" +
         "declare i64 @oc_arr_len(ptr)\n" +
         "declare i64 @oc_arr_cap(ptr)\n" +
@@ -31,10 +32,17 @@ func runtimeDecls() string {
         "declare ptr @oc_arr_push(ptr, i64)\n" +
         "declare void @oc_arr_remove(ptr, i64, i64, ptr, i64)\n" +
         "declare void @oc_arr_pop(ptr, i64, ptr, i64)\n" +
-        "declare void @oc_arr_free(ptr)\n" +
+        "declare void @oc_arr_free(ptr, ptr)\n" +
+        "declare void @oc_drop(ptr, ptr)\n" +
+        "declare i1 @oc_elems_match(ptr, ptr, ptr, i64)\n" +
+        "declare void @oc_iface_elems_check(ptr, ptr, i64)\n" +
+        "declare ptr @oc_str_copy(ptr)\n" +
+        "declare void @oc_free_ptr(ptr, ptr)\n" +
+        "declare void @oc_hom_range(ptr, i64, i64)\n" +
         "declare ptr @oc_arr_to_block(ptr, ptr)\n" +
         "declare ptr @oc_block_copy(ptr, ptr)\n" +
         "declare ptr @oc_block_new(i64, ptr)\n" +
+        "declare void @oc_init_block(ptr, ptr)\n" +
         "declare ptr @oc_slice(ptr, i64, i64, i64, ptr, i64, i64)\n" +
         "declare ptr @oc_concat(ptr, i64, ptr, i64, ptr)\n" +
         "declare ptr @oc_map_get(ptr, ptr, ptr)\n" +
@@ -47,6 +55,7 @@ func runtimeDecls() string {
         "declare ptr @oc_reflect_fields(ptr, ptr)\n" +
         "declare i64 @oc_reflect_is_struct(ptr)\n" +
         "declare i64 @oc_reflect_is_enum(ptr)\n" +
+        "declare ptr @oc_reflect_var_integer(ptr, ptr)\n" +
         "declare ptr @oc_reflect_enum_variant(ptr, ptr)\n" +
         "declare ptr @oc_method(ptr, ptr, i64)\n" +
         "declare void @oc_panic(ptr, i64) noreturn\n" +
@@ -201,6 +210,7 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
     drain(g);
     emitMatchers(g);
     drain(g);
+    emitGenericMethods(g);
     out := util.NewBuf();
     out.Add("; Ocean program module\n");
     out.Add(runtimeDecls());
@@ -211,4 +221,35 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
     out.AddBuf(g.globals);
     out.AddBuf(g.mod);
     return out.String(), g.errors == 0;
+}
+
+// emitGenericMethods registers, for every boxed type with a matching generic
+// method, the thunks of the instantiations used by interface calls; oc_method
+// consults @oc_generic_methods when a type's own table has no entry.
+func emitGenericMethods(g *Gen) {
+    entries := make([]string);
+    done := 0;
+    for (;;) {
+        entries = make([]string);
+        for (_, gc := range g.genericCalls) {
+            for (_, t := range g.descTypes) {
+                if (!concreteBoxable(t)) continue;
+                base := t; ptr := false;
+                if (t.kind == ast.TK.Ptr) { base = t.elem; ptr = true; }
+                if (base.kind != ast.TK.Struct && base.kind != ast.TK.Enum && base.kind != ast.TK.Named) continue;
+                if (nilS(base.sym)) continue;
+                for (_, m := range base.sym.methodList) {
+                    if (m.name != gc.method || len(m.typeParams) != len(gc.targs) || (m.recvPtr && !ptr)) continue;
+                    th := genericThunkFor(g, m, base, ptr, gc.targs);
+                    entries.append("{ptr, ptr, ptr} {ptr " + desc(g, t) + ", ptr " + methodName(g, gc.dispatch) + ", ptr " + th + "}");
+                }
+            }
+        }
+        drain(g);
+        if (len(entries) == done && g.qpos == len(g.queue)) break;
+        done = len(entries);
+    }
+    g.globals.Add("@oc_generic_method_count = constant i64 ").AddInt(len(entries)).Add("\n");
+    if (len(entries) == 0) { g.globals.Add("@oc_generic_methods = constant [0 x {ptr, ptr, ptr}] zeroinitializer\n"); return; }
+    g.globals.Add("@oc_generic_methods = constant [").AddInt(len(entries)).Add(" x {ptr, ptr, ptr}] [").Add(util.JoinList(entries, ", ")).Add("]\n");
 }

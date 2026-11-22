@@ -48,6 +48,14 @@ func ParseBigNat(text string) *BigNat {
         b.trim();
         return b;
     }
+    if (len(text) - i > 4000) {
+        // Divide and conquer with Karatsuba products: subquadratic in digits.
+        p10: map[int][]uint;
+        r := decimalLimbs(text, i, len(text), &p10);
+        for (_, x := range r) b.limbs.append(x -> int);
+        b.trim();
+        return b;
+    }
     // Decimal: process 9 digits at a time.
     for (i < len(text)) {
         chunk := 0; mul := 1; k := 0;
@@ -117,8 +125,12 @@ func intLiteral(c *Checker, n *ast.Node) LitInfo {
     r: LitInfo;
     if (n.kind == ast.NK.IntLit) {
         r.ok = true;
-        if (n.flag) { r.mag = new(BigNat); if (n.ival != 0) r.mag.limbs.append(n.ival); }
-        else r.mag = ParseBigNat(n.text);
+        if (n.flag) { r.mag = new(BigNat); if (n.ival != 0) r.mag.limbs.append(n.ival); return r; }
+        key := n -> int;
+        cached, hit := c.litCache[key];
+        if (hit) { r.mag = cached; return r; }
+        r.mag = ParseBigNat(n.text);
+        c.litCache[key] = r.mag;
         return r;
     }
     if (n.kind == ast.NK.Unary && n.op == scanner.Kind.Minus) {
@@ -164,4 +176,190 @@ func (c *Checker) LiteralDecimal(n *ast.Node) string {
     if (l.neg) return "-" + d;
     return d;
 }
+// LiteralLLVM spells an integer literal as an LLVM constant of width bits:
+// decimal when small, hex otherwise (LLVM parses wide decimals slowly).
+func (c *Checker) LiteralLLVM(n *ast.Node, bits int) string {
+    l := intLiteral(c, n);
+    if (!l.ok) return "0";
+    if (l.mag.BitLen() <= 63) { d := l.mag.Decimal(); return l.neg ? "-" + d : d; }
+    if (l.neg) return "u0x" + l.mag.TwosHex(bits);
+    if (l.mag.BitLen() > bits) {
+        // wrapped (explicit cast): keep the low bits
+        t := new(BigNat);
+        for (i := 0; i < (bits + 31) / 32 && i < len(l.mag.limbs); i++) t.limbs.append(l.mag.limbs[i]);
+        if (bits % 32 != 0 && len(t.limbs) == (bits + 31) / 32) t.limbs[len(t.limbs) - 1] = t.limbs[len(t.limbs) - 1] & ((1 << (bits % 32)) - 1);
+        t.trim();
+        return "u0x" + t.Hex();
+    }
+    return "u0x" + l.mag.Hex();
+}
 func (c *Checker) IsIntLiteral(n *ast.Node) bool { return intLiteral(c, n).ok; }
+
+func (b *BigNat) Bit(i int) bool { k := i / 32; return k < len(b.limbs) && ((b.limbs[k] >> (i % 32)) & 1) != 0; }
+
+// floatOverflows reports whether the magnitude rounds (to nearest even) to
+// infinity in a float of the given width.
+func floatOverflows(m *BigNat, bits int) bool {
+    e := bits == 32 ? 128 : 1024;
+    p := bits == 32 ? 24 : 53;
+    n := m.BitLen();
+    if (n > e) return true;
+    if (n < e) return false;
+    for (i := e - 1; i >= e - p - 1; i--) { if (!m.Bit(i)) return false; }
+    return true;
+}
+
+// warnLiteralInfinity warns when an integer literal becomes infinity as a float.
+func warnLiteralInfinity(c *Checker, at *ast.Node, l LitInfo, bits int) {
+    if (!l.ok || !floatOverflows(l.mag, bits)) return;
+    name := bits == 32 ? "f32" : "f64";
+    warn(c, at, "integer literal is out of range for " + name + " and becomes infinity; cast it with ->f64 if that is intended");
+}
+
+// ---- subquadratic decimal conversion (limbs are base 2^32 in uint) ----
+
+func trimU(a []uint) []uint { for (len(a) > 0 && a[len(a) - 1] == 0) a.pop(); return a; }
+
+func addU(a []uint, b []uint) []uint {
+    n := len(a) > len(b) ? len(a) : len(b);
+    out := make([]uint);
+    carry := 0->uint;
+    for (i := 0; i < n; i++) {
+        s := carry;
+        if (i < len(a)) s += a[i];
+        if (i < len(b)) s += b[i];
+        out.append(s & 4294967295);
+        carry = s >> 32;
+    }
+    if (carry != 0) out.append(carry);
+    return out;
+}
+
+// subU computes a - b, assuming a >= b.
+func subU(a []uint, b []uint) []uint {
+    out := make([]uint);
+    borrow := 0->uint;
+    for (i := 0; i < len(a); i++) {
+        x := a[i]; y := borrow;
+        if (i < len(b)) y += b[i];
+        if (x >= y) { out.append(x - y); borrow = 0; }
+        else { out.append(x + 4294967296 - y); borrow = 1; }
+    }
+    return trimU(out);
+}
+
+func sliceU(a []uint, lo int, hi int) []uint {
+    out := make([]uint);
+    for (i := lo; i < hi && i < len(a); i++) out.append(a[i]);
+    return trimU(out);
+}
+
+// addShifted adds b * 2^(32*shift) into acc (acc is long enough).
+func addShifted(acc *[]uint, b []uint, shift int) {
+    carry := 0->uint;
+    i := 0;
+    for (; i < len(b) || carry != 0; i++) {
+        for (shift + i >= len(*acc)) (*acc).append(0);
+        s := (*acc)[shift + i] + carry;
+        if (i < len(b)) s += b[i];
+        (*acc)[shift + i] = s & 4294967295;
+        carry = s >> 32;
+    }
+}
+
+func schoolMul(a []uint, b []uint) []uint {
+    out := make([]uint);
+    for (len(out) < len(a) + len(b)) out.append(0);
+    for (i := 0; i < len(a); i++) {
+        carry := 0->uint;
+        x := a[i];
+        if (x == 0) continue;
+        for (j := 0; j < len(b); j++) {
+            t := out[i + j] + x * b[j] + carry;
+            out[i + j] = t & 4294967295;
+            carry = t >> 32;
+        }
+        k := i + len(b);
+        for (carry != 0) { t := out[k] + carry; out[k] = t & 4294967295; carry = t >> 32; k++; }
+    }
+    return trimU(out);
+}
+
+func karatsuba(a []uint, b []uint) []uint {
+    if (len(a) == 0 || len(b) == 0) return make([]uint);
+    if (len(a) < 40 || len(b) < 40) return schoolMul(a, b);
+    m := (len(a) > len(b) ? len(a) : len(b)) / 2;
+    a0 := sliceU(a, 0, m); a1 := sliceU(a, m, len(a));
+    b0 := sliceU(b, 0, m); b1 := sliceU(b, m, len(b));
+    z0 := karatsuba(a0, b0);
+    z2 := karatsuba(a1, b1);
+    z1 := subU(subU(karatsuba(addU(a0, a1), addU(b0, b1)), z0), z2);
+    out := make([]uint);
+    addShifted(&out, z0, 0);
+    addShifted(&out, z1, m);
+    addShifted(&out, z2, 2 * m);
+    return trimU(out);
+}
+
+func pow10U(k int, memo *map[int][]uint) []uint {
+    v, ok := (*memo)[k];
+    if (ok) return v;
+    r := make([]uint);
+    if (k <= 9) {
+        p := 1->uint;
+        for (i := 0; i < k; i++) p *= 10;
+        r.append(p);
+    } else {
+        h := k / 2;
+        r = karatsuba(pow10U(h, memo), pow10U(k - h, memo));
+    }
+    (*memo)[k] = r;
+    return r;
+}
+
+func decimalLimbs(text string, lo int, hi int, memo *map[int][]uint) []uint {
+    if (hi - lo <= 2000) {
+        b := new(BigNat);
+        for (i := lo; i < hi;) {
+            chunk := 0; mul := 1; k := 0;
+            for (k < 9 && i < hi) { chunk = chunk * 10 + digitValue(text[i]); mul *= 10; i++; k++; }
+            if (len(b.limbs) == 0) { if (chunk != 0) b.limbs.append(chunk); }
+            else b.mulAdd(mul, chunk);
+        }
+        out := make([]uint);
+        for (_, x := range b.limbs) out.append(x -> uint);
+        return trimU(out);
+    }
+    k := (hi - lo) / 2;
+    left := decimalLimbs(text, lo, hi - k, memo);
+    right := decimalLimbs(text, hi - k, hi, memo);
+    return addU(karatsuba(left, pow10U(k, memo)), right);
+}
+
+// Hex renders the magnitude in base 16 (no prefix).
+func (b *BigNat) Hex() string {
+    if (len(b.limbs) == 0) return "0";
+    buf := make([]i8);
+    started := false;
+    for (i := len(b.limbs) - 1; i >= 0; i--) {
+        for (s := 28; s >= 0; s -= 4) {
+            d := (b.limbs[i] >> s) & 15;
+            if (d == 0 && !started) continue;
+            started = true;
+            buf.append("0123456789abcdef"[d]);
+        }
+    }
+    return buf -> string;
+}
+
+// TwosHex is the hex bit pattern of -m in a w-bit integer.
+func (b *BigNat) TwosHex(w int) string {
+    n := (w + 31) / 32;
+    l := make([]int);
+    for (i := 0; i < n; i++) l.append(i < len(b.limbs) ? (~b.limbs[i]) & 4294967295 : 4294967295);
+    carry := 1;
+    for (i := 0; i < n && carry != 0; i++) { v := l[i] + carry; l[i] = v & 4294967295; carry = v >> 32; }
+    if (w % 32 != 0) l[n - 1] = l[n - 1] & ((1 << (w % 32)) - 1);
+    r := new(BigNat); r.limbs = l; r.trim();
+    return r.Hex();
+}

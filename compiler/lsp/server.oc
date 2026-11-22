@@ -1,0 +1,248 @@
+package lsp;
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+struct Document { uri string; path string; text string; version int; }
+
+struct Server {
+    docs []*Document;
+    initialized bool;
+    shutdown bool;
+    inbuf string;
+    inpos int;
+    eof bool;
+}
+
+func send(body string) {
+    util.Stdout("Content-Length: " + util.Itoa(len(body)) + "\r\n\r\n" + body);
+}
+
+func reply(id *J, result string) {
+    idText := nilJ(id) ? "null" : id.raw;
+    send("{\"jsonrpc\":\"2.0\",\"id\":" + idText + ",\"result\":" + result + "}");
+}
+func replyError(id *J, code int, message string) {
+    idText := nilJ(id) ? "null" : id.raw;
+    send("{\"jsonrpc\":\"2.0\",\"id\":" + idText + ",\"error\":{\"code\":" + util.Itoa(code) + ",\"message\":" + Quote(message) + "}}");
+}
+
+// fill reads more of stdin; false at EOF.
+func fill(s *Server) bool {
+    if (s.eof) return false;
+    chunk := util.ReadFd(0, 65536);
+    if (chunk == "") { s.eof = true; return false; }
+    if (s.inpos > 0) { s.inbuf = s.inbuf[s.inpos:]; s.inpos = 0; }
+    s.inbuf += chunk;
+    return true;
+}
+
+func readLine(s *Server) (string, bool) {
+    for (;;) {
+        for (i := s.inpos; i < len(s.inbuf); i++) {
+            if (s.inbuf[i] == '\n') {
+                line := s.inbuf[s.inpos:i + 1];
+                s.inpos = i + 1;
+                return line, true;
+            }
+        }
+        if (!fill(s)) return "", false;
+    }
+    return "", false;
+}
+
+func readBytes(s *Server, n int) (string, bool) {
+    for (len(s.inbuf) - s.inpos < n) { if (!fill(s)) return "", false; }
+    out := s.inbuf[s.inpos:s.inpos + n];
+    s.inpos += n;
+    return out, true;
+}
+
+func lower(s string) string {
+    b: util.Buf;
+    for (i := 0; i < len(s); i++) { c := s[i]; if (c >= 'A' && c <= 'Z') c = c + 32; b.Addc(c); }
+    return b.String();
+}
+
+func hexVal(c i8) int {
+    if (c >= '0' && c <= '9') return (c - '0') -> int;
+    if (c >= 'a' && c <= 'f') return (c - 'a') -> int + 10;
+    if (c >= 'A' && c <= 'F') return (c - 'A') -> int + 10;
+    return -1;
+}
+
+// uriPath converts a file:// URI to a resolved path ("" if invalid).
+func uriPath(uri string) string {
+    if (!util.HasPrefix(uri, "file://")) return "";
+    s := uri[7:];
+    if (util.HasPrefix(s, "localhost/")) s = s[9:];
+    if (len(s) == 0 || s[0] != '/') return "";
+    b: util.Buf;
+    for (i := 0; i < len(s); i++) {
+        if (s[i] == '%') {
+            if (i + 2 >= len(s) || hexVal(s[i + 1]) < 0 || hexVal(s[i + 2]) < 0) return "";
+            v := hexVal(s[i + 1]) * 16 + hexVal(s[i + 2]);
+            if (v == 0) return "";
+            b.Addc(v -> i8);
+            i += 2;
+        } else b.Addc(s[i]);
+    }
+    path := b.String();
+    r, ok := util.Realpath(path);
+    if (ok) return r;
+    dir, dok := util.Realpath(util.Dir(path));
+    if (dok) return dir + "/" + util.Base(path);
+    return "";
+}
+
+// pathURI percent-encodes a path as a file:// URI.
+func pathURI(path string) string {
+    b: util.Buf;
+    b.Add("file://");
+    for (i := 0; i < len(path); i++) {
+        c := path[i];
+        u := (c -> int) & 255;
+        if (util.IsLetter(c) || util.IsDigit(c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') b.Addc(c);
+        else { b.Addc('%'); b.Addc(hexUpper(u >> 4)); b.Addc(hexUpper(u & 15)); }
+    }
+    return b.String();
+}
+func hexUpper(v int) i8 { return "0123456789ABCDEF"[v]; }
+
+func findDoc(s *Server, uri string) int {
+    for (i, d := range s.docs) { if (d.uri == uri) return i; }
+    return -1;
+}
+
+// Main runs the stdio language server.
+func Main() int {
+    s := new(Server);
+    for (;;) {
+        length := -1; bad := false;
+        for (;;) {
+            line, ok := readLine(s);
+            if (!ok) { if (len(s.inbuf) - s.inpos == 0) break; bad = true; break; }
+            if (line == "\r\n" || line == "\n") break;
+            if (util.HasPrefix(lower(line), "content-length:")) {
+                v, vok := util.Atoi(util.Trim(line[15:]));
+                if (!vok || length >= 0 || v <= 0 || v > 16777216) { bad = true; break; }
+                length = v;
+            }
+        }
+        if (s.eof && length < 0) return s.shutdown ? 0 : 1;
+        if (bad || length < 0) return 1;
+        body, ok := readBytes(s, length);
+        if (!ok) return 1;
+        root, pok := Parse(body);
+        if (!pok || root.kind != 'o') { replyError(zero(*J), -32700, "Parse error"); continue; }
+        id := root.Get("id");
+        params := root.Get("params");
+        method := root.Get("method").Str();
+        if (!root.Get("method").IsStr()) { if (!nilJ(id)) replyError(id, -32600, "Invalid request"); continue; }
+        if (method == "exit") return s.shutdown ? 0 : 1;
+        if (s.shutdown) { if (!nilJ(id)) replyError(id, -32600, "Server has shut down"); continue; }
+        if (method == "initialize") {
+            if (s.initialized) { replyError(id, -32600, "Already initialized"); continue; }
+            if (!nilJ(id)) {
+                s.initialized = true;
+                reply(id, "{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"hoverProvider\":true,\"definitionProvider\":true,\"declarationProvider\":true,\"typeDefinitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":true}},\"serverInfo\":{\"name\":\"ocean\"}}");
+            }
+            continue;
+        }
+        if (!s.initialized) { if (!nilJ(id)) replyError(id, -32002, "Server not initialized"); continue; }
+        if (method == "shutdown") { if (!nilJ(id)) { s.shutdown = true; reply(id, "null"); } continue; }
+        if (method == "textDocument/hover" || method == "textDocument/definition" || method == "textDocument/declaration" ||
+            method == "textDocument/typeDefinition" || method == "textDocument/references" || method == "textDocument/rename" ||
+            method == "textDocument/prepareRename" || method == "textDocument/completion") {
+            if (!nilJ(id)) semanticRequest(s, id, method, params);
+            continue;
+        }
+        if (method == "textDocument/didOpen" || method == "textDocument/didChange" || method == "textDocument/didSave" || method == "textDocument/didClose") {
+            td := params.Get("textDocument");
+            uri := td.Get("uri").Str();
+            if (uri == "") continue;
+            i := findDoc(s, uri);
+            if (method == "textDocument/didOpen") {
+                text := td.Get("text");
+                path := uriPath(uri);
+                if (text.IsStr() && path != "") {
+                    d := zero(*Document);
+                    if (i < 0) { d = new(Document); d.uri = uri; s.docs.append(d); } else d = s.docs[i];
+                    d.path = path; d.text = text.Str(); d.version = td.Get("version").Int(0);
+                }
+            } else if (i >= 0 && method == "textDocument/didClose") {
+                d := s.docs[i];
+                publishEmpty(d);
+                s.docs.remove(i);
+            } else if (i >= 0 && method == "textDocument/didChange") {
+                d := s.docs[i];
+                v := td.Get("version").Int(d.version + 1);
+                changes := params.Get("contentChanges");
+                if (!nilJ(changes) && changes.kind == 'a' && v > d.version) {
+                    for (_, ch := range changes.items) {
+                        t := ch.Get("text");
+                        if (t.IsStr() && nilJ(ch.Get("range"))) d.text = t.Str();
+                    }
+                    d.version = v;
+                }
+            }
+            for (_, d := range s.docs) publish(s, d);
+            continue;
+        }
+        if (!nilJ(id)) replyError(id, -32601, "Method not found");
+    }
+    return 1;
+}
+
+func publishEmpty(d *Document) {
+    send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" + Quote(d.uri) + ",\"version\":" + util.Itoa(d.version) + ",\"diagnostics\":[]}}");
+}
+
+func publish(s *Server, d *Document) {
+    items := isolated(s, d, "diagnostics", zero(*J));
+    send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" + Quote(d.uri) + ",\"version\":" + util.Itoa(d.version) + ",\"diagnostics\":[" + items + "]}}");
+}
+
+func semanticRequest(s *Server, id *J, method string, params *J) {
+    uri := params.Get("textDocument").Get("uri").Str();
+    i := findDoc(s, uri);
+    if (i < 0) {
+        // Unopened files are read from disk.
+        path := uriPath(uri);
+        text, ok := util.ReadFile(path);
+        if (path == "" || !ok) { reply(id, method == "textDocument/completion" ? "{\"isIncomplete\":false,\"items\":[]}" : "null"); return; }
+        d := new(Document); d.uri = uri; d.path = path; d.text = text;
+        out := isolated(s, d, method, params);
+        if (util.HasPrefix(out, "!")) replyError(id, -32602, out[1:]); else reply(id, out);
+        return;
+    }
+    out := isolated(s, s.docs[i], method, params);
+    if (util.HasPrefix(out, "!")) replyError(id, -32602, out[1:]);
+    else reply(id, out);
+}
+
+// isolated runs an analysis in a forked child so failures and memory growth
+// never affect the server. The child writes its JSON answer to a pipe.
+func isolated(s *Server, d *Document, method string, params *J) string {
+    r, w, ok := util.Pipe();
+    if (!ok) return answer(s, d, method, params);
+    pid := util.Fork();
+    if (pid == 0) {
+        util.CloseFd(r);
+        out := answer(s, d, method, params);
+        util.WriteFd(w -> i32, out);
+        util.ExitNow(0);
+    }
+    util.CloseFd(w);
+    if (pid < 0) { util.CloseFd(r); return fallback(method); }
+    out := util.ReadAllFd(r);
+    util.CloseFd(r);
+    st := util.Wait(pid);
+    if (st.Signal != 0 || st.Code != 0) return fallback(method);
+    return out;
+}
+
+func fallback(method string) string {
+    if (method == "diagnostics") return "";
+    if (method == "textDocument/completion") return "{\"isIncomplete\":false,\"items\":[]}";
+    if (method == "textDocument/definition" || method == "textDocument/declaration" || method == "textDocument/typeDefinition" || method == "textDocument/references") return "[]";
+    return "null";
+}

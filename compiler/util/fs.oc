@@ -96,6 +96,14 @@ func WriteFileMode(path string, s string, mode int) bool {
 }
 func WriteFile(path string, s string) bool { return WriteFileMode(path, s, 438); }
 
+// OpenTrunc opens path for writing (create/truncate); -1 on failure.
+func OpenTrunc(path string) int {
+    c := CStr(path);
+    return extern.open(c.data, (64 | 512 | 1)->i32, 438->u32) -> int;
+}
+func WriteString(fd int, s string) bool { return WriteFd(fd->i32, s); }
+func Close(fd int) bool { return extern.close(fd->i32) == 0; }
+
 func WriteBufFile(path string, b *Buf) bool {
     c := CStr(path);
     fd := extern.open(c.data, (64 | 512 | 1)->i32, 438->u32);

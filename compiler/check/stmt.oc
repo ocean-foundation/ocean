@@ -22,9 +22,11 @@ func checkFunc(c *Checker, d *ast.Node) {
         r.param = true;
         r.ty = receiverType(c, s);
         d.a.sym = r; d.a.ty = r.ty;
+        declRef(c, d.a.src, d.a.nameLine, d.a.nameCol, r, r.ty);
         declare(c, r, d.a);
     }
     declareParams(c, d.list, d.list2, f);
+    span(c, d.b);
     funcBody(c, d.b, f);
     pop(c);
     for (i := 0; i < pushed; i++) pop(c);
@@ -35,8 +37,14 @@ func funcBody(c *Checker, body *ast.Node, f *FuncCtx) {
     block(c, body);
     for (_, g := range f.gotos) {
         target, ok := f.labels[g.name];
-        if (!ok) { err(c, g, "undefined label: " + g.name); continue; }
+        if (!ok) {
+            c.errors++;
+            line := g.nameLine > 0 ? g.nameLine : g.line; col := g.nameLine > 0 ? g.nameCol : g.col;
+            c.diags.Error(nilSrc(g.src) ? "<source>" : g.src.path, line, col, "backend", "goto refers to an undefined label: " + g.name);
+            continue;
+        }
         g.ref = target;
+        checkGoto(c, g, target);
     }
     if (len(f.results) > 0 && !terminates(c, body)) {
         at := f.node;
@@ -69,8 +77,11 @@ func predeclare(c *Checker, stmts []*ast.Node) {
 
 func block(c *Checker, n *ast.Node) {
     push(c);
+    span(c, n);
     predeclare(c, n.list);
-    for (_, s := range n.list) stmt(c, s);
+    c.blockStack.append(n); c.indexStack.append(0);
+    for (i, s := range n.list) { c.indexStack[len(c.indexStack) - 1] = i; stmt(c, s); }
+    c.blockStack.pop(); c.indexStack.pop();
     pop(c);
 }
 
@@ -78,7 +89,10 @@ func block(c *Checker, n *ast.Node) {
 func stmtScoped(c *Checker, n *ast.Node) {
     if (n.kind == ast.NK.Block) { block(c, n); return; }
     push(c);
+    span(c, n);
+    c.blockStack.append(n); c.indexStack.append(0);
     stmt(c, n);
+    c.blockStack.pop(); c.indexStack.pop();
     pop(c);
 }
 
@@ -93,6 +107,7 @@ func stmt(c *Checker, n *ast.Node) {
         if (n.a.kind == ast.NK.Member && (n.a.sem == ast.Sem.Method || n.a.sem == ast.Sem.IfaceMethod)) err(c, n.a, "bound method values are not supported");
     case ast.NK.If:
         push(c);
+        span(c, n);
         if (!nilN(n.a)) stmt(c, n.a);
         condition(c, n.b);
         stmtScoped(c, n.c);
@@ -100,6 +115,7 @@ func stmt(c *Checker, n *ast.Node) {
         pop(c);
     case ast.NK.For:
         push(c);
+        span(c, n);
         if (!nilN(n.a)) stmt(c, n.a);
         if (!nilN(n.b)) condition(c, n.b);
         if (!nilN(n.c)) valueExpr(c, n.c);
@@ -129,6 +145,7 @@ func stmt(c *Checker, n *ast.Node) {
         _, dup := c.fn.labels[n.name];
         if (dup) err(c, n, "duplicate label: " + n.name);
         c.fn.labels[n.name] = n;
+        c.jumps[nodeKey(n)] = jumpInfo(c);
         n.ref = n.a;
         stmt(c, n.a);
     case ast.NK.Break:
@@ -139,6 +156,7 @@ func stmt(c *Checker, n *ast.Node) {
         else if (c.fn.loopDepth == 0) err(c, n, "continue requires an enclosing loop");
     case ast.NK.Goto:
         c.fn.gotos.append(n);
+        c.jumps[nodeKey(n)] = jumpInfo(c);
     case ast.NK.Fallthrough:
     case ast.NK.Asm: asmStmt(c, n);
     case ast.NK.Func:
@@ -171,21 +189,45 @@ func declareLocal(c *Checker, id *ast.Node, t *ast.Type) {
     s := newSym(c, ast.SK.Var, id.name, id);
     s.ty = t;
     id.sym = s; id.ty = t;
+    checkInstanceBitfields(c, id, t);
+    declRef(c, id.src, id.line, id.col, s, t);
     declare(c, s, id);
 }
 
 // localVar checks `names : [Type] [= values]`.
+// bindingAlias is the variable name an extraction entry binds.
+func bindingAlias(e *ast.Node) string {
+    if (e.b.kind == ast.NK.Ident) return e.b.name;
+    if (e.b.kind == ast.NK.Assign && e.b.a.kind == ast.NK.Ident) return e.b.a.name;
+    return "";
+}
+
+// orderBindings permutes record-extraction entries to follow the names on the
+// left: `x, y := e.(E.V{y, x})` binds by name, not position.
+func orderBindings(names []*ast.Node, v *ast.Node) {
+    if (v.kind != ast.NK.Assert || !v.flag || len(v.list) != len(names)) return;
+    out := make([]*ast.Node);
+    for (_, id := range names) {
+        found := zero(*ast.Node);
+        for (_, e := range v.list) { if (bindingAlias(e) == id.name) found = e; }
+        if (nilN(found)) return;
+        out.append(found);
+    }
+    v.list = out;
+}
+
 func localVar(c *Checker, n *ast.Node) {
     names := n.list; values := n.list2;
+    if (len(values) == 1 && len(names) > 1) orderBindings(names, values[0]);
     if (!nilN(n.a)) {
         t := resolveType(c, n.a);
         n.tyAlt = t;
+        checkLenNodes(c, t);
         if (t.kind == ast.TK.Void) err(c, n, "void is not a variable storage type");
         if (len(values) == 0) {
             if (t.kind == ast.TK.Array && t.len == -2) err(c, n, "array<T> requires an existing array initializer; instantiate with T[n]");
             if (t.kind == ast.TK.Buffer && t.len == -2) err(c, n, "unsized buffer requires an initializer");
             if (t.kind == ast.TK.Buffer && nilT(t.elem)) err(c, n, "unsized buffer requires an initializer");
-            if (t.kind == ast.TK.Array && t.len == -1) { lt := expr(c, t.lenNode, tInt); if (isUntyped(lt)) defaultType(c, t.lenNode, lt); }
             if (t.kind == ast.TK.Buffer && t.len == -1) { lt := expr(c, t.lenNode, tInt); if (isUntyped(lt)) defaultType(c, t.lenNode, lt); }
             if (t.kind == ast.TK.Struct) {
                 for (_, f := range c.FieldsOf(t)) { if (f.valueParam) { err(c, n, "struct with parameters requires an initializer"); break; } }
@@ -207,8 +249,8 @@ func localVar(c *Checker, n *ast.Node) {
         else {
             for (_, v := range values) {
                 if (v.kind == ast.NK.Composite && nilN(v.a)) allowContext(c, v);
-                expr(c, v, t);
-                if (t.kind == ast.TK.Ptr && intLiteral(c, v).ok) { defaultType(c, v, v.ty); continue; }
+                vt := expr(c, v, t);
+                if (Underlying(t).kind == ast.TK.Ptr && (vt.kind == ast.TK.UntypedInt || IsInteger(vt))) { defaultType(c, v, v.ty); continue; }
                 coerce(c, v, t, n);
             }
         }
@@ -267,6 +309,7 @@ func multiValue(c *Checker, n *ast.Node, v *ast.Node, count int) *ast.Type {
 
 func forRange(c *Checker, n *ast.Node) {
     push(c);
+    span(c, n);
     t := valueExpr(c, n.a);
     u := Underlying(t);
     kt := tInt; vt := tInvalid;
@@ -318,10 +361,6 @@ func typeSwitch(c *Checker, n *ast.Node) {
     if (!nilN(n.a)) stmt(c, n.a);
     t := valueExpr(c, n.b);
     if (t.kind == ast.TK.Enum) err(c, n, "type-guard switches do not support enums; use match");
-    else if (t.kind != ast.TK.Interface && t.kind != ast.TK.Union && t.kind != ast.TK.Param && t.kind != ast.TK.Invalid &&
-             !(t.kind == ast.TK.Buffer && nilT(t.elem)) && t.kind != ast.TK.Family && !(t.kind == ast.TK.Array && t.len == -2)) {
-        err(c, n, "type switch requires an interface or any value");
-    }
     c.fn.switchDepth++;
     for (_, cl := range n.list) {
         cl.types = make([]*ast.Type);
@@ -336,6 +375,7 @@ func typeSwitch(c *Checker, n *ast.Node) {
             bt := tAny;
             if (!cl.flag && len(cl.types) == 1 && cl.types[0].kind != ast.TK.Union) bt = cl.types[0];
             if (!cl.flag && len(cl.types) == 1 && cl.types[0].kind == ast.TK.Interface) bt = cl.types[0];
+            if (!cl.flag && len(cl.types) == 1 && cl.types[0].kind == ast.TK.Union && len(cl.types[0].terms) == 1) bt = cl.types[0].terms[0];
             id := new(ast.Node);
             id.kind = ast.NK.Ident; id.src = n.src; id.line = n.nameLine; id.col = n.nameCol; id.name = n.name;
             declareLocal(c, id, bt);
@@ -446,6 +486,12 @@ func returnStmt(c *Checker, n *ast.Node) {
         err(c, n, "return count mismatch: Expected " + itoa(len(results)) + " return values, but got 1.");
         return;
     }
+    if (len(n.list) == 1 && len(results) == 1 && n.list[0].kind == ast.NK.Call) {
+        t := valueExpr(c, n.list[0]);
+        if (t.kind == ast.TK.Tuple) { err(c, n, "return count mismatch: Expected 1 return values, but got " + itoa(len(t.results)) + "."); return; }
+        coerce(c, n.list[0], results[0], n.list[0]);
+        return;
+    }
     if (len(n.list) != len(results)) {
         err(c, n, "return count mismatch: Expected " + itoa(len(results)) + " return values, but got " + itoa(len(n.list)) + ".");
         for (_, v := range n.list) valueExpr(c, v);
@@ -479,8 +525,8 @@ func checkGlobal(c *Checker, d *ast.Node) {
     if (len(d.list2) == 1 && len(d.list) > 1) { valueExpr(c, d.list2[0]); return; }
     for (_, v := range d.list2) {
         if (v.kind == ast.NK.Composite && nilN(v.a)) allowContext(c, v);
-        expr(c, v, t);
-        if (t.kind == ast.TK.Ptr && intLiteral(c, v).ok) { defaultType(c, v, v.ty); continue; }
+        vt := expr(c, v, t);
+        if (Underlying(t).kind == ast.TK.Ptr && (vt.kind == ast.TK.UntypedInt || IsInteger(vt))) { defaultType(c, v, v.ty); continue; }
         coerce(c, v, t, d);
     }
 }
@@ -546,12 +592,21 @@ func terminates(c *Checker, n *ast.Node) bool {
     case ast.NK.Forward: return terminates(c, n.a);
     case ast.NK.Switch, ast.NK.TypeSwitch:
         hasDefault := false;
-        for (_, cl := range n.list) {
+        anyClause := -1;
+        for (i, cl := range n.list) {
             if (cl.flag) hasDefault = true;
-            if (n.kind == ast.NK.TypeSwitch) { for (_, t := range cl.types) { if (IsAny(t)) hasDefault = true; } }
+            if (n.kind == ast.NK.TypeSwitch && anyClause < 0) {
+                for (_, t := range cl.types) {
+                    if (IsAny(t)) anyClause = i;
+                    if (t.kind == ast.TK.Union) { for (j, term := range t.terms) { if (!t.tilde[j] && IsAny(term)) anyClause = i; } }
+                }
+            }
         }
+        if (anyClause >= 0) hasDefault = true;
         if (!hasDefault || hasBreak(n, n, 0)) return false;
         for (i, cl := range n.list) {
+            // with a case any, later clauses and the default are unreachable
+            if (anyClause >= 0 && (i > anyClause || cl.flag)) continue;
             if (len(cl.list2) == 0) { if (i == len(n.list) - 1) return false; continue; }
             last := cl.list2[len(cl.list2) - 1];
             if (last.kind == ast.NK.Fallthrough) continue;
@@ -574,3 +629,47 @@ func terminates(c *Checker, n *ast.Node) bool {
 }
 
 func unusedScanner(c *Checker, k scanner.Kind) bool { return k == scanner.Kind.EOF; }
+
+func gotoErr(c *Checker, g *ast.Node, msg string) {
+    at := new(ast.Node);
+    at.src = g.src; at.line = g.nameLine > 0 ? g.nameLine : g.line; at.col = g.nameLine > 0 ? g.nameCol : g.col;
+    err(c, at, msg);
+}
+
+// checkGoto enforces §10.11: the label must be in the same or an enclosing
+// block, and a forward jump may not skip a declaration in the label's scope.
+func checkGoto(c *Checker, g *ast.Node, label *ast.Node) {
+    gj, ok1 := c.jumps[nodeKey(g)];
+    lj, ok2 := c.jumps[nodeKey(label)];
+    if (!ok1 || !ok2 || len(lj.blocks) == 0) return;
+    top := lj.blocks[len(lj.blocks) - 1];
+    k := -1;
+    for (i, b := range gj.blocks) { if (b == top) k = i; }
+    if (k < 0) { gotoErr(c, g, "goto cannot enter another block or control-flow branch"); return; }
+    li := lj.idx[len(lj.idx) - 1];
+    gi := gj.idx[k];
+    if (top.kind != ast.NK.Block || gi >= li) return;
+    for (j := gi + 1; j < li; j++) {
+        if (top.list[j].kind == ast.NK.VarDecl) { gotoErr(c, g, "goto cannot jump over a variable declaration"); return; }
+    }
+}
+
+// checkInstanceBitfields validates bitfields of a generic struct instance whose
+// field types come from type arguments (ocean-c reports these while lowering).
+func checkInstanceBitfields(c *Checker, at *ast.Node, t *ast.Type) {
+    if (nilT(t)) return;
+    u := Underlying(t);
+    if (u.kind != ast.TK.Struct || len(u.args) == 0) return;
+    for (_, f := range c.FieldsOf(u)) {
+        if (f.bits <= 0) continue;
+        ft := Underlying(f.ty);
+        msg := "";
+        if (ft.kind != ast.TK.Int && ft.kind != ast.TK.Bool) msg = "bitfield requires an integer or bool type";
+        else if ((ft.kind == ast.TK.Int && f.bits > ft.bits) || (ft.kind == ast.TK.Bool && f.bits > 1)) msg = "bitfield size exceeds its type width";
+        if (msg != "") {
+            c.errors++;
+            c.diags.Error(nilSrc(at.src) ? "<source>" : at.src.path, at.line, at.col, "backend", msg);
+            return;
+        }
+    }
+}

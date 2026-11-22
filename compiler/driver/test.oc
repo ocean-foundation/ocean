@@ -8,6 +8,9 @@ struct Reporter {
     report string;          // path ("" none)
     reportBuf *util.Buf;
     jsonFile *util.Buf;
+    jsonFD int;
+    jsonFailed bool;
+    displayStarted bool;    // multi: the package was announced to the display at spawn             // --jsonfile stream (events are written as they happen)
     jsonPath string;
     pkg string;
     json bool;
@@ -32,7 +35,7 @@ struct Reporter {
 
 func newReporter() *Reporter {
     r := new(Reporter);
-    r.includeSkipped = true; r.timeout = 600.0; r.workers = 16; r.grantFD = -1; r.displayFD = -1;
+    r.includeSkipped = true; r.timeout = 600.0; r.workers = 16; r.grantFD = -1; r.displayFD = -1; r.jsonFD = -1;
     return r;
 }
 
@@ -173,14 +176,15 @@ func flushDisplay(r *Reporter) {
 }
 
 func emitJSON(r *Reporter, action string, name string, output string, elapsed float) {
-    displaySend(r, action, name, output, elapsed);
+    if (!(action == "start" && name == "" && r.displayStarted)) displaySend(r, action, name, output, elapsed);
     if (!r.json && ast_nilBuf(r.jsonFile)) return;
     line := "{\"Time\":\"" + timestamp() + "\",\"Action\":" + jsonQuote(action) + ",\"Package\":" + jsonQuote(r.pkg);
     if (name != "") line += ",\"Test\":" + jsonQuote(name);
     if (output != "") line += ",\"Output\":" + jsonQuote(output);
     line += ",\"Elapsed\":" + util.FormatFixed(elapsed, 9) + "}\n";
     if (r.json) util.Stdout(line);
-    if (!ast_nilBuf(r.jsonFile)) r.jsonFile.Add(line);
+    if (r.jsonFD >= 0) { if (!util.WriteString(r.jsonFD, line)) r.jsonFailed = true; }
+    else if (!ast_nilBuf(r.jsonFile)) r.jsonFile.Add(line);
 }
 
 func grant(r *Reporter) {
@@ -335,6 +339,8 @@ func takeLines(pending *string) []string {
 }
 
 func testExecute(r *Reporter, executable string, displayExe string) int {
+    // start the display first so it cannot inherit the test's pipes
+    if (displayExe != "") startDisplay(r, displayExe);
     evR, evW, ok1 := util.Pipe();
     outR, outW, ok2 := util.Pipe();
     if (!ok1 || !ok2) { util.Stderr("ocean test: pipe\n"); return 1; }
@@ -344,7 +350,6 @@ func testExecute(r *Reporter, executable string, displayExe string) int {
         if (!ok3) { util.Stderr("ocean test: worker slots\n"); return 1; }
         grR = a; grW = b;
     }
-    if (displayExe != "") startDisplay(r, displayExe);
     start := util.MonoSeconds();
     maps := []int{evW, 198, outW, 1, outW, 2};
     if (!r.shared) { maps.append(grR); maps.append(199); }
@@ -359,7 +364,14 @@ func testExecute(r *Reporter, executable string, displayExe string) int {
     pending := "";
     fds := []int{evR, outR};
     open := 2;
+    interrupted := 0;
+    if (!r.shared) util.BlockSignals();
     for (open > 0) {
+        if (!r.shared) {
+            sig := util.PendingSignal();
+            if (sig == 0 && checkDisplay(r)) sig = 2;
+            if (sig != 0 && interrupted == 0) { interrupted = sig; util.Kill(pid, sig); }
+        }
         if (!r.shared) grant(r);
         if (!timedOut && r.timeout > 0.0 && util.MonoSeconds() - start >= r.timeout) {
             timedOut = true;
@@ -383,9 +395,11 @@ func testExecute(r *Reporter, executable string, displayExe string) int {
         }
     }
     st := util.Wait(pid);
+    if (!r.shared) util.UnblockSignals();
     if (r.grantFD >= 0) { util.CloseFd(r.grantFD); r.grantFD = -1; }
     status := st.Code;
     if (st.Failed) status = 1;
+    if (interrupted != 0) status = 128 + interrupted;
     if (!r.completed && status == 0) status = 1;
     if (r.failed > 0 && status == 0) status = 1;
     stopDisplay(r, util.MonoSeconds() - start, status);
@@ -414,15 +428,29 @@ func buildDisplay(dir string) string {
 func startDisplay(r *Reporter, exe string) {
     rd, wr, ok := util.Pipe();
     if (!ok) return;
+    util.SaveTerminal();
     maps := []int{rd, 197};
     argv := []string{exe, r.pkg, r.color ? "1" : "0", r.includeSkipped ? "1" : "0"};
-    pid := util.SpawnMapped(argv.array(), maps, false, false);
+    pid := util.SpawnMappedSig(argv.array(), maps, false, false, true);
     util.CloseFd(rd);
     if (pid < 0) { util.CloseFd(wr); return; }
     r.displayFD = wr; r.displayPID = pid;
     r.display = util.NewBuf();
     util.SetCloexec(wr);
     util.SetNonblock(wr);
+}
+
+// checkDisplay reaps an exited display; true when the user interrupted it
+// (the display exits 130 after Ctrl+C or q).
+func checkDisplay(r *Reporter) bool {
+    if (r.displayPID <= 0) return false;
+    done, st := util.WaitNoHang(r.displayPID);
+    if (!done) return false;
+    r.displayPID = 0;
+    if (r.displayFD >= 0) { util.CloseFd(r.displayFD); r.displayFD = -1; }
+    util.RestoreTerminal();
+    if (st.Signal != 0) util.Stdout("\x1b[?25h");
+    return st.Code == 130;
 }
 
 func stopDisplay(r *Reporter, elapsed float, status int) {
@@ -432,12 +460,13 @@ func stopDisplay(r *Reporter, elapsed float, status int) {
     util.CloseFd(r.displayFD); r.displayFD = -1;
     for (attempt := 0; attempt < 200; attempt++) {
         done, _ := util.WaitNoHang(r.displayPID);
-        if (done) { r.displayPID = 0; return; }
+        if (done) { r.displayPID = 0; util.RestoreTerminal(); return; }
         util.Poll(make([]int), make([]int), 10);
     }
     util.Kill(r.displayPID, 9);
     util.Wait(r.displayPID);
     r.displayPID = 0;
+    util.RestoreTerminal();
     util.Stdout("\x1b[?25h");
 }
 
@@ -521,13 +550,14 @@ func testOne(args []string, shared bool) int {
     diags := newDiags();
     prog := Frontend(location, true, dir + "/harness", diags);
     failed := prog.fatal || !prog.ok;
+    overwrite := false;
     if (!failed && targetWasm()) { util.Stderr("ocean test requires a native target\n"); failed = true; }
     if (!failed) {
         for (_, pk := range prog.checker.Packages()) {
             for (_, src := range pk.files) {
                 if (src.abs == "") continue;
                 if ((reportPath != "" && sameFile(reportPath, src.abs)) || (jsonPath != "" && sameFile(jsonPath, src.abs))) {
-                    util.Stderr("ocean test: output would overwrite an input file\n"); failed = true;
+                    util.Stderr("ocean test: output would overwrite an input file\n"); failed = true; overwrite = true;
                 }
             }
         }
@@ -541,8 +571,13 @@ func testOne(args []string, shared bool) int {
         displayExe = buildDisplay(dir);
         if (displayExe == "") util.Stderr("ocean test: live display unavailable; using final report\n");
     }
+    if (overwrite) { util.RemoveAll(dir); return 1; }
     if (reportPath != "") r.reportBuf = util.NewBuf();
-    if (jsonPath != "") r.jsonFile = util.NewBuf();
+    if (jsonPath != "") {
+        r.jsonFile = util.NewBuf();
+        r.jsonFD = util.OpenTrunc(jsonPath);
+        if (r.jsonFD < 0) { util.Stderr("ocean test: result file: could not open " + jsonPath + "\n"); util.RemoveAll(dir); return 1; }
+    }
     pkg, ok := util.Realpath(location);
     if (ok && !util.IsDir(pkg)) pkg = util.Dir(pkg);
     if (!ok) pkg = location;
@@ -563,7 +598,10 @@ func testOne(args []string, shared bool) int {
 func writeReports(r *Reporter, reportPath string, jsonPath string) bool {
     ok := true;
     if (reportPath != "" && !ast_nilBuf(r.reportBuf)) { if (!util.WriteBufFile(reportPath, r.reportBuf)) { util.Stderr("ocean test: could not write report file\n"); ok = false; } }
-    if (jsonPath != "" && !ast_nilBuf(r.jsonFile)) { if (!util.WriteBufFile(jsonPath, r.jsonFile)) { util.Stderr("ocean test: could not write JSON file\n"); ok = false; } }
+    if (r.jsonFD >= 0) {
+        if (!util.Close(r.jsonFD) || r.jsonFailed) { util.Stderr("ocean test: could not write JSON file\n"); ok = false; }
+        r.jsonFD = -1;
+    } else if (jsonPath != "" && !ast_nilBuf(r.jsonFile)) { if (!util.WriteBufFile(jsonPath, r.jsonFile)) { util.Stderr("ocean test: could not write JSON file\n"); ok = false; } }
     return ok;
 }
 

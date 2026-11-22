@@ -24,6 +24,8 @@ struct FuncCtx {
 }
 
 struct Checker {
+    assignTarget bool;
+    litCache map[int]*BigNat;
     diags *diag.List;
     universe *ast.Scope;
     pkg *ast.Package;
@@ -49,6 +51,11 @@ struct Checker {
     lastErrorLine int;
     usesThreads bool;
     recordTypes map[string]*ast.Type;
+    index *Index;
+    genericCallee bool;
+    blockStack []*ast.Node;
+    indexStack []int;
+    jumps map[int]*JumpInfo;
     layoutMemo map[string]*StructLayout;
     sizeMemo map[string]int;
     alignMemo map[string]int;
@@ -178,6 +185,7 @@ func BuiltinSource() string {
 // ---- package declarations ----
 
 func addPackageSym(c *Checker, p *ast.Package, sym *ast.Symbol, at *ast.Node) {
+    if (sym.name == "_" && sym.kind == ast.SK.Var) { sym.global = true; p.syms.append(sym); return; }
     if (sym.name == "_" || sym.name == "") return;
     old := p.scope.LookupLocal(sym.name);
     if (!nilS(old)) {
@@ -225,6 +233,7 @@ func collectPackage(c *Checker, p *ast.Package) {
                     s := newSym(c, ast.SK.Var, id.name, id);
                     s.node = id; s.decl = d;
                     id.sym = s;
+                    declRef(c, src, id.line, id.col, s, zero(*ast.Type));
                     addPackageSym(c, p, s, d);
                     c.globals.append(s);
                 }
@@ -235,6 +244,7 @@ func collectPackage(c *Checker, p *ast.Package) {
             d.sym = s;
             if (p == c.builtinPkg) { s.builtin = true; s.exported = true; }
             if (d.kind == ast.NK.Func) c.funcs.append(s);
+            declRef(c, src, d.nameLine, d.nameCol, s, zero(*ast.Type));
             addPackageSym(c, p, s, d);
         }
     }
@@ -278,11 +288,22 @@ func collectMethods(c *Checker, p *ast.Package) {
                     // methods on an alias attach to its target
                     t := resolveSymType(c, owner);
                     if (!nilT(t) && !nilS(t.sym) && t.sym.pkg == p && (t.kind == ast.TK.Struct || t.kind == ast.TK.Enum || t.kind == ast.TK.Named)) owner = t.sym;
-                    else owner = zero(*ast.Symbol);
+                    else {
+                        owner = zero(*ast.Symbol);
+                        if (!nilT(t) && !nilS(t.sym) && t.sym.pkg != p) { err(c, recv, "cannot define a method on a type from another package"); continue; }
+                        if (!nilT(t) && t.kind == ast.TK.Family && t.sym.pkg != p) { err(c, recv, "cannot define a method on a type from another package"); continue; }
+                    }
                 }
                 if (nilS(owner)) {
                     u := c.universe.LookupLocal(base.name);
-                    if (!nilS(u) || !nilS(lookupAnyPackage(c, base.name))) err(c, recv, "cannot define a method on a type from another package");
+                    dotted := false;
+                    for (_, dp := range src.dotImports) { ds := dp.scope.LookupLocal(base.name); if (!nilS(ds) && ds.exported) dotted = true; }
+                    for (_, imp := range src.importNodes) {
+                        if (imp.name != ".") continue;
+                        ds := imp.sym.importPkg.scope;
+                        if (!ast.NilScope(ds) && !nilS(ds.LookupLocal(base.name))) dotted = true;
+                    }
+                    if (!nilS(u) || dotted || !nilS(lookupAnyPackage(c, base.name))) err(c, recv, "cannot define a method on a type from another package");
                     else err(c, recv, "method receiver must name a struct, enum, or defined type");
                     continue;
                 }
@@ -293,6 +314,7 @@ func collectMethods(c *Checker, p *ast.Package) {
             }
             m := newSym(c, ast.SK.Func, d.name, d);
             m.owner = owner; m.recvPtr = ptr;
+            declRef(c, src, d.nameLine, d.nameCol, m, zero(*ast.Type));
             if (p == c.builtinPkg) { m.builtin = true; m.exported = true; }
             d.sym = m;
             nTP := 0;
@@ -363,11 +385,24 @@ func (c *Checker) Check(order []*ast.Package, stdRoot string) int {
     return c.errors;
 }
 
+// physicallyIn reports whether a symbol's source file resolves inside dir
+// (a symlink leading out of the standard library grants no privilege).
+func physicallyIn(s *ast.Symbol, dir string) bool {
+    if (nilN(s.node) || nilSrc(s.node.src)) return false;
+    real, ok := util.Realpath(s.node.src.abs);
+    rdir, ok2 := util.Realpath(dir);
+    return ok && ok2 && len(real) > len(rdir) && real[:len(rdir)] == rdir && real[len(rdir)] == '/';
+}
+
 func markIntrinsics(c *Checker, p *ast.Package) {
     if (!p.std) return;
+    base := p.path;
+    for (i := len(base) - 1; i >= 0; i--) { if (base[i] == '/') { base = base[i + 1:]; break; } }
+    if (p.name != base) return; // the declared package must be the standard one
     for (_, s := range p.syms) {
         if (s.kind != ast.SK.Func) continue;
-        if (p.path == "reflect" && (s.name == "Fields" || s.name == "IsStruct" || s.name == "IsEnum" || s.name == "EnumVariant")) s.intrinsic = "reflect." + s.name;
+        if (!physicallyIn(s, p.dir)) continue;
+        if (p.path == "reflect" && (s.name == "Fields" || s.name == "IsStruct" || s.name == "IsEnum" || s.name == "EnumVariant" || s.name == "varIntegerBytes")) s.intrinsic = "reflect." + s.name;
         if (p.path == "threads" && (s.name == "Spawn" || s.name == "Return")) { s.intrinsic = "threads." + s.name; }
         if (p.path == "os" && s.name == "setArgs") { s.intrinsic = "os.setArgs"; c.osSetArgs = s; }
     }
@@ -426,7 +461,10 @@ func checkMain(c *Checker, p *ast.Package) {
     m := p.scope.LookupLocal("main");
     if (nilS(m) || m.kind != ast.SK.Func) {
         if (!nilS(m)) err(c, m.node, "main must be a function");
-        else if (len(p.files) > 0) pkgErr(c, p.files[0], "package main must declare func main()");
+        else if (len(p.files) > 0 && c.errors == 0) {
+            c.errors++;
+            c.diags.Error(p.files[0].path, 1, 1, "backend", "executable requires func main() or func main() int");
+        }
         return;
     }
     ft := m.ty;
@@ -472,3 +510,15 @@ func itoa(n int) string { return util.Itoa(n); }
 
 func (c *Checker) RecordType(et *ast.Type, v *ast.VariantInfo) *ast.Type { return recordType(c, et, v); }
 func (c *Checker) LitInfo(n *ast.Node) (bool, bool) { l := intLiteral(c, n); return l.ok, l.neg; }
+
+// JumpInfo records where a label or goto sits: enclosing blocks and the index
+// of the statement within each.
+struct JumpInfo { blocks []*ast.Node; idx []int; }
+
+func jumpInfo(c *Checker) *JumpInfo {
+    j := new(JumpInfo);
+    j.blocks.append(c.blockStack...);
+    j.idx.append(c.indexStack...);
+    return j;
+}
+func nodeKey(n *ast.Node) int { return n -> int; }

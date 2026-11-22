@@ -1,0 +1,69 @@
+package driver;
+import "github.com/ocean-foundation/ocean/compiler/runtime";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+// Build cache: finished artifacts keyed by a hash of everything that affects
+// them (IR, runtime sources, link mode, optimization level, compiler version).
+
+func cacheRoot() string {
+    o, ok := util.Getenv("OCEAN_BUILD_CACHE");
+    if (ok && o == "off") return "";
+    if (ok && o != "") return o + "/oc1";
+    home, hok := util.Getenv("HOME");
+    if (!hok || home == "") return "";
+    return home + "/.cache/ocean-build/oc1";
+}
+
+func fnv(h uint, s string) uint {
+    for (i := 0; i < len(s); i++) {
+        h = h ^ (((s[i] -> int) & 255) -> uint);
+        h = h * 1099511628211->uint;
+    }
+    return h;
+}
+
+func cacheKey(p *Program, ir string, staticLink bool) string {
+    h := 14695981039346656037->uint;
+    h = fnv(h, ir);
+    h = fnv(h, runtime.Core());
+    if (p.checker.UsesThreads()) h = fnv(h, runtime.Threads());
+    if (usesPackage(p, "os/exec")) h = fnv(h, runtime.Process());
+    if (p.usesFFI) h = fnv(h, runtime.Ffi());
+    if (p.usesCurl) h = fnv(h, "curl");
+    h2 := fnv(h ^ 6148914691236517205->uint, ir);
+    tag := (p.isLibrary ? "lib" : "exe") + (staticLink ? "-static" : "") + optLevel() + Version() + Commit();
+    h = fnv(h, tag); h2 = fnv(h2, tag);
+    return util.Hex(h, 16) + util.Hex(h2, 16);
+}
+
+func cacheLookup(key string, output string) bool {
+    root := cacheRoot();
+    if (root == "") return false;
+    entry := root + "/" + key[0:2] + "/" + key;
+    if (!util.IsRegular(entry)) return false;
+    data, ok := util.ReadFile(entry);
+    if (!ok) return false;
+    staged := output + ".ocean-tmp";
+    if (!util.WriteFileMode(staged, data, 493)) return false;
+    if (!util.Rename(staged, output)) { util.Remove(staged); return false; }
+    return true;
+}
+
+func cacheStore(key string, output string) {
+    root := cacheRoot();
+    if (root == "") return;
+    dir := root + "/" + key[0:2];
+    if (!util.MkdirAll(dir)) return;
+    data, ok := util.ReadFile(output);
+    if (!ok) return;
+    tmp := dir + "/." + key + "." + util.Itoa(util.Pid());
+    if (util.WriteFile(tmp, data)) util.Rename(tmp, dir + "/" + key);
+    else util.Remove(tmp);
+}
+
+func cleanCache() int {
+    root := cacheRoot();
+    if (root == "" || !util.Exists(root)) return 0;
+    if (!util.RemoveAll(root)) { util.Stderr("ocean: could not clean build cache\n"); return 1; }
+    return 0;
+}

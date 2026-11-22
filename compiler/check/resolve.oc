@@ -52,7 +52,15 @@ func resolveSymType(c *Checker, s *ast.Symbol) *ast.Type {
         if (u.kind == ast.TK.Buffer && u.len == -1) err(c, s.node, "runtime-sized buffers cannot be used in type declarations");
         if (u.kind == ast.TK.Array && u.len == -1) err(c, s.node, "runtime-sized buffers cannot be used in type declarations");
         s.ty = u;
-        if (typeContainsSelf(c, u, s, false)) err(c, s.node, "cyclic type declaration");
+        // a chain of defined types that leads back here (type A B; type B A)
+        cyc := false;
+        for (k, x := 0, u; k < 64 && !nilT(x) && x.kind == ast.TK.Named && !nilS(x.sym); k++) {
+            if (x.sym == s) { cyc = true; break; }
+            if (x.sym.kind != ast.SK.TypeDef || x.sym.state != 2) break;
+            x = x.sym.ty;
+        }
+        if (cyc) { err(c, s.node, "cyclic type declaration: " + s.name); s.ty = tInvalid; }
+        else if (typeContainsSelf(c, u, s, false)) err(c, s.node, "cyclic type declaration");
     case ast.SK.Alias:
         t := resolveTypeOrFamily(c, s.node.a);
         if (t.kind == ast.TK.Buffer && t.len == -1) err(c, s.node, "runtime-sized buffers cannot be used in type declarations");
@@ -92,11 +100,39 @@ func resolveStruct(c *Checker, s *ast.Symbol) {
         }
         f := new(ast.FieldInfo);
         f.name = fd.name; f.node = fd; f.bits = fd.ival;
+        refField(c, fd.src, fd.line, fd.col, s, fd.name, zero(*ast.Type), true);
         f.ty = resolveType(c, fd.a);
         if (f.ty.kind == ast.TK.Void) err(c, fd, "void is not a field storage type");
         if (f.ty.kind == ast.TK.Buffer && f.ty.len == -1) err(c, fd, "runtime-sized buffers cannot be used in type declarations");
         if (f.bits > 0) checkBitfield(c, fd, f);
         s.fields.append(f);
+    }
+    for (_, f := range s.fields) {
+        if (ownsSelf(c, f.ty, s, 0)) { err(c, n, "recursive array-value layouts are unsupported; use explicit pointers for recursive ownership"); break; }
+    }
+    // Field dimensions may use value parameters: struct M(n int) { data [n]int; }
+    needs := false;
+    for (_, f := range s.fields) { if (!f.valueParam && f.ty.kind == ast.TK.Array && f.ty.len == -1) needs = true; }
+    if (needs) {
+        push(c);
+        for (_, f := range s.fields) {
+            if (!f.valueParam) continue;
+            vs := newSym(c, ast.SK.Var, f.name, f.node);
+            vs.ty = f.ty;
+            c.scope.Insert(vs);
+            s.valueSyms.append(vs);
+        }
+        savedFn := c.fn;
+        c.fn = zero(*FuncCtx);
+        for (_, f := range s.fields) {
+            if (f.valueParam) continue;
+            for (at := f.ty; at.kind == ast.TK.Array && at.len == -1 && !nilN(at.lenNode); at = at.elem) {
+                lt := expr(c, at.lenNode, tInt);
+                if (isUntyped(lt)) defaultType(c, at.lenNode, lt);
+            }
+        }
+        c.fn = savedFn;
+        pop(c);
     }
     pop(c);
 }
@@ -125,6 +161,7 @@ func resolveEnum(c *Checker, s *ast.Symbol) {
     for (i, vn := range n.list) {
         v := new(ast.VariantInfo);
         v.name = vn.name; v.vkind = vn.ival; v.index = i; v.node = vn;
+        refVariant(c, vn.src, vn.line, vn.col, s, vn.name, zero(*ast.Type), true);
         if (vn.ival == 1) {
             for (_, tn := range vn.list) {
                 t := resolveType(c, tn);
@@ -152,6 +189,7 @@ func resolveEnum(c *Checker, s *ast.Symbol) {
     for (_, v := range s.variants) {
         if (v.vkind != 3) continue;
         if (!nilT(v.fixedType)) {
+            if (v.fixedValue.kind == ast.NK.Composite && nilN(v.fixedValue.a)) allowContext(c, v.fixedValue);
             exprExpect(c, v.fixedValue, v.fixedType);
         } else {
             t := expr(c, v.fixedValue, zero(*ast.Type));
@@ -394,7 +432,10 @@ func symToType(c *Checker, n *ast.Node, s *ast.Symbol) *ast.Type {
     case ast.SK.BuiltinType: return s.ty;
     case ast.SK.TypeParam: if (nilT(s.ty)) s.ty = ParamType(s); return s.ty;
     case ast.SK.Alias: return resolveSymType(c, s);
-    case ast.SK.TypeDef: resolveSymType(c, s); return selfType(c, s);
+    case ast.SK.TypeDef:
+        // A definition may refer to itself through indirection (type L *L).
+        if (s.state != 1) resolveSymType(c, s);
+        return selfType(c, s);
     case ast.SK.Struct, ast.SK.Enum, ast.SK.Interface:
         resolveSymType(c, s);
         if (len(s.typeParams) > 0 || (!nilN(s.node) && len(s.node.list3) > 0)) {
@@ -418,6 +459,7 @@ func resolveTypeOrFamily(c *Checker, n *ast.Node) *ast.Type {
         s := lookup(c, n.name);
         if (nilS(s)) { err(c, n, "unresolved type: " + n.name); return tInvalid; }
         n.sym = s;
+        refSym(c, n, n.line, n.col, s, zero(*ast.Type));
         if (s.kind == ast.SK.Var || s.kind == ast.SK.Func || s.kind == ast.SK.Package || s.kind == ast.SK.BuiltinFunc) {
             err(c, n, "unresolved type: " + n.name); return tInvalid;
         }
@@ -514,7 +556,10 @@ func qualifiedSym(c *Checker, n *ast.Node) *ast.Symbol {
     if (nilS(ps)) { err(c, n.a, "unresolved type: " + n.a.name); return zero(*ast.Symbol); }
     if (ps.kind != ast.SK.Package) { err(c, n, "expected a type"); return zero(*ast.Symbol); }
     n.a.sym = ps;
-    return packageMember(c, n, ps.importPkg, n.name);
+    refSym(c, n.a, n.a.line, n.a.col, ps, zero(*ast.Type));
+    ms := packageMember(c, n, ps.importPkg, n.name);
+    if (!nilS(ms)) refSym(c, n, n.nameLine, n.nameCol, ms, zero(*ast.Type));
+    return ms;
 }
 
 func packageMember(c *Checker, n *ast.Node, p *ast.Package, name string) *ast.Symbol {
@@ -554,4 +599,21 @@ func smallLiteral(text string) int {
         if (v > 1000000000000) return 1000000000000;
     }
     return v;
+}
+
+// ownsSelf reports whether a field type holds struct s by value (directly or
+// inside arrays/maps/buffers) rather than through a pointer.
+func ownsSelf(c *Checker, t *ast.Type, s *ast.Symbol, depth int) bool {
+    if (nilT(t) || depth > 16) return false;
+    switch (t.kind) {
+    case ast.TK.Struct:
+        if (t.sym == s) return true;
+        if (t.sym.state != 2) return false;
+        for (_, f := range c.FieldsOf(t)) { if (ownsSelf(c, f.ty, s, depth + 1)) return true; }
+        return false;
+    case ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer: return !nilT(t.elem) && ownsSelf(c, t.elem, s, depth + 1);
+    case ast.TK.Map: return ownsSelf(c, t.key, s, depth + 1) || ownsSelf(c, t.elem, s, depth + 1);
+    case ast.TK.Named: return t.sym.state == 2 && ownsSelf(c, t.sym.ty, s, depth + 1);
+    }
+    return false;
 }

@@ -1,0 +1,153 @@
+package lsp;
+import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+// J is a parsed JSON value. kind: 's' string, 'n' number, 'o' object,
+// 'a' array, 't' true, 'f' false, 'z' null. raw keeps the original text.
+struct J { kind i8; str string; items []*J; keys []string; raw string; }
+
+struct reader { s string; i int; ok bool; }
+
+func ws(r *reader) { for (r.i < len(r.s) && (r.s[r.i] == ' ' || r.s[r.i] == '\t' || r.s[r.i] == '\n' || r.s[r.i] == '\r')) r.i++; }
+
+func hex4(r *reader) int {
+    if (r.i + 4 > len(r.s)) { r.ok = false; return 0; }
+    v := 0;
+    for (k := 0; k < 4; k++) {
+        c := r.s[r.i + k];
+        d := -1;
+        if (c >= '0' && c <= '9') d = (c - '0') -> int;
+        else if (c >= 'a' && c <= 'f') d = (c - 'a') -> int + 10;
+        else if (c >= 'A' && c <= 'F') d = (c - 'A') -> int + 10;
+        if (d < 0) { r.ok = false; return 0; }
+        v = v * 16 + d;
+    }
+    r.i += 4;
+    return v;
+}
+
+func lit(r *reader, w string) bool {
+    if (r.i + len(w) > len(r.s)) return false;
+    for (k := 0; k < len(w); k++) { if (r.s[r.i + k] != w[k]) return false; }
+    return true;
+}
+
+func parseValue(r *reader, depth int) *J {
+    ws(r);
+    j := new(J);
+    if (depth > 64 || r.i >= len(r.s)) { r.ok = false; return j; }
+    start := r.i;
+    c := r.s[r.i];
+    if (c == '"') {
+        r.i++;
+        j.kind = 's';
+        b: util.Buf;
+        for (r.i < len(r.s) && r.s[r.i] != '"') {
+            ch := r.s[r.i];
+            if (ch >= 0 && ch < 32) { r.ok = false; return j; }
+            if (ch != '\\') { b.Addc(ch); r.i++; continue; }
+            r.i++;
+            if (r.i >= len(r.s)) { r.ok = false; return j; }
+            e := r.s[r.i];
+            r.i++;
+            if (e == '"' || e == '\\' || e == '/') b.Addc(e);
+            else if (e == 'b') b.Addc(8);
+            else if (e == 'f') b.Addc(12);
+            else if (e == 'n') b.Addc(10);
+            else if (e == 'r') b.Addc(13);
+            else if (e == 't') b.Addc(9);
+            else if (e == 'u') {
+                code := hex4(r);
+                if (!r.ok) return j;
+                if (code >= 55296 && code <= 56319) {
+                    if (r.i + 2 > len(r.s) || r.s[r.i] != '\\' || r.s[r.i + 1] != 'u') { r.ok = false; return j; }
+                    r.i += 2;
+                    low := hex4(r);
+                    if (low < 56320 || low > 57343) { r.ok = false; return j; }
+                    code = 65536 + ((code - 55296) << 10) + low - 56320;
+                }
+                scanner.EncodeUTF8(&b, code);
+            } else { r.ok = false; return j; }
+        }
+        if (r.i >= len(r.s)) { r.ok = false; return j; }
+        r.i++;
+        j.str = b.String();
+    } else if (c == '{' || c == '[') {
+        obj := c == '{';
+        j.kind = 'a'; if (obj) j.kind = 'o';
+        close: i8 = ']'; if (obj) close = '}';
+        r.i++;
+        ws(r);
+        if (r.i < len(r.s) && r.s[r.i] == close) r.i++;
+        else {
+            for (;;) {
+                if (obj) {
+                    k := parseValue(r, depth + 1);
+                    if (!r.ok || k.kind != 's') { r.ok = false; return j; }
+                    ws(r);
+                    if (r.i >= len(r.s) || r.s[r.i] != ':') { r.ok = false; return j; }
+                    r.i++;
+                    j.keys.append(k.str);
+                }
+                v := parseValue(r, depth + 1);
+                if (!r.ok) return j;
+                j.items.append(v);
+                ws(r);
+                if (r.i < len(r.s) && r.s[r.i] == ',') { r.i++; continue; }
+                break;
+            }
+            if (r.i >= len(r.s) || r.s[r.i] != close) { r.ok = false; return j; }
+            r.i++;
+        }
+    } else if (lit(r, "true")) { j.kind = 't'; r.i += 4; }
+    else if (lit(r, "false")) { j.kind = 'f'; r.i += 5; }
+    else if (lit(r, "null")) { j.kind = 'z'; r.i += 4; }
+    else {
+        j.kind = 'n';
+        if (r.s[r.i] == '-') r.i++;
+        if (r.i >= len(r.s) || !util.IsDigit(r.s[r.i])) { r.ok = false; return j; }
+        for (r.i < len(r.s) && (util.IsDigit(r.s[r.i]) || r.s[r.i] == '.' || r.s[r.i] == 'e' || r.s[r.i] == 'E' || r.s[r.i] == '+' || r.s[r.i] == '-')) r.i++;
+    }
+    j.raw = r.s[start:r.i];
+    return j;
+}
+
+// Parse returns (value, ok); trailing non-space text is an error.
+func Parse(s string) (*J, bool) {
+    r: reader;
+    r.s = s; r.ok = true;
+    v := parseValue(&r, 0);
+    ws(&r);
+    if (r.i != len(s)) r.ok = false;
+    return v, r.ok;
+}
+
+func nilJ(j *J) bool { return (j -> int) == 0; }
+
+func (j *J) Get(key string) *J {
+    if (nilJ(j) || j.kind != 'o') return zero(*J);
+    for (i, k := range j.keys) { if (k == key) return j.items[i]; }
+    return zero(*J);
+}
+func (j *J) Str() string { if (nilJ(j) || j.kind != 's') return ""; return j.str; }
+func (j *J) IsStr() bool { return !nilJ(j) && j.kind == 's'; }
+func (j *J) Int(fallback int) int {
+    if (nilJ(j) || j.kind != 'n') return fallback;
+    v, ok := util.Atoi(j.raw);
+    if (!ok) return fallback;
+    return v;
+}
+
+func Quote(s string) string {
+    b: util.Buf;
+    b.Addc('"');
+    for (i := 0; i < len(s); i++) {
+        c := s[i];
+        if (c == '"') b.Add("\\\"");
+        else if (c == '\\') b.Add("\\\\");
+        else if (c >= 0 && c < 32) { b.Add("\\u00"); b.Addc(util.HexDigit((c->int) >> 4)); b.Addc(util.HexDigit(c->int)); }
+        else b.Addc(c);
+    }
+    b.Addc('"');
+    return b.String();
+}

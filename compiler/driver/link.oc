@@ -17,6 +17,7 @@ func generate(p *Program) (string, bool) {
     opts.wasm = targetWasm();
     ir, ok := backend.Generate(p.checker, p.checker.Packages(), p.build.Root(), opts);
     p.usesFFI = util.Contains(ir, "@oc_cvar_call(");
+    p.usesCurl = util.Contains(ir, "@\"curl_") || util.Contains(ir, "@curl_");
     return ir, ok;
 }
 
@@ -61,7 +62,71 @@ func clangRun(args []string) bool {
 }
 
 // compileProgram produces an executable or relocatable object at output.
+// With a build cache the compiled program object is cached (independent of
+// static linking) and the final link always runs.
 func compileProgram(p *Program, ir string, output string, staticLink bool) bool {
+    root := cacheRoot();
+    if (p.isLibrary) {
+        key := cacheKey(p, ir, staticLink);
+        if (cacheLookup(key, output)) return true;
+        if (!compileUncached(p, ir, output, staticLink)) return false;
+        cacheStore(key, output);
+        return true;
+    }
+    if (root == "") return compileUncached(p, ir, output, staticLink);
+    key := cacheKey(p, ir, false) + ".o";
+    dir, ok := util.MakeTempDir("ocean-build-");
+    if (!ok) { util.Stderr("ocean: cannot create temporary directory\n"); return false; }
+    obj := dir + "/program.o";
+    if (!cacheLookup(key, obj)) {
+        irPath := dir + "/program.ll";
+        if (!util.WriteFile(irPath, ir)) { util.Stderr("ocean: could not create IR file\n"); util.RemoveAll(dir); return false; }
+        parts := make([]string);
+        all := make([]string);
+        all.append(irPath);
+        all.append(runtimeSources(p, dir)...);
+        for (i, f := range all) {
+            o := dir + "/part" + util.Itoa(i) + ".o";
+            cargs := []string{"clang", optLevel(), "-w", "-Wno-override-module", "-c"};
+            if (util.HasSuffix(f, ".ll")) cargs.append("-x", "ir"); else cargs.append("-x", "c");
+            cargs.append(f, "-o", o);
+            if (!clangRun(cargs)) { util.RemoveAll(dir); return false; }
+            parts.append(o);
+        }
+        if (len(parts) == 1) util.Rename(parts[0], obj);
+        else {
+            rargs := []string{"clang", "-r", "-nostdlib", "-o", obj};
+            rargs.append(parts...);
+            if (!clangRun(rargs)) { util.RemoveAll(dir); return false; }
+        }
+        cacheStore(key, obj);
+    }
+    staged := output + ".ocean-tmp";
+    args := []string{"clang", obj, "-o", staged};
+    if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
+    ok2 := clangRun(args);
+    util.RemoveAll(dir);
+    if (!ok2) { util.Remove(staged); return false; }
+    if (!util.Rename(staged, output)) { util.Stderr("ocean: could not write " + output + "\n"); util.Remove(staged); return false; }
+    return true;
+}
+
+// appendLinkFlags adds the system libraries and static flags of a final link.
+func appendLinkFlags(p *Program, args *[]string, staticLink bool) bool {
+    if (p.checker.UsesThreads()) (*args).append("-pthread");
+    if (p.usesFFI) (*args).append("-lffi");
+    if (p.usesCurl && !targetWasm()) {
+        if (staticLink) {
+            flags, fok := staticCurlFlags();
+            if (!fok) { util.Stderr("backend error: static HTTP linking requires pkg-config and libcurl's static development dependencies\n"); return false; }
+            (*args).append(flags...);
+        } else (*args).append("-lcurl");
+    }
+    if (staticLink) (*args).append("-static");
+    return true;
+}
+
+func compileUncached(p *Program, ir string, output string, staticLink bool) bool {
     dir, ok := util.MakeTempDir("ocean-build-");
     if (!ok) { util.Stderr("ocean: cannot create temporary directory\n"); return false; }
     irPath := dir + "/program.ll";
@@ -90,9 +155,7 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
         args.append("-x", "ir", irPath, "-x", "c");
         args.append(rts...);
         args.append("-o", staged);
-        if (p.checker.UsesThreads()) args.append("-pthread");
-        if (p.usesFFI) args.append("-lffi");
-        if (staticLink) args.append("-static");
+        if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
         if (!clangRun(args)) { util.RemoveAll(dir); util.Remove(staged); return false; }
     }
     util.RemoveAll(dir);
@@ -101,27 +164,44 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
 }
 
 // selfContainedIR merges the runtime into the program module for --emit-llvm.
+// selfContainedIR appends the runtime, compiled to assembly, as module-level
+// inline asm: the program IR is emitted untouched (no llvm-link round trip,
+// which re-prints wide constants in decimal), yet clang can build it alone.
 func selfContainedIR(p *Program, ir string) (string, bool) {
     dir, ok := util.MakeTempDir("ocean-ir-");
     if (!ok) return ir, true;
-    irPath := dir + "/program.ll";
-    util.WriteFile(irPath, ir);
-    parts := make([]string);
-    parts.append(irPath);
+    out: util.Buf;
+    out.Add(ir);
+    if (!util.HasSuffix(ir, "\n")) out.Add("\n");
     for (i, f := range runtimeSources(p, dir)) {
-        out := dir + "/rt" + util.Itoa(i) + ".ll";
-        if (!clangRun([]string{"clang", "-O1", "-w", "-S", "-emit-llvm", "-x", "c", f, "-o", out})) { util.RemoveAll(dir); return ir, true; }
-        parts.append(out);
+        asmPath := dir + "/rt" + util.Itoa(i) + ".s";
+        if (!clangRun([]string{"clang", optLevel(), "-w", "-S", "-g0", "-fno-asynchronous-unwind-tables", "-x", "c", f, "-o", asmPath})) { util.RemoveAll(dir); return ir, true; }
+        text, rok := util.ReadFile(asmPath);
+        if (!rok) { util.RemoveAll(dir); return ir, true; }
+        start := 0;
+        for (k := 0; k <= len(text); k++) {
+            if (k < len(text) && text[k] != '\n') continue;
+            line := text[start:k];
+            start = k + 1;
+            if (line == "" || util.HasPrefix(util.Trim(line), ".addrsig") || util.HasPrefix(util.Trim(line), ".ident")) continue;
+            out.Add("module asm \"");
+            for (c := 0; c < len(line); c++) {
+                ch := line[c];
+                // local labels are renamed per unit so they cannot collide
+                if (ch == '.' && c + 1 < len(line) && line[c + 1] == 'L' && (c == 0 || !labelChar(line[c - 1]))) {
+                    out.Add(".Locrt").Add(util.Itoa(i)).Add("_");
+                    c++;
+                    continue;
+                }
+                v := (ch -> int) & 255;
+                if (ch == '"' || ch == '\\' || v < 32 || v > 126) { out.Addc('\\'); out.Addc(util.HexDigit(v >> 4)); out.Addc(util.HexDigit(v)); }
+                else out.Addc(ch);
+            }
+            out.Add("\"\n");
+        }
     }
-    merged := dir + "/merged.ll";
-    largs := []string{"llvm-link", "-S", "-o", merged};
-    largs.append(parts...);
-    st, _ := util.RunCapture(largs.array());
-    if (st.Failed || st.Code != 0) { util.RemoveAll(dir); return ir, true; }
-    text, rok := util.ReadFile(merged);
     util.RemoveAll(dir);
-    if (!rok) return ir, true;
-    return text, true;
+    return out.String(), true;
 }
 
 func checkBackend(p *Program) bool {
@@ -130,7 +210,7 @@ func checkBackend(p *Program) bool {
     dir, dok := util.MakeTempDir("ocean-check-");
     if (!dok) return true;
     out := dir + "/check.out";
-    built := compileProgram(p, ir, out, false);
+    built := compileUncached(p, ir, out, false);
     util.RemoveAll(dir);
     return !built;
 }
@@ -180,3 +260,19 @@ func unusedAst(p *ast.Package) bool { return (p -> int) == 0; }
 
 func Generate(p *Program) (string, bool) { return generate(p); }
 func NewDiagsQuiet() *diag.List { d := newDiags(); return d; }
+
+// staticCurlFlags discovers libcurl's full static dependency closure.
+func staticCurlFlags() ([]string, bool) {
+    argv: [4]string = {"pkg-config", "--static", "--libs", "libcurl"};
+    st, out := util.RunCapture(argv);
+    out2 := make([]string);
+    if (st.Code != 0 || st.Signal != 0) return out2, false;
+    cur := "";
+    for (i := 0; i <= len(out); i++) {
+        if (i == len(out) || out[i] == ' ' || out[i] == '\n' || out[i] == '\t') { if (cur != "") out2.append(cur); cur = ""; }
+        else cur += out[i];
+    }
+    return out2, len(out2) > 0;
+}
+
+func labelChar(ch i8) bool { return util.IsLetter(ch) || util.IsDigit(ch) || ch == '_' || ch == '.' || ch == '$'; }

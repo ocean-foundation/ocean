@@ -28,6 +28,7 @@ func numConv(g *Gen, val string, from *ast.Type, to *ast.Type) string {
         emit(g, r + " = " + (f.bits < t.bits ? "fpext " : "fptrunc ") + ll(f) + " " + val + " to " + ll(t));
         return r;
     }
+    if (f.kind == ast.TK.Bool && t.kind == ast.TK.Int && ll(t) == "i1") return val;
     if (f.kind == ast.TK.Bool && t.kind == ast.TK.Int) { emit(g, r + " = zext i1 " + val + " to " + ll(t)); return r; }
     if (f.kind == ast.TK.Bool && t.kind == ast.TK.Float) { emit(g, r + " = uitofp i1 " + val + " to " + ll(t)); return r; }
     if (f.kind == ast.TK.Int && t.kind == ast.TK.Bool) { emit(g, r + " = icmp ne " + ll(f) + " " + val + ", 0"); return r; }
@@ -41,7 +42,7 @@ func nullPtr() string { return "inttoptr (i64 1 to ptr)"; }
 // box converts a concrete value to an interface pair (deep copy into a box).
 func box(g *Gen, v V) V {
     t := under(v.t);
-    if (t.kind == ast.TK.Interface || t.kind == ast.TK.Union) return v;
+    if (isBoxed(t)) return v;
     if (v.t.kind == ast.TK.Null) return mkV("zeroinitializer", check.TAny());
     d := desc(g, v.t);
     p := spill(g, v);
@@ -54,7 +55,7 @@ func pair(g *Gen, a string, b string, t *ast.Type) V {
     r1 := tmp(g); r2 := tmp(g);
     emit(g, r1 + " = insertvalue {ptr, ptr} poison, ptr " + a + ", 0");
     emit(g, r2 + " = insertvalue {ptr, ptr} " + r1 + ", ptr " + b + ", 1");
-    return freshV(r2, t);
+    return freshV(g, r2, t);
 }
 func extract(g *Gen, v string, i int) string {
     r := tmp(g);
@@ -70,12 +71,26 @@ func conv(g *Gen, v V, dest0 *ast.Type) V {
     if (check.Identical(t, dest)) return v;
     ud := under(dest); ut := under(t);
     if (t.kind == ast.TK.Null) {
-        if (ud.kind == ast.TK.Interface || ud.kind == ast.TK.Union || ud.kind == ast.TK.Func) return mkV("zeroinitializer", dest);
+        if (isPair(ud)) return mkV("zeroinitializer", dest);
         if (ud.kind == ast.TK.Enum) return zeroV(g, dest);
         return mkV(nullPtr(), dest);
     }
-    if (ud.kind == ast.TK.Interface || ud.kind == ast.TK.Union) {
-        if (ut.kind == ast.TK.Interface || ut.kind == ast.TK.Union) { v.t = dest; return v; }
+    if (isBoxed(ud)) {
+        if (isBoxed(ut)) {
+            // interface to interface: check the dynamic type when not implied
+            if (ud.kind == ast.TK.Interface && ut.kind == ast.TK.Interface && !check.IsAny(ud) && !g.c.Implements(ut, ud)) {
+                d := extract(g, v.r, 0);
+                isNull := tmp(g); emit(g, isNull + " = icmp eq ptr " + d + ", null");
+                ok := typeTest(g, d, dest);
+                good := tmp(g); emit(g, good + " = or i1 " + isNull + ", " + ok);
+                yes := newLabel(g, "iok"); no := newLabel(g, "ibad");
+                condBr(g, good, yes, no);
+                label(g, no);
+                term(g, "call void @llvm.trap()\n  unreachable");
+                label(g, yes);
+            }
+            v.t = dest; return v;
+        }
         if (ud.kind == ast.TK.Union && !inUnion(g, t, ud)) {
             w := widenTarget(g, t, ud);
             if (!nilT(w)) {
@@ -92,18 +107,19 @@ func conv(g *Gen, v V, dest0 *ast.Type) V {
     if (ut.kind == ast.TK.String && ud.kind == ast.TK.Dyn) {
         r := tmp(g);
         emit(g, r + " = call ptr @oc_arr_copy(ptr " + v.r + ", ptr " + desc(g, check.TI8()) + ")");
-        return freshV(r, dest);
+        return freshV(g, r, dest);
     }
     if (ut.kind == ast.TK.Dyn && ud.kind == ast.TK.String) {
         r := tmp(g);
         emit(g, r + " = call ptr @oc_arr_copy(ptr " + v.r + ", ptr " + desc(g, check.TI8()) + ")");
-        return freshV(r, dest);
+        return freshV(g, r, dest);
     }
     if (ut.kind == ast.TK.Array && ud.kind == ast.TK.Array) {
+        if (!check.Identical(ut.elem, ud.elem) && ud.len < 0) return convertBlock(g, v, dest);
         if (ut.len >= 0 && ud.len < 0) {
             r := tmp(g);
             emit(g, r + " = call ptr @oc_block_copy(ptr " + v.r + ", ptr " + desc(g, ud.elem) + ")");
-            return freshV(r, dest);
+            return freshV(g, r, dest);
         }
         if (ut.len < 0 && ud.len >= 0) {
             p := alloca(g, dest);
@@ -116,8 +132,31 @@ func conv(g *Gen, v V, dest0 *ast.Type) V {
         if (ut.len > 0 && ud.len <= 0) { v2 := mkV(v.r, dest); return v2; }
         v.t = dest; return v;
     }
+    if (ud.kind == ast.TK.Ptr && ut.kind == ast.TK.Int) {
+        x := intConv(g, v.r, ut, check.TInt());
+        r := tmp(g); emit(g, r + " = inttoptr i64 " + x + " to ptr");
+        return mkV(r, dest);
+    }
     if (ud.kind == ast.TK.Ptr || ud.kind == ast.TK.Buffer) { v.t = dest; return v; }
-    if (ud.kind == ast.TK.Dyn && ut.kind == ast.TK.Dyn) { v.t = dest; return v; }
+    if (ud.kind == ast.TK.Dyn && ut.kind == ast.TK.Dyn && under(ud.elem).kind == ast.TK.Interface && under(ut.elem).kind == ast.TK.Interface) {
+        hom := !ud.isMixed;
+        needs := hom && ut.isMixed || (!check.IsAny(under(ud.elem)) && !g.c.Implements(under(ut.elem), under(ud.elem)));
+        if (needs) {
+            m := check.IsAny(under(ud.elem)) ? "null" : matcherFor(g, ud.elem);
+            emit(g, "call void @oc_iface_elems_check(ptr " + v.r + ", ptr " + m + ", i64 " + (hom ? "1" : "0") + ")");
+        }
+        v.t = dest; return v;
+    }
+    if (ud.kind == ast.TK.Dyn && ut.kind == ast.TK.Dyn) {
+        if (!check.Identical(ud.elem, ut.elem) && isBoxed(ud.elem) && !isBoxed(ut.elem)) {
+            slot := alloca(g, dest);
+            emit(g, "store ptr null, ptr " + slot);
+            appendSide(g, slot, v, true, ud.elem);
+            r := tmp(g); emit(g, r + " = load ptr, ptr " + slot);
+            return freshV(g, r, dest);
+        }
+        v.t = dest; return v;
+    }
     v.t = dest;
     return v;
 }
@@ -189,8 +228,9 @@ func floatConst(g *Gen, text string, t *ast.Type) string {
 }
 
 func intLitV(g *Gen, n *ast.Node, t *ast.Type) V {
-    dec := g.c.LiteralDecimal(n);
     u := under(t);
+    if (u.kind == ast.TK.Int) return mkV(g.c.LiteralLLVM(n, u.bits), t);
+    dec := g.c.LiteralDecimal(n);
     if (u.kind == ast.TK.Float) {
         if (u.bits == 32) { f := scanner.ParseF32(dec); return mkV(floatHex(f -> float), t); }
         return mkV(floatHex(scanner.ParseF64(dec)), t);
@@ -198,8 +238,7 @@ func intLitV(g *Gen, n *ast.Node, t *ast.Type) V {
     if (u.kind == ast.TK.Bool) return mkV(dec == "0" ? "false" : "true", t);
     if (u.kind == ast.TK.Ptr || u.kind == ast.TK.Buffer) return mkV("inttoptr (i64 " + dec + " to ptr)", t);
     if (u.kind != ast.TK.Int) return mkV(dec, check.TInt());
-    // wrap literal values that exceed the destination width (explicit casts)
-    return mkV(dec, t);
+    return mkV(g.c.LiteralLLVM(n, u.bits), t);
 }
 
 // ---- expressions ----
@@ -237,9 +276,11 @@ func genExpr(g *Gen, n *ast.Node) V {
         et := sub(g, n.tyAlt);
         r := tmp(g);
         emit(g, r + " = call ptr @oc_alloc(i64 " + itoa(sizeOf(g, et)) + ")");
-        if (needsInit(g, et)) emit(g, "call void @oc_zero(ptr " + r + ", ptr " + desc(g, et) + ")");
-        return freshV(r, t);
-    case ast.NK.Make: return freshV("null", t);
+        ue := under(et);
+        if (ue.kind == ast.TK.Array && ue.len == -1 && !nilN(et.lenNode)) emit(g, "store ptr " + newRuntimeArray(g, et) + ", ptr " + r);
+        else if (needsInit(g, et)) emit(g, "call void @oc_zero(ptr " + r + ", ptr " + desc(g, et) + ")");
+        return freshV(g, r, t);
+    case ast.NK.Make: return freshV(g, "null", t);
     case ast.NK.Sizeof:
         st := sub(g, n.tyAlt);
         return mkV(itoa(sizeOf(g, st)), t);
@@ -249,15 +290,11 @@ func genExpr(g *Gen, n *ast.Node) V {
         r := tmp(g);
         if (needsInit(g, et)) emit(g, r + " = call ptr @oc_arr_new_init(i64 " + cnt.r + ", ptr " + desc(g, et) + ", i64 " + itoa(site(g, n)) + ")");
         else emit(g, r + " = call ptr @oc_arr_new(i64 " + cnt.r + ", i64 " + itoa(sizeOf(g, et)) + ", i64 " + itoa(site(g, n)) + ")");
-        return freshV(r, t);
+        return freshV(g, r, t);
     case ast.NK.TBuffer:
         et := sub(g, n.tyAlt);
         cnt := genAs(g, n.b, check.TInt());
-        bytes := tmp(g);
-        emit(g, bytes + " = mul i64 " + cnt.r + ", " + itoa(sizeOf(g, et)));
-        r := tmp(g);
-        emit(g, r + " = call ptr @oc_alloc(i64 " + bytes + ")");
-        return freshV(r, t);
+        return freshV(g, runtimeBuffer(g, et, cnt.r), t);
     }
     fail(g, n, "unsupported expression");
     return mkV("undef", t);
@@ -278,6 +315,7 @@ func genIdent(g *Gen, n *ast.Node, t *ast.Type) V {
         return mkV("false", t);
     }
     fail(g, n, "unsupported identifier " + n.name);
+    if (nilT(t)) t = check.TInt();
     return mkV("undef", t);
 }
 
@@ -299,6 +337,7 @@ func structBase(g *Gen, base *ast.Node) (string, *ast.Type) {
     bt := typeOf(g, base);
     if (bt.kind == ast.TK.Ptr) {
         v := derefChain(g, genExpr(g, base));
+        checkNullPtr(g, v.r);
         return v.r, v.t.elem;
     }
     if (isLvalue(base)) return addrOf(g, base), bt;
@@ -331,6 +370,7 @@ func addrOf(g *Gen, n *ast.Node) string {
     case ast.NK.Unary:
         if (n.op == scanner.Kind.Star) {
             v := genExpr(g, n.a);
+            checkNullPtr(g, v.r);
             return v.r;
         }
     }
@@ -440,6 +480,7 @@ func collectionLen(g *Gen, v V) string {
         r := tmp(g); emit(g, r + " = udiv i64 " + h + ", " + itoa(es)); return r;
     case ast.TK.Buffer:
         if (u.len > 0) return itoa(u.len);
+        if (u.len == -1) { h := gep(g, v.r, -16); r := tmp(g); emit(g, r + " = load i64, ptr " + h); return r; }
     }
     return "0";
 }
@@ -480,7 +521,7 @@ func genMember(g *Gen, n *ast.Node, t *ast.Type) V {
             v := load(g, bt.elem, pv.r);
             return mkV(arrayDataPtr(g, v), t);
         }
-        if (under(bt).kind == ast.TK.Array && isLvalue(n.a)) {
+        if (under(bt).kind == ast.TK.Array && under(bt).len >= 0 && isLvalue(n.a)) {
             p := addrOf(g, n.a);
             return mkV(gep(g, p, g.c.ArrayDataOffset(under(bt).elem)), t);
         }
@@ -493,16 +534,20 @@ func genMember(g *Gen, n *ast.Node, t *ast.Type) V {
         et := t;
         p := alloca(g, et);
         setTag(g, et, p, n.ival);
-        return freshV(p, et);
+        return freshV(g, p, et);
     case ast.Sem.EnumFixed:
         et := t;
         p := alloca(g, et);
         setTag(g, et, p, n.ival);
         vs := g.c.VariantsOf(under(et));
         v := vs[n.ival];
+        // fixed values are evaluated in the enum's own specialization
+        savedEnv := g.env;
+        g.env = check.MakeEnv(under(et).sym.typeParams, under(et).args);
         val := genAs(g, v.fixedValue, v.fixedType);
+        g.env = savedEnv;
         store(g, v.fixedType, gep(g, p, g.c.EnumPayloadOffset(under(et))), val);
-        return freshV(p, et);
+        return freshV(g, p, et);
     case ast.Sem.TypeName:
         fail(g, n, "a type is not a value");
     }
@@ -522,6 +567,7 @@ func genUnary(g *Gen, n *ast.Node, t *ast.Type) V {
     switch (n.op) {
     case scanner.Kind.Minus:
         if (g.c.IsIntLiteral(n)) return intLitV(g, n, t);
+        if (typeList(under(t))) return unionUnary(g, genExpr(g, n.a), t, 0);
         v := conv(g, genExpr(g, n.a), t);
         r := tmp(g);
         if (under(t).kind == ast.TK.Float) emit(g, r + " = fneg " + ll(t) + " " + v.r);
@@ -537,6 +583,7 @@ func genUnary(g *Gen, n *ast.Node, t *ast.Type) V {
         return mkV(r, t);
     case scanner.Kind.Star:
         v := genExpr(g, n.a);
+        checkNullPtr(g, v.r);
         return load(g, t, v.r);
     case scanner.Kind.Amp:
         return mkV(addrOf(g, n.a), t);
@@ -562,6 +609,12 @@ func genInc(g *Gen, n *ast.Node, target *ast.Node, post bool) V {
     }
     p := lvalueAddr(g, target);
     old := load(g, t, p);
+    if (typeList(under(t))) {
+        nv := unionUnary(g, old, t, up ? 1 : 2);
+        old2 := copyV(g, old);
+        storeReplace(g, t, p, nv);
+        return post ? old2 : stored(nv);
+    }
     nv := tmp(g);
     u := under(t);
     if (u.kind == ast.TK.Ptr) {
@@ -590,4 +643,123 @@ func lvalueAddr(g *Gen, n *ast.Node) string {
         if (bt.kind == ast.TK.Map) return mapSlot(g, n);
     }
     return addrOf(g, n);
+}
+
+// convertBlock converts every element of an array into a new block of dest's element type.
+func convertBlock(g *Gen, v V, dest *ast.Type) V {
+    ut := under(v.t); ud := under(dest);
+    n := collectionLen(g, v);
+    data := arrayDataPtr(g, v);
+    blk := tmp(g);
+    emit(g, blk + " = call ptr @oc_block_new(i64 " + n + ", ptr " + desc(g, ud.elem) + ")");
+    out := gep(g, blk, g.c.ArrayDataOffset(ud.elem));
+    idx := alloca(g, check.TInt());
+    emit(g, "store i64 0, ptr " + idx);
+    head := newLabel(g, "cvt"); body := newLabel(g, "cvtbody"); done := newLabel(g, "cvtdone");
+    br(g, head);
+    label(g, head);
+    i := tmp(g); emit(g, i + " = load i64, ptr " + idx);
+    c := tmp(g); emit(g, c + " = icmp slt i64 " + i + ", " + n);
+    condBr(g, c, body, done);
+    label(g, body);
+    ev := copyV(g, conv(g, load(g, ut.elem, gepDyn(g, data, i, sizeOf(g, ut.elem))), ud.elem));
+    store(g, ud.elem, gepDyn(g, out, i, sizeOf(g, ud.elem)), ev);
+    i2 := tmp(g); emit(g, i2 + " = add i64 " + i + ", 1");
+    emit(g, "store i64 " + i2 + ", ptr " + idx);
+    br(g, head);
+    label(g, done);
+    return freshV(g, blk, dest);
+}
+
+// newRuntimeArray allocates a runtime-sized array, recursively for nested ones.
+func newRuntimeArray(g *Gen, t *ast.Type) string {
+    u := under(t);
+    cnt := genAs(g, t.lenNode, check.TInt());
+    blk := tmp(g);
+    emit(g, blk + " = call ptr @oc_block_new(i64 " + cnt.r + ", ptr " + desc(g, u.elem) + ")");
+    e := under(u.elem);
+    if (e.kind == ast.TK.Array && e.len == -1 && !nilN(u.elem.lenNode)) {
+        out := gep(g, blk, g.c.ArrayDataOffset(u.elem));
+        idx := alloca(g, check.TInt());
+        emit(g, "store i64 0, ptr " + idx);
+        head := newLabel(g, "nest"); body := newLabel(g, "nestbody"); done := newLabel(g, "nestdone");
+        br(g, head);
+        label(g, head);
+        i := tmp(g); emit(g, i + " = load i64, ptr " + idx);
+        c := tmp(g); emit(g, c + " = icmp slt i64 " + i + ", " + cnt.r);
+        condBr(g, c, body, done);
+        label(g, body);
+        inner := newRuntimeArray(g, u.elem);
+        emit(g, "store ptr " + inner + ", ptr " + gepDyn(g, out, i, 8));
+        i2 := tmp(g); emit(g, i2 + " = add i64 " + i + ", 1");
+        emit(g, "store i64 " + i2 + ", ptr " + idx);
+        br(g, head);
+        label(g, done);
+    } else if (needsInit(g, u.elem)) {
+        emit(g, "call void @oc_init_block(ptr " + blk + ", ptr " + desc(g, u.elem) + ")");
+    }
+    return blk;
+}
+
+// runtimeBuffer allocates n elements preceded by a hidden element count, and
+// returns the address of the first element (usable as an ordinary buffer view).
+func runtimeBuffer(g *Gen, elem *ast.Type, n string) string {
+    bytes := tmp(g);
+    emit(g, bytes + " = mul i64 " + n + ", " + itoa(sizeOf(g, elem)));
+    total := tmp(g);
+    emit(g, total + " = add i64 " + bytes + ", 16");
+    base := tmp(g);
+    emit(g, base + " = call ptr @oc_alloc(i64 " + total + ")");
+    emit(g, "store i64 " + n + ", ptr " + base);
+    return gep(g, base, 16);
+}
+
+// hasRuntimeElems reports a fixed array whose elements (at some depth) are
+// runtime-sized arrays needing allocation.
+func hasRuntimeElems(t *ast.Type) bool {
+    u := under(t);
+    if (u.kind != ast.TK.Array || u.len <= 0) return false;
+    e := under(u.elem);
+    if (e.kind == ast.TK.Array && e.len == -1 && !nilN(u.elem.lenNode)) return true;
+    return hasRuntimeElems(u.elem);
+}
+
+// initRuntimeElems allocates the runtime-sized arrays inside a zeroed fixed array at p.
+func initRuntimeElems(g *Gen, t *ast.Type, p string) {
+    u := under(t);
+    data := gep(g, p, g.c.ArrayDataOffset(u.elem));
+    es := sizeOf(g, u.elem);
+    e := under(u.elem);
+    for (i := 0; i < u.len; i++) {
+        slot := gep(g, data, i * es);
+        if (e.kind == ast.TK.Array && e.len == -1) emit(g, "store ptr " + newRuntimeArray(g, u.elem) + ", ptr " + slot);
+        else initRuntimeElems(g, u.elem, slot);
+    }
+}
+
+// unionUnary applies -x (op 0), x+1 (1) or x-1 (2) to a boxed type-list value
+// by dispatching over its terms; the result is boxed as t.
+func unionUnary(g *Gen, v V, t *ast.Type, op int) V {
+    terms := unionTerms(g, v.t);
+    slot := alloca(g, t);
+    done := newLabel(g, "uudone");
+    d := extract(g, v.r, 0);
+    for (i, x := range terms) {
+        body := newLabel(g, "uucase"); next := newLabel(g, "uunext");
+        condBr(g, termTest(g, d, x, unionTilde(v.t, i)), body, next);
+        label(g, body);
+        xv := load(g, under(x), extract(g, v.r, 1));
+        xv.t = x;
+        u := under(x);
+        r := tmp(g);
+        isF := u.kind == ast.TK.Float;
+        if (op == 0) emit(g, r + (isF ? " = fneg " + ll(x) + " " + xv.r : " = sub " + ll(x) + " 0, " + xv.r));
+        else emit(g, r + " = " + (isF ? (op == 1 ? "fadd " : "fsub ") : (op == 1 ? "add " : "sub ")) + ll(x) + " " + xv.r + (isF ? ", 1.0" : ", 1"));
+        store(g, t, slot, conv(g, mkV(r, x), t));
+        br(g, done);
+        label(g, next);
+    }
+    term(g, "call void @llvm.trap()\n  unreachable");
+    label(g, done);
+    return freshV(g, load(g, t, slot).r, t);
 }

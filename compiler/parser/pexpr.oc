@@ -71,8 +71,6 @@ func assignExpr(p *Parser) *ast.Node {
         next(p);
         n.a = lhs;
         n.b = assignExpr(p);
-        // Report assignments at the target, matching ocean-c.
-        n.line = lhs.line; n.col = lhs.col;
         return finish(p, n);
     }
     return lhs;
@@ -82,6 +80,7 @@ func ternary(p *Parser) *ast.Node {
     c := binary(p, 1);
     if (!is(p, scanner.Kind.Question)) return c;
     n := nodeAt(p, ast.NK.Ternary, c);
+    n.line = tok(p).line; n.col = tok(p).col;
     next(p);
     n.a = c;
     first := assignExpr(p);
@@ -161,7 +160,7 @@ func tryTypeArgs(p *Parser) ([]*ast.Node, bool) {
 // fixEligible: expression-level T[n] is rewritten for built-in types, known
 // declared/imported types, enclosing type parameters, and generic instances.
 func fixEligible(p *Parser, n *ast.Node) bool {
-    if (n.kind == ast.NK.Inst || n.kind == ast.NK.TBuffer) return true;
+    if (n.kind == ast.NK.Inst || n.kind == ast.NK.TBuffer || n.kind == ast.NK.TVarint) return true;
     if (n.kind == ast.NK.Ident) {
         if (isBuiltinTypeName(n.name)) return true;
         _, ok := p.known[n.name];
@@ -226,13 +225,15 @@ func postfix(p *Parser, n *ast.Node) *ast.Node {
                 else err(p, "Unexpected ']', expected expression");
                 return n;
             }
-            if ((n.kind == ast.NK.Ident && isBuiltinTypeName(n.name)) || n.kind == ast.NK.Inst || n.kind == ast.NK.TBuffer) {
+            if ((n.kind == ast.NK.Ident && isBuiltinTypeName(n.name)) || n.kind == ast.NK.Inst || n.kind == ast.NK.TBuffer || n.kind == ast.NK.TVarint) {
                 r := legacy.TypeRewrite(&p.toks, indexOfNodeStart(p, n), p.src.text, true);
                 if (r.ok) { errNode(p, n, legacy.Message(r.text, r.kinds)); return n; }
             }
+            brLine := tok(p).line; brCol := tok(p).col;
             next(p);
             if (is(p, scanner.Kind.Colon)) {
                 s := nodeAt(p, ast.NK.Slice, n);
+                s.line = brLine; s.col = brCol;
                 s.a = n;
                 next(p);
                 if (!is(p, scanner.Kind.RBrack)) s.c = expr(p);
@@ -243,6 +244,7 @@ func postfix(p *Parser, n *ast.Node) *ast.Node {
             idx := expr(p);
             if (accept(p, scanner.Kind.Colon)) {
                 s := nodeAt(p, ast.NK.Slice, n);
+                s.line = brLine; s.col = brCol;
                 s.a = n; s.b = idx;
                 if (!is(p, scanner.Kind.RBrack)) s.c = expr(p);
                 if (!accept(p, scanner.Kind.RBrack)) { err(p, "Expected closing array dimension bracket"); return s; }
@@ -252,7 +254,7 @@ func postfix(p *Parser, n *ast.Node) *ast.Node {
             ix := nodeAt(p, ast.NK.Index, n);
             ix.a = n; ix.b = idx;
             // ocean-c reports index errors at the bracket
-            ix.line = n.line; ix.col = n.col;
+            ix.line = brLine; ix.col = brCol;
             if (!accept(p, scanner.Kind.RBrack)) { err(p, "Expected closing array dimension bracket"); return ix; }
             n = finish(p, ix);
             continue;

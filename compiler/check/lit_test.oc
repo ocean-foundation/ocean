@@ -1,0 +1,41 @@
+package check;
+import "testing";
+
+func repeat(s string, n int) string {
+    out := "";
+    for (i := 0; i < n; i++) out += s;
+    return out;
+}
+
+// The divide-and-conquer decimal path must agree with the simple path.
+func TestLargeDecimalParse(t *testing.T) {
+    digits := "1" + repeat("234567890", 600) + "7";
+    fast := ParseBigNat(digits);
+    slow := new(BigNat);
+    for (i := 0; i < len(digits); i++) {
+        if (len(slow.limbs) == 0) { v := digitValue(digits[i]); if (v != 0) slow.limbs.append(v); }
+        else slow.mulAdd(10, digitValue(digits[i]));
+    }
+    slow.trim();
+    if (len(fast.limbs) != len(slow.limbs)) t.Fatal("limb count differs");
+    for (i := 0; i < len(fast.limbs); i++) { if (fast.limbs[i] != slow.limbs[i]) t.Fatal("limb differs"); }
+    if (fast.Decimal() != digits) t.Fatal("decimal round trip failed");
+}
+
+func TestHexSpelling(t *testing.T) {
+    if (ParseBigNat("255").Hex() != "ff") t.Fatal("hex 255");
+    if (ParseBigNat("0").Hex() != "0") t.Fatal("hex 0");
+    if (ParseBigNat("4294967296").Hex() != "100000000") t.Fatal("hex 2^32");
+    // -1 in 8 bits is 0xff; -2^64 in 72 bits is 0xff0000000000000000
+    if (ParseBigNat("1").TwosHex(8) != "ff") t.Fatal("twos -1");
+    if (ParseBigNat("18446744073709551616").TwosHex(72) != "ff0000000000000000") t.Fatal("twos -2^64");
+}
+
+func TestFloatOverflowThreshold(t *testing.T) {
+    // f32: values from 2^128 - 2^103 round to infinity; the largest finite is (2^24-1)*2^104.
+    if (!floatOverflows(ParseBigNat("0x100000000000000000000000000000000"), 32)) t.Fatal("2^128 must overflow f32");
+    if (floatOverflows(ParseBigNat("340282346638528859811704183484516925440"), 32)) t.Fatal("max f32 must not overflow");
+    if (!floatOverflows(ParseBigNat("0xffffff80000000000000000000000000"), 32)) t.Fatal("halfway rounds to infinity");
+    if (floatOverflows(ParseBigNat("0xffffff7fffffffffffffffffffffffff"), 32)) t.Fatal("below halfway stays finite");
+    if (floatOverflows(ParseBigNat("0x100000000000000000000000000000000"), 64)) t.Fatal("2^128 fits f64");
+}

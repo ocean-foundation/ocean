@@ -254,7 +254,12 @@ func inTerms(c *Checker, t *ast.Type, u *ast.Type) bool {
 
 // matchTerm checks one constraint term against a type.
 func matchTerm(c *Checker, t *ast.Type, term *ast.Type, tilde bool) bool {
-    if (tilde) return Identical(Underlying(t), Underlying(term));
+    if (tilde) {
+        ut := Underlying(t); uterm := Underlying(term);
+        if (Identical(ut, uterm)) return true;
+        if (uterm.kind == ast.TK.Buffer || uterm.kind == ast.TK.Array || uterm.kind == ast.TK.Family) return matchTerm(c, ut, uterm, false);
+        return false;
+    }
     if (Identical(t, term)) return true;
     switch (term.kind) {
     case ast.TK.Interface:
@@ -274,14 +279,18 @@ func matchTerm(c *Checker, t *ast.Type, term *ast.Type, tilde bool) bool {
         return false;
     case ast.TK.Dyn:
         if (t.kind != ast.TK.Dyn) return false;
+        if (!term.isMixed && !t.isMixed && familyMatch(c, t.elem, term.elem)) return true;
+        if (!term.isMixed && !t.isMixed && IsInterface(term.elem) && !IsInterface(t.elem) && satisfies(c, t.elem, term.elem)) return true;
         if (term.isMixed) return (t.isMixed && Identical(t.elem, term.elem)) || (!t.isMixed && (Identical(t.elem, term.elem) || satisfies(c, t.elem, term.elem)));
         return false;
     case ast.TK.Struct, ast.TK.Enum:
         if (t.kind != term.kind || t.sym != term.sym || len(t.args) != len(term.args)) return false;
         for (i := 0; i < len(t.args); i++) {
-            if (!Identical(t.args[i], term.args[i]) && !(term.args[i].kind == ast.TK.Family && matchTerm(c, t.args[i], term.args[i], false))) return false;
+            if (!Identical(t.args[i], term.args[i]) && !familyMatch(c, t.args[i], term.args[i])) return false;
         }
         return true;
+    case ast.TK.Ptr:
+        return t.kind == ast.TK.Ptr && (Identical(t.elem, term.elem) || familyMatch(c, t.elem, term.elem));
     case ast.TK.Union: return inTerms(c, t, term);
     }
     return false;
@@ -319,8 +328,10 @@ func (c *Checker) Satisfies(t *ast.Type, constraint *ast.Type) bool { return sat
 func constraintTerms(c *Checker, t *ast.Type) []*ast.Type {
     out := make([]*ast.Type);
     if (t.kind == ast.TK.Param) {
-        if (nilT(t.sym.constraint)) return out;
-        return constraintTerms(c, t.sym.constraint);
+        k := t.sym.constraint;
+        if (nilT(k) || IsAny(k)) return out;
+        if (k.kind != ast.TK.Union && k.kind != ast.TK.Interface && k.kind != ast.TK.Family) { out.append(k); return out; }
+        return constraintTerms(c, k);
     }
     if (t.kind == ast.TK.Union || (t.kind == ast.TK.Interface && len(t.terms) > 0)) {
         for (i, term := range t.terms) {
@@ -360,4 +371,26 @@ func flatTerms(t *ast.Type) *ast.Type {
         }
     }
     return u;
+}
+
+// familyMatch: a type matches a term whose structure contains families
+// (bare generic names, buffer, buffer<T>, array<T>) at any depth.
+func familyMatch(c *Checker, t *ast.Type, term *ast.Type) bool {
+    if (Identical(t, term)) return true;
+    switch (term.kind) {
+    case ast.TK.Family: return (t.kind == ast.TK.Struct || t.kind == ast.TK.Enum || t.kind == ast.TK.Family) && t.sym == term.sym;
+    case ast.TK.Buffer, ast.TK.Array, ast.TK.Struct, ast.TK.Enum, ast.TK.Ptr: return matchTerm(c, t, term, false);
+    case ast.TK.Dyn: return t.kind == ast.TK.Dyn && t.isMixed == term.isMixed && familyMatch(c, t.elem, term.elem);
+    }
+    return false;
+}
+
+// ParamBound gives the single concrete type a parameter's constraint names
+// (e.g. T buffer<int>, T Box<int>), used for member and index operations.
+func paramBound(t *ast.Type) *ast.Type {
+    if (t.kind != ast.TK.Param || nilT(t.sym.constraint)) return t;
+    k := t.sym.constraint;
+    if (k.kind == ast.TK.Struct || k.kind == ast.TK.Enum || k.kind == ast.TK.Ptr || k.kind == ast.TK.Dyn || k.kind == ast.TK.Map ||
+        k.kind == ast.TK.String || (k.kind == ast.TK.Buffer && !nilT(k.elem)) || (k.kind == ast.TK.Array && !nilT(k.elem))) return k;
+    return t;
 }

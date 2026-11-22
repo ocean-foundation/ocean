@@ -8,12 +8,13 @@ func block(p *Parser) *ast.Node {
     for (!is(p, scanner.Kind.RBrace) && !is(p, scanner.Kind.EOF)) {
         before := p.pos;
         s := statement(p);
-        n.list.append(s);
         if (p.failed) {
-            if (!p.recover || p.trial > 0) return n;
+            if (!p.recover || p.trial > 0) { n.list.append(s); return n; }
             p.failed = false;
             recoverStmt(p, before);
+            continue;
         }
+        n.list.append(s);
     }
     if (!accept(p, scanner.Kind.RBrace)) err(p, "Expected end of block");
     return finish(p, n);
@@ -95,7 +96,7 @@ func statement1(p *Parser) *ast.Node {
         n := node(p, ast.NK.Goto);
         next(p);
         if (!is(p, scanner.Kind.Ident)) { err(p, "Expected goto label"); return n; }
-        n.name = tok(p).text;
+        n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
         next(p);
         semi(p, "Expected semicolon after branch");
         return finish(p, n);

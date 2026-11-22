@@ -62,14 +62,14 @@ func genBinary(g *Gen, n *ast.Node, t *ast.Type) V {
     if (op == scanner.Kind.AndAnd || op == scanner.Kind.OrOr) return genLogical(g, n);
     a := genExpr(g, n.a);
     // keep the left value stable against side effects of the right operand
-    if (isAgg(a.t) && !a.fresh) a = copyV(g, a);
+    if ((isAgg(a.t) || under(a.t).kind == ast.TK.Dyn || under(a.t).kind == ast.TK.Map) && !a.fresh && !pureExpr(n.b)) a = copyV(g, a);
     b := genExpr(g, n.b);
     return binaryValues(g, n, op, a, b, t);
 }
 
 func binaryValues(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, t *ast.Type) V {
     ua := under(a.t); ub := under(b.t);
-    if (ua.kind == ast.TK.Union || ub.kind == ast.TK.Union) return unionBinary(g, n, op, a, b, t);
+    if (typeList(ua) || typeList(ub)) return unionBinary(g, n, op, a, b, t);
     if (op == scanner.Kind.EqEq || op == scanner.Kind.NotEq) return mkV(genEquality(g, n, a, b, op == scanner.Kind.NotEq), check.TBool());
     if (isCmp(op)) {
         if (ua.kind == ast.TK.String) {
@@ -90,7 +90,7 @@ func binaryValues(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, t *ast.Type) V
         if (ua.kind == ast.TK.String && ub.kind == ast.TK.String) emit(g, r + " = call ptr @oc_str_concat(ptr " + a.r + ", ptr " + b.r + ")");
         else if (ua.kind == ast.TK.String) emit(g, r + " = call ptr @oc_str_add_byte(ptr " + a.r + ", i8 " + b.r + ", i64 0)");
         else emit(g, r + " = call ptr @oc_str_add_byte(ptr " + b.r + ", i8 " + a.r + ", i64 1)");
-        return freshV(r, t);
+        return freshV(g, r, t);
     }
     // pointer arithmetic
     if (ua.kind == ast.TK.Ptr || ub.kind == ast.TK.Ptr) {
@@ -150,18 +150,19 @@ func genTernary(g *Gen, n *ast.Node, t *ast.Type) V {
         store(g, t, slot, genAs(g, n.c, t));
         br(g, done);
         label(g, done);
-        return freshV(slot, t);
+        return freshV(g, slot, t);
     }
     label(g, yes);
     a := genAs(g, n.b, t);
     ya := g.fn.cur; br(g, done);
     label(g, no);
     b := genAs(g, n.c, t);
+    consume(g, a); consume(g, b);
     nb := g.fn.cur; br(g, done);
     label(g, done);
     r := tmp(g);
     emit(g, r + " = phi " + ll(t) + " [ " + a.r + ", %" + ya + " ], [ " + b.r + ", %" + nb + " ]");
-    return freshV(r, t);
+    return freshV(g, r, t);
 }
 
 // ---- equality ----
@@ -182,7 +183,7 @@ func tagOf(g *Gen, v V) string { r := tmp(g); emit(g, r + " = load i64, ptr " + 
 func equality(g *Gen, n *ast.Node, a V, b V) string {
     ua := under(a.t); ub := under(b.t);
     // enum compared with a variant selector tests only the tag
-    if (!nilN(n) && n.kind == ast.NK.Binary && (ua.kind == ast.TK.Enum || ub.kind == ast.TK.Enum)) {
+    if (!nilN(n) && n.kind == ast.NK.Binary && (ua.kind == ast.TK.Enum || ub.kind == ast.TK.Enum) && a.t.kind != ast.TK.Null && b.t.kind != ast.TK.Null) {
         sa := isSelectorNode(n.a) && n.a.sem != ast.Sem.EnumFixed;
         sb := isSelectorNode(n.b) && n.b.sem != ast.Sem.EnumFixed;
         if (sa || sb) {
@@ -252,65 +253,126 @@ func equality(g *Gen, n *ast.Node, a V, b V) string {
 
 // ---- collections ----
 
+// isArraySide decides whether a concatenation operand contributes its elements.
+func isArraySide(g *Gen, side *ast.Type, result *ast.Type) bool {
+    su := under(side); ru := under(result);
+    if (su.kind != ast.TK.Dyn && su.kind != ast.TK.Array) return false;
+    if (check.Identical(su, ru)) return true;
+    if (check.Identical(side, ru.elem) || g.c.Assignable(side, ru.elem) && !g.c.Assignable(su.elem, ru.elem)) return false;
+    return g.c.Assignable(su.elem, ru.elem);
+}
+
+// appendSide appends an operand (its elements, or itself) to the array at slot.
+func appendSide(g *Gen, slot string, v V, isArray bool, elem *ast.Type) {
+    es := sizeOf(g, elem);
+    if (!isArray) {
+        e := copyV(g, conv(g, v, elem));
+        dst := tmp(g);
+        emit(g, dst + " = call ptr @oc_arr_push(ptr " + slot + ", i64 " + itoa(es) + ")");
+        store(g, elem, dst, e);
+        return;
+    }
+    su := under(v.t);
+    data := arrayDataPtr(g, v);
+    n := collectionLen(g, v);
+    if (check.Identical(su.elem, elem)) {
+        cur := tmp(g); emit(g, cur + " = load ptr, ptr " + slot);
+        l := tmp(g); emit(g, l + " = call i64 @oc_arr_len(ptr " + cur + ")");
+        emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + l + ", ptr " + data + ", i64 " + n + ", ptr " + desc(g, elem) + ", i64 0)");
+        return;
+    }
+    idx := alloca(g, check.TInt());
+    emit(g, "store i64 0, ptr " + idx);
+    head := newLabel(g, "cat"); body := newLabel(g, "catbody"); done := newLabel(g, "catdone");
+    br(g, head);
+    label(g, head);
+    i := tmp(g); emit(g, i + " = load i64, ptr " + idx);
+    c := tmp(g); emit(g, c + " = icmp slt i64 " + i + ", " + n);
+    condBr(g, c, body, done);
+    label(g, body);
+    ev := copyV(g, conv(g, load(g, su.elem, gepDyn(g, data, i, sizeOf(g, su.elem))), elem));
+    dst := tmp(g);
+    emit(g, dst + " = call ptr @oc_arr_push(ptr " + slot + ", i64 " + itoa(es) + ")");
+    store(g, elem, dst, ev);
+    i2 := tmp(g); emit(g, i2 + " = add i64 " + i + ", 1");
+    emit(g, "store i64 " + i2 + ", ptr " + idx);
+    br(g, head);
+    label(g, done);
+}
+
 func concatValues(g *Gen, a V, b V, t *ast.Type) V {
     u := under(t);
     elem := u.elem;
-    da := ""; na := ""; db := ""; nb := "";
-    ua := under(a.t); ub := under(b.t);
-    if (ua.kind == ast.TK.Dyn || ua.kind == ast.TK.Array) { da = arrayDataPtr(g, a); na = collectionLen(g, a); }
-    else { e := conv(g, a, elem); da = spill(g, e); na = "1"; }
-    if (ub.kind == ast.TK.Dyn || ub.kind == ast.TK.Array) { db = arrayDataPtr(g, b); nb = collectionLen(g, b); }
-    else { e := conv(g, b, elem); db = spill(g, e); nb = "1"; }
-    r := tmp(g);
-    emit(g, r + " = call ptr @oc_concat(ptr " + da + ", i64 " + na + ", ptr " + db + ", i64 " + nb + ", ptr " + desc(g, elem) + ")");
-    if (u.kind == ast.TK.Dyn) return freshV(r, t);
-    // fixed arrays: build a block of the combined length
+    slot := alloca(g, check.DynOf(elem));
+    emit(g, "store ptr null, ptr " + slot);
+    appendSide(g, slot, a, isArraySide(g, a.t, t), elem);
+    appendSide(g, slot, b, isArraySide(g, b.t, t), elem);
+    homCheckSlot(g, check.DynOf(elem), slot, "0", "9223372036854775807");
+    r := tmp(g); emit(g, r + " = load ptr, ptr " + slot);
+    if (u.kind == ast.TK.Dyn) return freshV(g, r, t);
+    freshV(g, r, check.DynOf(elem));
     blk := tmp(g);
     emit(g, blk + " = call ptr @oc_arr_to_block(ptr " + r + ", ptr " + desc(g, elem) + ")");
     if (u.len >= 0) {
         p := alloca(g, t);
         memcpy(g, p, blk, sizeOf(g, t));
-        return freshV(p, t);
+        emit(g, "call void @oc_free(ptr " + blk + ")");
+        return freshV(g, p, t);
     }
-    return freshV(blk, t);
+    return freshV(g, blk, t);
 }
 
 // ---- boxed type-list operations: dispatch over concrete term pairs ----
 
+func typeList(u *ast.Type) bool { return u.kind == ast.TK.Union || (u.kind == ast.TK.Interface && len(u.terms) > 0); }
+
 func unionTerms(g *Gen, t *ast.Type) []*ast.Type {
     u := under(t);
     out := make([]*ast.Type);
-    if (u.kind == ast.TK.Union) { for (_, x := range u.terms) out.append(x); return out; }
+    if (typeList(u)) { for (_, x := range u.terms) out.append(x); return out; }
     out.append(t);
     return out;
 }
 
+func unionTilde(t *ast.Type, i int) bool {
+    u := under(t);
+    return typeList(u) && i < len(u.tilde) && u.tilde[i];
+}
+
+// termTest tests a boxed descriptor against one type-list term.
+func termTest(g *Gen, d string, term *ast.Type, tilde bool) string {
+    if (!tilde) { c := tmp(g); emit(g, c + " = icmp eq ptr " + d + ", " + desc(g, term)); return c; }
+    one := ast.NewType(ast.TK.Union);
+    one.terms.append(term); one.tilde.append(true);
+    return typeTest(g, d, one);
+}
+
 func unionBinary(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, t *ast.Type) V {
     ta := unionTerms(g, a.t); tb := unionTerms(g, b.t);
-    boxedA := under(a.t).kind == ast.TK.Union; boxedB := under(b.t).kind == ast.TK.Union;
+    boxedA := typeList(under(a.t)); boxedB := typeList(under(b.t));
     resultBoxed := under(t).kind == ast.TK.Union || under(t).kind == ast.TK.Interface;
     slot := alloca(g, t);
     done := newLabel(g, "udone");
     da := boxedA ? extract(g, a.r, 0) : "";
     db := boxedB ? extract(g, b.r, 0) : "";
-    for (_, x := range ta) {
-        for (_, y := range tb) {
+    for (xi, x := range ta) {
+        for (yi, y := range tb) {
             next := newLabel(g, "unext");
             body := newLabel(g, "ucase");
             c := "true";
-            if (boxedA) { c1 := tmp(g); emit(g, c1 + " = icmp eq ptr " + da + ", " + desc(g, x)); c = c1; }
+            if (boxedA) c = termTest(g, da, x, unionTilde(a.t, xi));
             if (boxedB) {
-                c2 := tmp(g); emit(g, c2 + " = icmp eq ptr " + db + ", " + desc(g, y));
+                c2 := termTest(g, db, y, unionTilde(b.t, yi));
                 if (c == "true") c = c2; else { c3 := tmp(g); emit(g, c3 + " = and i1 " + c + ", " + c2); c = c3; }
             }
             condBr(g, c, body, next);
             label(g, body);
             av := a; bv := b;
-            if (boxedA) av = load(g, x, extract(g, a.r, 1)); else av.t = x;
-            if (boxedB) bv = load(g, y, extract(g, b.r, 1)); else bv.t = y;
+            if (boxedA) av = load(g, under(x), extract(g, a.r, 1)); else av.t = x;
+            if (boxedB) bv = load(g, under(y), extract(g, b.r, 1)); else bv.t = y;
             rt := zero(*ast.Type);
             if (isCmp(op)) rt = check.TBool();
-            else if (under(x).kind == ast.TK.String) rt = x;
+            else if (under(x).kind == ast.TK.String || under(x).kind == ast.TK.Dyn || under(x).kind == ast.TK.Array) rt = x;
             else rt = g.c.NumericResult(x, y);
             res := binaryValues(g, zero(*ast.Node), op, av, bv, rt);
             stored := res;
@@ -323,5 +385,45 @@ func unionBinary(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, t *ast.Type) V 
     }
     term(g, "call void @llvm.trap()\n  unreachable");
     label(g, done);
+    if (owned(g, t) && !isAgg(t)) return freshV(g, load(g, t, slot).r, t);
     return load(g, t, slot);
+}
+
+// pureExpr: expressions that cannot mutate storage when evaluated.
+func pureExpr(n *ast.Node) bool {
+    switch (n.kind) {
+    case ast.NK.Ident, ast.NK.IntLit, ast.NK.FloatLit, ast.NK.StrLit, ast.NK.Null, ast.NK.Sizeof, ast.NK.Zero: return true;
+    case ast.NK.Member: return pureExpr(n.a);
+    case ast.NK.Unary: return n.op != scanner.Kind.PlusPlus && n.op != scanner.Kind.MinusMinus && pureExpr(n.a);
+    case ast.NK.Binary: return pureExpr(n.a) && pureExpr(n.b);
+    case ast.NK.Index: return pureExpr(n.a) && pureExpr(n.b);
+    case ast.NK.Composite:
+        for (_, e := range n.list) { if (!pureExpr(e.b) || (!nilN(e.a) && !pureExpr(e.a))) return false; }
+        return true;
+    case ast.NK.Cast: return pureExpr(n.a);
+    }
+    return false;
+}
+
+// rootSym is the variable at the root of an lvalue path (a.b[i].c -> a).
+func rootSym(n *ast.Node) *ast.Symbol {
+    for (!nilN(n)) {
+        if (n.kind == ast.NK.Ident) return n.sym;
+        if (n.kind == ast.NK.Member || n.kind == ast.NK.Index) { n = n.a; continue; }
+        break;
+    }
+    return zero(*ast.Symbol);
+}
+
+// mayMutate reports whether evaluating e can change the variable rooted at s:
+// it takes s's address or assigns to it.
+func mayMutate(e *ast.Node, s *ast.Symbol) bool {
+    if (nilN(e) || nilS(s)) return false;
+    if (e.kind == ast.NK.Unary && e.op == scanner.Kind.Amp && rootSym(e.a) == s) return true;
+    if ((e.kind == ast.NK.Assign || e.kind == ast.NK.MultiAssign) && rootSym(e.a) == s) return true;
+    if (e.kind == ast.NK.FuncLit) return false;
+    if (mayMutate(e.a, s) || mayMutate(e.b, s) || mayMutate(e.c, s)) return true;
+    for (_, x := range e.list) { if (mayMutate(x, s)) return true; }
+    for (_, x := range e.list2) { if (mayMutate(x, s)) return true; }
+    return false;
 }

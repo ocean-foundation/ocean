@@ -214,7 +214,7 @@ func topLevel(p *Parser, f *ast.Node) {
     if (k == scanner.Kind.KwGoto || k == scanner.Kind.KwBreak || k == scanner.Kind.KwContinue || k == scanner.Kind.KwFallthrough) {
         err(p, "Branch statement is not valid in this context"); return;
     }
-    if (k == scanner.Kind.KwAsm) { err(p, "Unexpected 'asm', expected expression"); return; }
+    if (k == scanner.Kind.KwAsm) { err(p, "asm blocks are only allowed inside functions"); return; }
     if (isIdent(p, "forward") && peek(p, 1) == scanner.Kind.KwPanic) { err(p, "Forward panic is only allowed inside a function"); return; }
     d := declaration(p, true);
     if (!ast.Nil(d)) { f.list.append(d); return; }
@@ -316,6 +316,7 @@ func typeParamList(p *Parser, out *[]*ast.Node, close scanner.Kind) {
         if (!is(p, scanner.Kind.Ident)) { err(p, "Expected type parameter name"); return; }
         n := node(p, ast.NK.TypeParam);
         n.name = tok(p).text;
+        if (n.name == "array") { err(p, "array is a reserved type name"); return; }
         next(p);
         pending.append(n);
         (*out).append(n);
@@ -596,6 +597,7 @@ func structDecl(p *Parser) *ast.Node {
     next(p);
     if (!is(p, scanner.Kind.Ident)) { err(p, "Expected struct name"); return n; }
     n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    if (n.name == "array") { err(p, "array is a reserved type name"); return n; }
     next(p);
     n.list3 = typeParams(p, false);
     valueNames: map[string]bool;
@@ -620,6 +622,7 @@ func enumDecl(p *Parser) *ast.Node {
     next(p);
     if (!is(p, scanner.Kind.Ident)) { err(p, "Expected enum name"); return n; }
     n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    if (n.name == "array") { err(p, "array is a reserved type name"); return n; }
     next(p);
     n.list3 = typeParams(p, true);
     if (!accept(p, scanner.Kind.LBrace)) { err(p, "Expected enum body"); return n; }
@@ -746,6 +749,7 @@ func interfaceDecl(p *Parser) *ast.Node {
     next(p);
     if (!is(p, scanner.Kind.Ident)) { err(p, "Expected interface name"); return n; }
     n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    if (n.name == "array") { err(p, "array is a reserved type name"); return n; }
     next(p);
     n.list3 = typeParams(p, false);
     interfaceBody(p, n);
@@ -757,6 +761,7 @@ func typeDecl(p *Parser) *ast.Node {
     next(p);
     if (!is(p, scanner.Kind.Ident)) { err(p, "Expected type name"); return n; }
     n.name = tok(p).text; n.nameLine = tok(p).line; n.nameCol = tok(p).col;
+    if (n.name == "array") { err(p, "array is a reserved type name"); return n; }
     next(p);
     if (accept(p, scanner.Kind.Assign)) n.flag = true;
     n.a = typeChecked(p);
@@ -838,4 +843,12 @@ func constraintChecked(p *Parser) *ast.Node {
     t := constraint(p);
     legacyCheck(p, start);
     return t;
+}
+
+// ParseExpression parses a standalone expression (editor completion receivers).
+func ParseExpression(src *ast.Source, diags *diag.List) (*ast.Node, bool) {
+    p := new(Parser);
+    p.src = src; p.toks = src.tokens; p.diags = diags; p.trial = 1;
+    e := expr(p);
+    return e, !p.failed && is(p, scanner.Kind.EOF);
 }

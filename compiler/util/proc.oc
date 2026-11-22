@@ -16,6 +16,23 @@ extern i32 kill(i32 pid, i32 sig);
 extern buffer<i8> strsignal(i32 sig);
 extern i32 setenv(buffer<i8> name, buffer<i8> value, i32 overwrite);
 extern i32 unsetenv(buffer<i8> name);
+extern i32 sigemptyset(buffer<i8> set);
+extern i32 sigaddset(buffer<i8> set, i32 sig);
+extern i32 sigprocmask(i32 how, buffer<i8> set, buffer<i8> old);
+extern i32 sigtimedwait(buffer<i8> set, buffer<i8> info, buffer<i64> timeout);
+extern i32 tcgetattr(i32 fd, buffer<i8> t);
+extern i32 tcsetattr(i32 fd, i32 action, buffer<i8> t);
+
+savedTerminal: [64]i8;
+terminalSaved := false;
+
+// SaveTerminal records stdin's terminal settings for RestoreTerminal.
+func SaveTerminal() { terminalSaved = extern.tcgetattr(0->i32, savedTerminal.data) == 0; }
+func RestoreTerminal() {
+    if (!terminalSaved) return;
+    extern.tcsetattr(0->i32, 0->i32, savedTerminal.data);
+    terminalSaved = false;
+}
 
 // Process status: exited normally with Code, or killed by Signal (> 0).
 struct Status { Code int; Signal int; Failed bool; }
@@ -48,6 +65,7 @@ func spawn(argv array<string>, r *Redirect) int {
     pid := extern.fork();
     if (pid < 0) return -1;
     if (pid == 0) {
+        unblockSignals();
         if (r.stdinPath != "") {
             fd := extern.open(stdinPath.data, 0->i32);
             if (fd >= 0) { extern.dup2(fd, 0->i32); extern.close(fd); }
@@ -86,15 +104,32 @@ func Run(argv array<string>) Status {
 
 // RunForeground runs a child while ignoring terminal interrupts in the parent,
 // so the child receives them and the parent reports the outcome.
+// RunForeground runs a child, forwarding SIGINT/SIGTERM/SIGHUP to it.
 func RunForeground(argv array<string>) Status {
-    old2 := extern.signal(2->i32, 1->(*void));
-    old15 := extern.signal(15->i32, 1->(*void));
-    old1 := extern.signal(1->i32, 1->(*void));
-    s := Run(argv);
-    extern.signal(2->i32, old2);
-    extern.signal(15->i32, old15);
-    extern.signal(1->i32, old1);
-    return s;
+    set: buffer<i8, 128>;
+    old: buffer<i8, 128>;
+    extern.sigemptyset(set);
+    extern.sigaddset(set, 2->i32); extern.sigaddset(set, 15->i32); extern.sigaddset(set, 1->i32);
+    extern.sigprocmask(0->i32, set, old);
+    r := NewRedirect();
+    pid := spawn(argv, &r);
+    if (pid < 0) { extern.sigprocmask(2->i32, old, zero(buffer<i8>)); s: Status; s.Failed = true; s.Code = 1; return s; }
+    ts: buffer<i64, 2> = {0, 50000000};
+    st: Status;
+    for (;;) {
+        sig := extern.sigtimedwait(set, zero(buffer<i8>), ts);
+        if (sig > 0) extern.kill(pid->i32, sig);
+        done, status := WaitNoHang(pid);
+        if (done) { st = status; break; }
+    }
+    extern.sigprocmask(2->i32, old, zero(buffer<i8>));
+    return st;
+}
+
+func unblockSignals() {
+    empty: buffer<i8, 128>;
+    extern.sigemptyset(empty);
+    extern.sigprocmask(2->i32, empty, zero(buffer<i8>));
 }
 
 func readAll(fd i32) string {
@@ -152,7 +187,31 @@ extern int write(i32 fd, buffer<i8> data, int count);
 
 // SpawnMapped starts argv with descriptor mappings (pairs: from, to). Every
 // other inherited mapping source is closed in the child.
+// BlockSignals defers SIGINT/SIGTERM/SIGHUP so PendingSignal can poll them.
+func BlockSignals() {
+    set: buffer<i8, 128>;
+    extern.sigemptyset(set);
+    extern.sigaddset(set, 2->i32); extern.sigaddset(set, 15->i32); extern.sigaddset(set, 1->i32);
+    extern.sigprocmask(0->i32, set, zero(buffer<i8>));
+}
+// PendingSignal consumes one blocked SIGINT/SIGTERM/SIGHUP (0 if none).
+func PendingSignal() int {
+    set: buffer<i8, 128>;
+    extern.sigemptyset(set);
+    extern.sigaddset(set, 2->i32); extern.sigaddset(set, 15->i32); extern.sigaddset(set, 1->i32);
+    ts: buffer<i64, 2> = {0, 0};
+    sig := extern.sigtimedwait(set, zero(buffer<i8>), ts);
+    return sig > 0 ? sig -> int : 0;
+}
+func UnblockSignals() { unblockSignals(); }
+
 func SpawnMapped(argv array<string>, maps []int, devNullStdin bool, ownGroup bool) int {
+    return SpawnMappedSig(argv, maps, devNullStdin, ownGroup, false);
+}
+
+// SpawnMappedSig is SpawnMapped; ignoreSignals makes the child ignore
+// SIGINT/SIGTERM/SIGHUP (it is shut down through its input instead).
+func SpawnMappedSig(argv array<string>, maps []int, devNullStdin bool, ownGroup bool, ignoreSignals bool) int {
     storage := make([][]i8);
     for (i := 0; i < len(argv); i++) storage.append(CStr(argv[i]));
     ptrs := make([]int);
@@ -162,8 +221,10 @@ func SpawnMapped(argv array<string>, maps []int, devNullStdin bool, ownGroup boo
     pid := extern.fork();
     if (pid < 0) return -1;
     if (pid == 0) {
+        unblockSignals();
         if (ownGroup) extern.setpgid(0->i32, 0->i32);
         extern.signal(2->i32, zero(*void)); extern.signal(15->i32, zero(*void)); extern.signal(1->i32, zero(*void)); extern.signal(13->i32, zero(*void));
+        if (ignoreSignals) { ign := 1 -> (*void); extern.signal(2->i32, ign); extern.signal(15->i32, ign); extern.signal(1->i32, ign); }
         // Move sources out of the way first so mappings cannot clobber each other.
         moved := make([]int);
         for (i := 0; i + 1 < len(maps); i += 2) moved.append(extern.fcntl(maps[i]->i32, 1030->i32, 300->i32) -> int);
@@ -233,3 +294,8 @@ func clock(id int) (int, int) {
 func MonoSeconds() float { s, ns := clock(1); return (s -> float) + (ns -> float) / 1000000000.0; }
 func RealNow() (int, int) { return clock(0); }
 func KillGroup(pid int, sig int) { extern.kill((-pid)->i32, sig->i32); }
+
+// Fork duplicates the process; returns 0 in the child.
+func Fork() int { return extern.fork() -> int; }
+// ExitNow terminates immediately without running atexit handlers.
+func ExitNow(code int) { extern._exit(code->i32); }

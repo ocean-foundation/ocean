@@ -5,7 +5,11 @@ import "github.com/ocean-foundation/ocean/compiler/util";
 
 // V is a generated value. Scalars are SSA operands; aggregates live in memory
 // and r is a pointer to their storage. fresh marks temporaries we own.
-struct V { r string; t *ast.Type; fresh bool; }
+struct V { r string; t *ast.Type; fresh bool; tmp int; }
+
+// Temp is an owned temporary awaiting a move; Local an owned variable slot.
+struct Temp { slot string; t *ast.Type; dead bool; }
+struct Local { slot string; t *ast.Type; }
 
 struct Inst {
     sym *ast.Symbol;       // function or method (nil for literals)
@@ -15,9 +19,13 @@ struct Inst {
     kind int;              // 0 function/method, 1 literal, 2 interface thunk
     thunkPtr bool;         // thunk: box holds a pointer
     recvType *ast.Type;    // methods: concrete receiver type
+    targs []*ast.Type;     // thunks of generic methods: method type arguments
 }
 
-struct Loop { node *ast.Node; brk string; cont string; }
+// GenericCall is an interface call of a generic method instantiation.
+struct GenericCall { method string; dispatch string; targs []*ast.Type; }
+
+struct Loop { node *ast.Node; brk string; cont string; scopeDepth int; tempMark int; }
 
 struct Fn {
     inst *Inst;
@@ -44,9 +52,16 @@ struct Fn {
     fallLabels []string;
     cur string;
     pendingLabel *ast.Node;
+    temps []*Temp;
+    scopes [][]*Local;
+    allLocals []*Local;
+    lastLoop *Loop;
 }
 
 struct Gen {
+    trackTemps bool;
+    genericCalls []*GenericCall;
+    genericKeys map[string]bool;
     c *check.Checker;
     mod *util.Buf;
     decls map[string]string;
@@ -91,6 +106,8 @@ struct Matcher { name string; term *ast.Type; tilde bool; }
 
 func NewGen(c *check.Checker) *Gen {
     g := new(Gen);
+    _, noFree := util.Getenv("OCEAN_NO_FREE");
+    g.trackTemps = !noFree;
     g.c = c;
     g.mod = util.NewBuf();
     g.globals = util.NewBuf();
@@ -110,7 +127,23 @@ func itoa(n int) string { return util.Itoa(n); }
 // sub applies the current generic environment.
 func sub(g *Gen, t *ast.Type) *ast.Type {
     if (nilT(t)) return t;
-    return check.Subst(t, g.env);
+    return localNamed(g, check.Subst(t, g.env));
+}
+
+// localNamed replaces block-local definitions over type parameters (type L T
+// inside a generic body) by their substituted representation.
+func localNamed(g *Gen, t *ast.Type) *ast.Type {
+    switch (t.kind) {
+    case ast.TK.Named:
+        if (t.sym.local && check.HasParams(t.sym.ty)) return localNamed(g, check.Subst(t.sym.ty, g.env));
+    case ast.TK.Ptr, ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
+        if (nilT(t.elem)) return t;
+        e := localNamed(g, t.elem);
+        if (e == t.elem) return t;
+        n := ast.NewType(t.kind); n.elem = e; n.len = t.len; n.isMixed = t.isMixed; n.lenNode = t.lenNode;
+        return n;
+    }
+    return t;
 }
 
 func under(t *ast.Type) *ast.Type { return check.Underlying(t); }
@@ -128,7 +161,13 @@ func isAgg(t *ast.Type) bool {
 
 func isPair(t *ast.Type) bool {
     u := under(t);
-    return u.kind == ast.TK.Interface || u.kind == ast.TK.Func || u.kind == ast.TK.Union;
+    return u.kind == ast.TK.Interface || u.kind == ast.TK.Func || u.kind == ast.TK.Union || isBoxed(u);
+}
+
+// isBoxed: dynamically typed values carried as {descriptor, data} pairs.
+func isBoxed(t *ast.Type) bool {
+    u := under(t);
+    return u.kind == ast.TK.Interface || u.kind == ast.TK.Union || u.kind == ast.TK.Family || (u.kind == ast.TK.Buffer && nilT(u.elem));
 }
 
 // ll gives the SSA LLVM type of a scalar Ocean type ("ptr" for aggregates' addresses).
@@ -138,9 +177,10 @@ func ll(t *ast.Type) string {
     case ast.TK.Bool: return "i1";
     case ast.TK.Int: return "i" + itoa(u.bits);
     case ast.TK.Float: return u.bits == 32 ? "float" : "double";
-    case ast.TK.Interface, ast.TK.Func, ast.TK.Union: return "{ptr, ptr}";
+    case ast.TK.Interface, ast.TK.Func, ast.TK.Union, ast.TK.Family: return "{ptr, ptr}";
     case ast.TK.Void: return "void";
     }
+    if (u.kind == ast.TK.Buffer && nilT(u.elem)) return "{ptr, ptr}";
     return "ptr";
 }
 
@@ -153,8 +193,9 @@ func zeroLit(t *ast.Type) string {
     case ast.TK.Bool: return "false";
     case ast.TK.Int: return "0";
     case ast.TK.Float: return "0.0";
-    case ast.TK.Interface, ast.TK.Func, ast.TK.Union: return "zeroinitializer";
+    case ast.TK.Interface, ast.TK.Func, ast.TK.Union, ast.TK.Family: return "zeroinitializer";
     }
+    if (u.kind == ast.TK.Buffer && nilT(u.elem)) return "zeroinitializer";
     return "null";
 }
 
@@ -162,7 +203,7 @@ func zeroLit(t *ast.Type) string {
 func owned(g *Gen, t *ast.Type) bool {
     u := under(t);
     k := u.kind;
-    if (k != ast.TK.Struct && k != ast.TK.Enum && k != ast.TK.Array && k != ast.TK.Tuple && k != ast.TK.Buffer) return k == ast.TK.Dyn || k == ast.TK.Map;
+    if (k != ast.TK.Struct && k != ast.TK.Enum && k != ast.TK.Array && k != ast.TK.Tuple && k != ast.TK.Buffer) return k == ast.TK.Dyn || k == ast.TK.Map || k == ast.TK.String || k == ast.TK.Interface || k == ast.TK.Union;
     key := check.TypeKey(u);
     v, ok := g.ownedMemo[key];
     if (ok) return v;
@@ -173,8 +214,8 @@ func owned(g *Gen, t *ast.Type) bool {
 }
 func owned1(g *Gen, u *ast.Type) bool {
     switch (u.kind) {
-    case ast.TK.Dyn, ast.TK.Map: return true;
-    case ast.TK.Array: return owned(g, u.elem);
+    case ast.TK.Dyn, ast.TK.Map, ast.TK.String, ast.TK.Interface, ast.TK.Union: return true;
+    case ast.TK.Array: return u.len < 0 || owned(g, u.elem);
     case ast.TK.Buffer: return u.len > 0 && owned(g, u.elem);
     case ast.TK.Struct:
         for (_, f := range g.c.FieldsOf(u)) { if (owned(g, f.ty)) return true; }
@@ -251,8 +292,10 @@ func alloca(g *Gen, t *ast.Type) string {
         sz := sizeOf(g, t); al := alignOf(g, t);
         if (sz == 0) sz = 1;
         g.fn.allocas.Add("  ").Add(r).Add(" = alloca [").AddInt(sz).Add(" x i8], align ").AddInt(al < 1 ? 1 : al).Add("\n");
+        if (owned(g, t)) g.fn.allocas.Add("  call void @llvm.memset.p0.i64(ptr ").Add(r).Add(", i8 0, i64 ").AddInt(sz).Add(", i1 false)\n");
     } else {
         g.fn.allocas.Add("  ").Add(r).Add(" = alloca ").Add(ll(t)).Add(", align 8\n");
+        if (owned(g, t)) g.fn.allocas.Add("  store ").Add(ll(t)).Add(" ").Add(zeroLit(t)).Add(", ptr ").Add(r).Add("\n");
     }
     return r;
 }
@@ -298,23 +341,114 @@ func load(g *Gen, t *ast.Type, p string) V {
     return v;
 }
 // store writes v (already of type t) to p.
+// store moves v into the storage at p (a registered temporary is consumed).
 func store(g *Gen, t *ast.Type, p string, v V) {
+    consume(g, v);
+    storeRaw(g, t, p, v);
+}
+func storeRaw(g *Gen, t *ast.Type, p string, v V) {
     if (isAgg(t)) { memcpy(g, p, v.r, sizeOf(g, t)); return; }
     emit(g, "store " + ll(t) + " " + v.r + ", ptr " + p);
 }
 func storeVolatile(g *Gen, t *ast.Type, p string, v V) {
+    consume(g, v);
     if (isAgg(t)) { memcpy(g, p, v.r, sizeOf(g, t)); return; }
     emit(g, "store volatile " + ll(t) + " " + v.r + ", ptr " + p);
 }
 
 func mkV(r string, t *ast.Type) V { v: V; v.r = r; v.t = t; return v; }
-func freshV(r string, t *ast.Type) V { v: V; v.r = r; v.t = t; v.fresh = true; return v; }
+func freshNoTemp(r string, t *ast.Type) V { v: V; v.r = r; v.t = t; v.fresh = true; return v; }
+
+// freshV creates a fresh owned value; owned temporaries are registered so they
+// are released at the end of the statement unless moved.
+func freshV(g *Gen, r string, t *ast.Type) V {
+    v := freshNoTemp(r, t);
+    if (nilT(t) || !owned(g, t) || !g.trackTemps) return v;
+    slot := r;
+    if (!isAgg(t)) {
+        slot = tempSlot(g, t);
+        storeRaw(g, t, slot, v);
+    }
+    tp := new(Temp);
+    tp.slot = slot; tp.t = t;
+    g.fn.temps.append(tp);
+    v.tmp = len(g.fn.temps);
+    return v;
+}
+
+// tempSlot is a zero-initialized (at function entry) slot for a temporary.
+func tempSlot(g *Gen, t *ast.Type) string {
+    r := tmp(g);
+    g.fn.allocas.Add("  ").Add(r).Add(" = alloca ").Add(ll(t)).Add(", align 8\n");
+    g.fn.allocas.Add("  store ").Add(ll(t)).Add(" ").Add(zeroLit(t)).Add(", ptr ").Add(r).Add("\n");
+    return r;
+}
+
+func consume(g *Gen, v V) {
+    if (v.tmp > 0 && v.tmp <= len(g.fn.temps)) g.fn.temps[v.tmp - 1].dead = true;
+}
+
+// dropTemps releases live temporaries registered at index mark or later.
+func dropTemps(g *Gen, mark int, forget bool) {
+    if (!g.fn.terminated) {
+        for (i := len(g.fn.temps) - 1; i >= mark; i--) {
+            tp := g.fn.temps[i];
+            if (!tp.dead) emit(g, "call void @oc_drop(ptr " + tp.slot + ", ptr " + desc(g, tp.t) + ")");
+        }
+    }
+    if (forget) { for (len(g.fn.temps) > mark) { g.fn.temps[len(g.fn.temps) - 1].dead = true; g.fn.temps.pop(); } }
+}
+
+func pushScope(g *Gen) { g.fn.scopes.append(make([]*Local)); }
+func dropScope(g *Gen, i int) {
+    sc := g.fn.scopes[i];
+    for (k := len(sc) - 1; k >= 0; k--) emit(g, "call void @oc_drop(ptr " + sc[k].slot + ", ptr " + desc(g, sc[k].t) + ")");
+}
+// popScope releases a block's locals on normal exit. Functions with defers keep
+// them until the epilogue (deferred calls may still refer to them).
+func popScope(g *Gen) {
+    if (!g.fn.terminated && !g.fn.hasDefer) dropScope(g, len(g.fn.scopes) - 1);
+    g.fn.scopes.pop();
+}
+// dropScopesTo releases scopes at depth or deeper (for jumps out of them).
+func dropScopesTo(g *Gen, depth int) {
+    if (g.fn.terminated || g.fn.hasDefer) return;
+    for (i := len(g.fn.scopes) - 1; i >= depth; i--) dropScope(g, i);
+}
+// dropAllLocals releases every owned local of the function (epilogue). Slots
+// already released are zero, so dropping again is harmless.
+func dropAllLocals(g *Gen) {
+    for (k := len(g.fn.allLocals) - 1; k >= 0; k--) {
+        l := g.fn.allLocals[k];
+        emit(g, "call void @oc_drop(ptr " + l.slot + ", ptr " + desc(g, l.t) + ")");
+    }
+}
+func ownLocal(g *Gen, slot string, t *ast.Type) {
+    if (!g.trackTemps || !owned(g, t)) return;
+    l := new(Local); l.slot = slot; l.t = t;
+    g.fn.allLocals.append(l);
+    if (len(g.fn.scopes) > 0) g.fn.scopes[len(g.fn.scopes) - 1].append(l);
+}
+// ownedLocal allocates storage for a local that owns its value.
+func ownedLocal(g *Gen, s *ast.Symbol, t *ast.Type) string {
+    p := localStorage(g, s, t);
+    if (!s.captured) ownLocal(g, p, t);
+    return p;
+}
+
+// storeReplace releases the value held at p, then moves v into it.
+func storeReplace(g *Gen, t *ast.Type, p string, v V) {
+    if (g.trackTemps && owned(g, t)) emit(g, "call void @oc_drop(ptr " + p + ", ptr " + desc(g, t) + ")");
+    store(g, t, p, v);
+}
+// stored is the value of an assignment expression: it aliases the target.
+func stored(v V) V { return mkV(v.r, v.t); }
 
 // spill materializes a scalar into memory and returns its address.
 func spill(g *Gen, v V) string {
     if (isAgg(v.t)) return v.r;
     p := alloca(g, v.t);
-    store(g, v.t, p, v);
+    storeRaw(g, v.t, p, v);
     return p;
 }
 
@@ -328,7 +462,7 @@ func zeroV(g *Gen, t *ast.Type) V {
     if (!isAgg(t)) return mkV(zeroLit(t), t);
     p := alloca(g, t);
     zeroInto(g, t, p);
-    return freshV(p, t);
+    return freshV(g, p, t);
 }
 
 // copyV returns an independent copy of v (deep for owned contents).
@@ -338,7 +472,7 @@ func copyV(g *Gen, v V) V {
         if (isAgg(t) && !v.fresh) {
             p := alloca(g, t);
             memcpy(g, p, v.r, sizeOf(g, t));
-            return freshV(p, t);
+            return freshV(g, p, t);
         }
         return v;
     }
@@ -346,21 +480,31 @@ func copyV(g *Gen, v V) V {
     if (u.kind == ast.TK.Dyn) {
         r := tmp(g);
         emit(g, r + " = call ptr @oc_arr_copy(ptr " + v.r + ", ptr " + desc(g, u.elem) + ")");
-        return freshV(r, t);
+        return freshV(g, r, t);
+    }
+    if (u.kind == ast.TK.String) {
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_str_copy(ptr " + v.r + ")");
+        return freshV(g, r, t);
+    }
+    if (u.kind == ast.TK.Interface || u.kind == ast.TK.Union) {
+        p := spill(g, v);
+        q := tmpSlotCopy(g, t, p);
+        return freshV(g, q, t);
     }
     if (u.kind == ast.TK.Map) {
         r := tmp(g);
         emit(g, r + " = call ptr @oc_map_copy(ptr " + v.r + ")");
-        return freshV(r, t);
+        return freshV(g, r, t);
     }
     if (u.kind == ast.TK.Array && u.len < 0) {
         r := tmp(g);
         emit(g, r + " = call ptr @oc_block_copy(ptr " + v.r + ", ptr " + desc(g, u.elem) + ")");
-        return freshV(r, t);
+        return freshV(g, r, t);
     }
     p := alloca(g, t);
     emit(g, "call void @oc_copy(ptr " + p + ", ptr " + v.r + ", ptr " + desc(g, t) + ")");
-    return freshV(p, t);
+    return freshV(g, p, t);
 }
 
 // ---- constants ----
@@ -379,13 +523,12 @@ func quoteBytes(s string) string {
 
 // strConst returns a global holding an Ocean string header (null for "").
 func strConst(g *Gen, s string) string {
-    if (len(s) == 0) return "null";
     name, ok := g.strs[s];
     if (ok) return name;
     g.nstr++;
     name = "@oc.str." + itoa(g.nstr);
-    g.globals.Add(name).Add(".data = private unnamed_addr constant [").AddInt(len(s)).Add(" x i8] ").Add(quoteBytes(s)).Add("\n");
-    g.globals.Add(name).Add(" = private unnamed_addr constant {i64, i64, ptr} {i64 ").AddInt(len(s)).Add(", i64 ").AddInt(len(s)).Add(", ptr ").Add(name).Add(".data}\n");
+    g.globals.Add(name).Add(".data = private unnamed_addr constant [").AddInt(len(s) + 1).Add(" x i8] ").Add(quoteBytes(s + "\x00")).Add("\n");
+    g.globals.Add(name).Add(" = private unnamed_addr constant {i64, i64, ptr} {i64 ").AddInt(len(s)).Add(", i64 -1, ptr ").Add(name).Add(".data}\n");
     g.strs[s] = name;
     return name;
 }
@@ -459,4 +602,26 @@ func fail(g *Gen, n *ast.Node, msg string) {
     g.errors++;
     if (nilN(n)) { util.Stderr("backend error: " + msg + "\n"); return; }
     util.Stderr("[" + n.src.path + ":" + itoa(n.line) + ":" + itoa(n.col) + "]: backend error: " + msg + "\n");
+}
+
+// homogeneous reports non-mixed dynamic arrays of interface elements.
+func homogeneous(t *ast.Type) bool {
+    u := under(t);
+    return u.kind == ast.TK.Dyn && !u.isMixed && isBoxed(u.elem);
+}
+
+// homCheckSlot verifies a homogeneous array stored at slot (range [start, start+count)).
+func homCheckSlot(g *Gen, t *ast.Type, slot string, start string, count string) {
+    if (!homogeneous(t)) return;
+    a := tmp(g); emit(g, a + " = load ptr, ptr " + slot);
+    emit(g, "call void @oc_hom_range(ptr " + a + ", i64 " + start + ", i64 " + count + ")");
+}
+
+// tmpSlotCopy deep-copies a boxed pair stored at p and returns the new pair value.
+func tmpSlotCopy(g *Gen, t *ast.Type, p string) string {
+    q := alloca(g, t);
+    emit(g, "call void @oc_copy(ptr " + q + ", ptr " + p + ", ptr " + desc(g, t) + ")");
+    r := tmp(g);
+    emit(g, r + " = load {ptr, ptr}, ptr " + q);
+    return r;
 }

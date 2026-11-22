@@ -70,14 +70,19 @@ func funcRef(g *Gen, s *ast.Symbol, targs []*ast.Type) string {
     inst = new(Inst);
     inst.sym = s; inst.node = s.node;
     inst.env = check.MakeEnv(s.typeParams, args);
-    pkgPart := "";
-    if (!nilPkgB(s.pkg)) pkgPart = s.pkg.name + ".";
-    inst.name = "@\"" + mangle(pkgPart + s.name + "." + itoa(s.id) + argsKey(args)) + "\"";
+    // ocean-c's naming: ocean.__pkg<N>_<name>
+    unique := s.name == "init" || s.name == "_" ? "." + itoa(s.id) : "";
+    inst.name = "@\"" + mangle("ocean." + pkgPrefix(s.pkg) + s.name + unique + argsKey(args)) + "\"";
     g.funcs[key] = inst;
     enqueue(g, inst);
     return inst.name;
 }
 func nilPkgB(p *ast.Package) bool { return (p -> int) == 0; }
+func pkgPrefix(p *ast.Package) string {
+    if (nilPkgB(p)) return "";
+    if (p.id < 0) return "__builtin_";
+    return "__pkg" + itoa(p.id) + "_";
+}
 
 // methodRef instantiates method m for a concrete receiver type and method type arguments.
 func methodRef(g *Gen, m *ast.Symbol, recv *ast.Type, targs []*ast.Type) string {
@@ -93,7 +98,7 @@ func methodRef(g *Gen, m *ast.Symbol, recv *ast.Type, targs []*ast.Type) string 
     env := check.MakeEnv(m.recvParams, base.args);
     inst.env = env.Extend(m.typeParams, margs);
     owner := m.owner.name;
-    inst.name = "@\"" + mangle(m.pkg.name + "." + owner + "." + m.name + "." + itoa(m.id) + argsKey(base.args) + argsKey(margs)) + "\"";
+    inst.name = "@\"" + mangle("ocean.method." + pkgPrefix(m.pkg) + owner + "." + m.name + "." + itoa(m.id) + argsKey(base.args) + argsKey(margs)) + "\"";
     g.funcs[key] = inst;
     enqueue(g, inst);
     return inst.name;
@@ -108,6 +113,21 @@ func thunkFor(g *Gen, m *ast.Symbol, base *ast.Type, ptrBox bool) string {
     inst.sym = m; inst.node = m.node; inst.kind = 2; inst.thunkPtr = ptrBox; inst.recvType = base;
     inst.env = check.MakeEnv(m.recvParams, base.args);
     inst.name = "@\"" + mangle("thunk." + m.owner.name + "." + m.name + "." + itoa(m.id) + check.TypeKey(base) + (ptrBox ? "*" : "")) + "\"";
+    g.funcs[key] = inst;
+    enqueue(g, inst);
+    return inst.name;
+}
+
+// genericThunkFor adapts a boxed receiver to an instantiation of a generic method.
+func genericThunkFor(g *Gen, m *ast.Symbol, base *ast.Type, ptrBox bool, targs []*ast.Type) string {
+    key := "TG" + itoa(m.id) + "|" + check.TypeKey(base) + (ptrBox ? "*" : "") + argsKey(targs);
+    inst, ok := g.funcs[key];
+    if (ok) return inst.name;
+    inst = new(Inst);
+    inst.sym = m; inst.node = m.node; inst.kind = 2; inst.thunkPtr = ptrBox; inst.recvType = base; inst.targs = targs;
+    env := check.MakeEnv(m.recvParams, base.args);
+    inst.env = env.Extend(m.typeParams, targs);
+    inst.name = "@\"" + mangle("thunk." + m.owner.name + "." + m.name + "." + itoa(m.id) + check.TypeKey(base) + (ptrBox ? "*" : "") + argsKey(targs)) + "\"";
     g.funcs[key] = inst;
     enqueue(g, inst);
     return inst.name;
@@ -274,6 +294,7 @@ func emitInst(g *Gen, inst *Inst) {
     // epilogue
     label(g, "exit");
     if (f.hasDefer) emit(g, "call void @oc_run_defers(ptr " + f.frame + ")");
+    dropAllLocals(g);
     br(g, "finish");
     if (f.hasDefer) { g.fn.body.Add("recovered:\n"); f.terminated = false; br(g, "finish"); }
     label(g, "finish");
@@ -295,10 +316,10 @@ func bindParam(g *Gen, s *ast.Symbol, t *ast.Type, arg string) {
         if (s.captured) {
             cell := localStorage(g, s, t);
             memcpy(g, cell, arg, sizeOf(g, t));
-        } else g.fn.locals[s.id] = arg;
+        } else { g.fn.locals[s.id] = arg; ownLocal(g, arg, t); }
         return;
     }
-    slot := localStorage(g, s, t);
+    slot := ownedLocal(g, s, t);
     emit(g, "store " + ll(t) + " " + arg + ", ptr " + slot);
 }
 
@@ -372,7 +393,7 @@ func emitThunk(g *Gen, inst *Inst) {
     }
     args += ", " + recv;
     for (i, p := range ft.params) args += ", " + paramLL(sub(g, p)) + " %p" + itoa(i);
-    callee := methodRef(g, m, base, make([]*ast.Type));
+    callee := methodRef(g, m, base, inst.targs);
     rl := retLL(g, resultTypes);
     if (rl == "void") { emit(g, "call void " + callee + "(" + args + ")"); term(g, "ret void"); }
     else { r := tmp(g); emit(g, r + " = call " + rl + " " + callee + "(" + args + ")"); term(g, "ret " + rl + " " + r); }

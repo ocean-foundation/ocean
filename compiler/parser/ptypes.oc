@@ -1,6 +1,7 @@
 package parser;
 import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
+import "github.com/ocean-foundation/ocean/compiler/legacy";
 
 // constraint = ['~'] Type { '|' ['~'] Type }
 func constraint(p *Parser) *ast.Node {
@@ -39,10 +40,11 @@ func varintType(p *Parser) *ast.Node {
     n.flag = is(p, scanner.Kind.KwVarint);
     signed := n.flag;
     next(p);
-    if (!accept(p, scanner.Kind.LParen)) { err(p, "Expected '(' after varint"); return n; }
-    if (!is(p, scanner.Kind.Int) || tok(p).isChar) { err(p, "varint width must be an integer literal from 1 through 8388608"); return n; }
+    if (!accept(p, scanner.Kind.LParen)) { kw := signed ? "varint" : "varuint"; err(p, kw + " requires a bit width: " + kw + "(n)"); return n; }
+    kwName := signed ? "varint" : "varuint";
+    if (!is(p, scanner.Kind.Int) || tok(p).isChar) { err(p, kwName + " width must be an integer literal from 1 to 8388608"); return n; }
     w := smallInt(tok(p).text);
-    if (w < 1 || w > 8388608) { err(p, "varint width must be an integer literal from 1 through 8388608"); return n; }
+    if (w < 1 || w > 8388608) { err(p, kwName + " width must be from 1 to 8388608"); return n; }
     n.ival = w;
     next(p);
     if (!accept(p, scanner.Kind.RParen)) {
@@ -80,8 +82,14 @@ func typ1(p *Parser) *ast.Node {
     if (k == scanner.Kind.LBrack) return arrayType(p);
     if (k == scanner.Kind.KwMixed) {
         n := node(p, ast.NK.TMixed);
+        start := p.pos;
         next(p);
-        if (!is(p, scanner.Kind.LBrack) || peek(p, 1) != scanner.Kind.RBrack) { err(p, "mixed must precede a dynamic array type"); return n; }
+        if (!is(p, scanner.Kind.LBrack) || peek(p, 1) != scanner.Kind.RBrack) {
+            r := legacy.TypeRewrite(&p.toks, start, p.src.text, true);
+            if (r.ok && !p.fix) { t := p.toks[start]; errTok(p, t, t.col, legacy.Message(r.text, r.kinds)); return n; }
+            if (r.ok && p.fix) { recordFix(p, start, r); return n; }
+            at := p.toks[start + 2 < len(p.toks) ? start + 2 : start + 1]; errTok(p, at, at.col, "mixed requires an array type []T"); return n;
+        }
         n.a = arrayType(p);
         return finish(p, n);
     }
@@ -105,6 +113,7 @@ func typ1(p *Parser) *ast.Node {
     if (k == scanner.Kind.Ident && tok(p).text == "buffer") return bufferType(p, false);
     if (k == scanner.Kind.Ident && tok(p).text == "map" && peek(p, 1) == scanner.Kind.LBrack) return mapType(p);
     if (k == scanner.Kind.Ident || k == scanner.Kind.KwAny) return namedType(p);
+    if (k == scanner.Kind.LParen) { err(p, "Expected function signature type"); return node(p, ast.NK.Bad); }
     err(p, "Expected type name");
     return node(p, ast.NK.Bad);
 }
@@ -146,7 +155,7 @@ func mapType(p *Parser) *ast.Node {
     if (is(p, scanner.Kind.RBrack)) { err(p, "Expected map key type"); return n; }
     n.a = typ(p);
     if (!accept(p, scanner.Kind.RBrack)) { err(p, "Expected closing map bracket"); return n; }
-    n.b = typ(p);
+    n.b = typeChecked(p);
     return finish(p, n);
 }
 
@@ -177,6 +186,7 @@ func bufferType(p *Parser, expr bool) *ast.Node {
     next(p);
     if (!is(p, scanner.Kind.Lt)) return finish(p, n);
     next(p);
+    if (is(p, scanner.Kind.Gt)) { err(p, "Expected type argument"); return n; }
     n.a = typ(p);
     if (accept(p, scanner.Kind.Comma)) n.b = additive(p);
     if (!closeAngle(p)) { err(p, "Expected '>' after buffer type arguments"); return n; }

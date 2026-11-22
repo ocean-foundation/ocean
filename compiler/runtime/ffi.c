@@ -45,6 +45,7 @@ static void promote(const OcAny *a, int64_t *kind, uint64_t *value) {
         memcpy(value, &d, 8); *kind = 3; return;
     }
     if (t->kind == K_STRING) { *kind = 5; *value = (uint64_t)(uintptr_t)oc_str_cdata(*(OcArr **)a->data); return; }
+    if (t->kind == K_BUFFER) { *kind = 5; *value = (uint64_t)(uintptr_t)a->data; return; }
     *kind = 5;
     memcpy(value, a->data, 8);
 }

@@ -22,12 +22,17 @@ func compositeExpr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
         if (isType && (et.kind == ast.TK.Enum || et.kind == ast.TK.Family)) return enumRecord(c, n, et, expected);
     }
     t, isType := typeOfExpr(c, n.a);
+    if (!isType && n.a.kind == ast.NK.Member && n.a.a.kind == ast.NK.Ident) {
+        // a package-qualified prefix reports missing or unexported names
+        ps := lookup(c, n.a.a.name);
+        if (!nilS(ps) && ps.kind == ast.SK.Package && nilS(packageMember(c, n.a, ps.importPkg, n.a.name))) return tInvalid;
+    }
     if (!isType) {
-        if (n.a.kind == ast.NK.Ident && nilS(lookup(c, n.a.name))) { err(c, n.a, "unresolved type: " + n.a.name); return tInvalid; }
         err(c, n, "literal prefix must name an array, buffer, or struct type");
         return tInvalid;
     }
     if (t.kind == ast.TK.Invalid) return tInvalid;
+    if (t.kind == ast.TK.Enum || (t.kind == ast.TK.Family && t.sym.kind == ast.SK.Enum)) { err(c, n, "construct an enum through a qualified variant"); return tInvalid; }
     if (t.kind == ast.TK.Array && t.len == -3) {
         t = ArrayOf(t.elem, len(n.list));
     }
@@ -54,7 +59,7 @@ func literalOf(c *Checker, n *ast.Node, t *ast.Type) *ast.Type {
     case ast.TK.Array, ast.TK.Dyn, ast.TK.Buffer:
         if (u.kind == ast.TK.Buffer && nilT(u.elem)) { err(c, n, "zero requires a concrete buffer element type"); return tInvalid; }
         if (u.kind == ast.TK.Buffer && u.len == -1) { err(c, n, "runtime-sized buffers cannot have initializers"); return tInvalid; }
-        if (u.kind == ast.TK.Array && u.len == -1) { err(c, n, "runtime-sized arrays cannot have initializers"); return tInvalid; }
+
         if (u.kind == ast.TK.Array && u.len == -2) { err(c, n, "array<T> cannot instantiate an array; use T[n]"); return tInvalid; }
         for (_, e := range n.list) {
             if (!nilN(e.a)) { err(c, e, "array and buffer literals require positional elements"); return t; }
@@ -111,6 +116,7 @@ func structLiteral(c *Checker, n *ast.Node, t *ast.Type, fields []*ast.FieldInfo
             if (seen[idx]) { err(c, e, "duplicate struct field initializer"); continue; }
             seen[idx] = true;
             e.ival = idx;
+            if (t.kind == ast.TK.Struct) refField(c, e.a.src, e.a.line, e.a.col, t.sym, e.a.name, fields[idx].ty, false);
             checkElem(c, e.b, fields[idx].ty);
         }
     } else {
@@ -140,6 +146,7 @@ func enumRecord(c *Checker, n *ast.Node, et *ast.Type, expected *ast.Type) *ast.
     n.sem = ast.Sem.CallEnum; n.ival = v.index; n.tyAlt = et;
     n.a.sem = ast.Sem.EnumSelector; n.a.ty = et; n.a.ival = v.index;
     structLiteral(c, n, et, v.fields);
+    if (len(n.list) < len(v.fields)) err(c, v.node, "missing struct parameter initializer");
     return et;
 }
 
@@ -162,6 +169,10 @@ func assertExpr(c *Checker, n *ast.Node) *ast.Type {
     xt := valueExpr(c, n.a);
     if (xt.kind == ast.TK.Invalid) return tInvalid;
     if (xt.kind == ast.TK.Enum) return extractExpr(c, n, xt);
+    if (n.b.kind == ast.NK.Member) {
+        et, isType := typeOfExpr(c, n.b.a);
+        if (isType && (et.kind == ast.TK.Enum || et.kind == ast.TK.Family)) { err(c, n, "enum extraction requires a value of the same enum"); return tInvalid; }
+    }
     target := resolveTypeOrUnion(c, n.b);
     n.tyAlt = target;
     if (xt.kind != ast.TK.Interface && xt.kind != ast.TK.Union && xt.kind != ast.TK.Param && xt.kind != ast.TK.Family &&
@@ -219,6 +230,7 @@ func extractExpr(c *Checker, n *ast.Node, xt *ast.Type) *ast.Type {
 func castExpr(c *Checker, n *ast.Node) *ast.Type {
     target := resolveTypeOrFamily(c, n.b);
     n.tyAlt = target;
+    checkLenNodes(c, target);
     st := expr(c, n.a, zero(*ast.Type));
     if (target.kind == ast.TK.Invalid || st.kind == ast.TK.Invalid) return target;
     if (st.kind == ast.TK.UntypedInt) {
@@ -227,7 +239,7 @@ func castExpr(c *Checker, n *ast.Node) *ast.Type {
         if (u.kind == ast.TK.Int && litFits(l, u.bits, u.signed)) { setLitType(c, n.a, u); return target; }
         if (u.kind == ast.TK.Float) {
             setLitType(c, n.a, u);
-            if (u.bits == 32 && l.mag.BitLen() > 128) warn(c, n, "integer literal is out of range for f32 and becomes infinity; cast it with ->f64 if that is intended");
+            if (u.bits == 32) warnLiteralInfinity(c, n, l, 32);
             return target;
         }
         st = defaultType(c, n.a, st);
@@ -265,7 +277,8 @@ func zeroExpr(c *Checker, n *ast.Node) *ast.Type {
     n.tyAlt = t;
     if (t.kind == ast.TK.Void) { err(c, n, "void has no value representation"); return tInvalid; }
     if (IsAny(t) && n.a.kind == ast.NK.Ident && n.a.name == "any") { err(c, n, "zero requires a storage type or a type parameter, not any"); return tInvalid; }
-    if (t.kind == ast.TK.Buffer && (nilT(t.elem) || t.len == -1)) { err(c, n, "zero requires a fixed-size buffer type; use buffer<T, N> or buffer<T>"); return tInvalid; }
+    if (t.kind == ast.TK.Buffer && nilT(t.elem)) { err(c, n, "zero requires a concrete buffer element type"); return tInvalid; }
+    if (t.kind == ast.TK.Buffer && t.len == -1) { err(c, n, "zero requires a fixed-size buffer type; use buffer<T, N> or buffer<T>"); return tInvalid; }
     if (t.kind == ast.TK.Array && (t.len == -2 || t.len == -1)) { err(c, n, "array<T> cannot instantiate an array; use T[n]"); return tInvalid; }
     if (t.kind == ast.TK.Family) { err(c, n, "struct literals require concrete type arguments"); return tInvalid; }
     return t;
@@ -274,9 +287,12 @@ func zeroExpr(c *Checker, n *ast.Node) *ast.Type {
 func newExpr(c *Checker, n *ast.Node) *ast.Type {
     t := resolveTypeOrFamily(c, n.a);
     n.tyAlt = t;
-    if (t.kind == ast.TK.Void || (t.kind == ast.TK.Array && t.len < 0) || t.kind == ast.TK.Family || (t.kind == ast.TK.Buffer && t.len <= 0)) {
+    if (t.kind == ast.TK.Array && t.len == -2) { err(c, n, "array<T> cannot instantiate an array; use T[n]"); return tInvalid; }
+    runtimeSized := t.kind == ast.TK.Array && t.len == -1 && !nilN(t.lenNode);
+    if (t.kind == ast.TK.Void || (t.kind == ast.TK.Array && t.len < 0 && !runtimeSized) || t.kind == ast.TK.Family || (t.kind == ast.TK.Buffer && t.len <= 0)) {
         err(c, n, "new requires a storage type"); return tInvalid;
     }
+    checkLenNodes(c, t);
     return PtrTo(t);
 }
 
@@ -306,7 +322,7 @@ func arrayAllocExpr(c *Checker, n *ast.Node) *ast.Type {
     if (!IsInteger(n.b.ty) && n.b.ty.kind != ast.TK.Invalid) err(c, n.b, "invalid allocation length");
     l := intLiteral(c, n.b);
     if (l.ok && l.neg) err(c, n, "array item count must not be negative");
-    if (IsInterface(e) && !IsAny(e)) { err(c, n, "interface array allocation requires a concrete element type; use an array literal"); }
+    if (IsInterface(e) && !IsAny(e) && !(l.ok && l.mag.IsZero())) { err(c, n, "interface array allocation requires a concrete element type; use an array literal"); }
     n.tyAlt = e;
     return DynOf(e);
 }
@@ -318,7 +334,9 @@ func bufferAllocExpr(c *Checker, n *ast.Node) *ast.Type {
     if (isUntyped(lt)) defaultType(c, n.b, lt);
     if (!IsInteger(n.b.ty) && n.b.ty.kind != ast.TK.Invalid) err(c, n.b, "invalid runtime buffer size");
     n.tyAlt = e;
-    return BufferOf(e, -2);
+    t := BufferOf(e, -1);
+    t.lenNode = n.b;
+    return t;
 }
 
 // ---- function literals ----
@@ -335,6 +353,7 @@ func funcLit(c *Checker, n *ast.Node) *ast.Type {
     push(c);
     c.scope.isFunc = true;
     declareParams(c, n.list, n.list2, f);
+    span(c, n.b);
     funcBody(c, n.b, f);
     pop(c);
     c.fn = saved;
@@ -348,6 +367,7 @@ func declareParams(c *Checker, params []*ast.Node, results []*ast.Node, f *FuncC
         s := newSym(c, ast.SK.Var, p.name, p);
         s.param = true; s.ty = p.ty;
         p.sym = s;
+        declRef(c, p.src, p.nameLine > 0 ? p.nameLine : p.line, p.nameLine > 0 ? p.nameCol : p.col, s, p.ty);
         declare(c, s, p);
     }
     for (_, r := range results) {
@@ -368,3 +388,14 @@ func declareParams(c *Checker, params []*ast.Node, results []*ast.Node, f *FuncC
 }
 
 func isScanKind(c *Checker, k scanner.Kind) bool { return k == scanner.Kind.EOF; }
+
+// checkLenNodes types the runtime length expressions of (nested) array types.
+func checkLenNodes(c *Checker, t *ast.Type) {
+    for (at := t; !nilT(at) && (at.kind == ast.TK.Array || at.kind == ast.TK.Buffer); at = at.elem) {
+        if (at.len == -1 && !nilN(at.lenNode) && nilT(at.lenNode.ty)) {
+            lt := expr(c, at.lenNode, tInt);
+            if (isUntyped(lt)) lt = defaultType(c, at.lenNode, lt);
+            if (!IsInteger(lt) && lt.kind != ast.TK.Invalid) mismatch(c, at.lenNode, tInt, lt);
+        }
+    }
+}

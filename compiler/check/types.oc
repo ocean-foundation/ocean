@@ -100,7 +100,7 @@ func IsInteger(t *ast.Type) bool { return Underlying(t).kind == ast.TK.Int; }
 func IsFloating(t *ast.Type) bool { return Underlying(t).kind == ast.TK.Float; }
 func IsNumeric(t *ast.Type) bool { k := Underlying(t).kind; return k == ast.TK.Int || k == ast.TK.Float; }
 func IsInterface(t *ast.Type) bool { return t.kind == ast.TK.Interface; }
-func IsAny(t *ast.Type) bool { return t.kind == ast.TK.Interface && nilS(t.sym) && len(t.methods) == 0; }
+func IsAny(t *ast.Type) bool { return t.kind == ast.TK.Interface && nilS(t.sym) && len(t.methods) == 0 && len(t.terms) == 0; }
 func IsVoidPtr(t *ast.Type) bool { return t.kind == ast.TK.Ptr && t.elem.kind == ast.TK.Void; }
 func IsOptional(t *ast.Type) bool { return t.kind == ast.TK.Enum && t.sym.builtin && t.sym.name == "Optional"; }
 func IsResult(t *ast.Type) bool { return t.kind == ast.TK.Enum && t.sym.builtin && t.sym.name == "Result"; }
@@ -229,7 +229,7 @@ func TypeString(t *ast.Type) string {
     case ast.TK.Union:
         s := "";
         for (i, term := range t.terms) {
-            if (i > 0) s += " | ";
+            if (i > 0) s += "|";
             if (t.tilde[i]) s += "~";
             s += TypeString(term);
         }

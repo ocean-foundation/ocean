@@ -18,6 +18,7 @@ struct Program {
     order []*ast.Package;
     fatal bool;
     usesFFI bool;
+    usesCurl bool;
 }
 
 func builtinPackage(diags *diag.List) *ast.Package {

@@ -114,7 +114,12 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
     }
     reportBuf := zero(*util.Buf); jsonBuf := zero(*util.Buf);
     if (reportPath != "") reportBuf = util.NewBuf();
-    if (jsonPath != "") jsonBuf = util.NewBuf();
+    jsonFD := -1;
+    if (jsonPath != "") {
+        jsonBuf = util.NewBuf();
+        jsonFD = util.OpenTrunc(jsonPath);
+        if (jsonFD < 0) { util.Stderr("ocean test: result file: could not open " + jsonPath + "\n"); return 1; }
+    }
     childArgs := []string{loader.Executable(), "test", "--internal-test-package"};
     for (i := 0; i < len(flags); i++) {
         f := flags[i];
@@ -122,15 +127,32 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
         childArgs.append(f);
     }
     childArgs.append("--json", "--notty");
+    // live shared display: every package's events go to one "packages" frontend
+    ui := newReporter();
+    ui.pkg = "packages"; ui.color = color; ui.includeSkipped = includeSkipped;
+    tmpDir := "";
+    if (isTerminalOk(false, json) && !notty) {
+        d, tok := util.MakeTempDir(".ocean-packages-");
+        if (tok) {
+            tmpDir = d;
+            exe := buildDisplay(tmpDir);
+            if (exe != "") startDisplay(ui, exe);
+            else util.Stderr("ocean test: live display unavailable; using final report\n");
+        }
+    }
+    util.BlockSignals();
+    interrupted := 0;
+    cancelled := 0.0;
     runs := make([]*PackageRun);
     for (_, loc := range list) {
         p := new(PackageRun);
         p.out = -1; p.errs = -1; p.grant = -1;
         r := newReporter();
         r.pkg = loader.NewBuild(newDiags()).PackageTestPath(loc);
-        r.json = json; r.jsonFile = jsonBuf; r.reportBuf = reportBuf;
+        r.json = json; r.jsonFile = jsonBuf; r.reportBuf = reportBuf; r.jsonFD = jsonFD;
         r.includePassed = includePassed; r.includeSkipped = includeSkipped;
         r.color = color && util.IsTerminal(1);
+        if (ui.displayFD >= 0) { r.displayFD = ui.displayFD; r.display = ui.display; r.multiPackage = hexEncode(r.pkg); }
         p.r = r;
         runs.append(p);
     }
@@ -138,7 +160,20 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
     status := 0;
     start := util.MonoSeconds();
     for (finished < len(runs)) {
-        for (next < len(runs) && active < workers) {
+        if (checkDisplay(ui) && interrupted == 0) interrupted = 2;
+        if (ui.displayFD < 0) { for (_, p := range runs) p.r.displayFD = -1; }
+        sig := util.PendingSignal();
+        if (sig != 0 && interrupted == 0) interrupted = sig;
+        if (interrupted != 0 && cancelled == 0.0) {
+            cancelled = util.MonoSeconds(); status = 128 + interrupted;
+            for (i := 0; i < next; i++) { if (!runs[i].finished) util.KillGroup(runs[i].pid, interrupted); }
+        }
+        if (cancelled > 0.0 && next == finished) break;
+        if (cancelled > 0.0 && util.MonoSeconds() - cancelled > 1.0) {
+            for (i := 0; i < next; i++) { if (!runs[i].finished) util.KillGroup(runs[i].pid, 9); }
+        }
+        flushDisplay(ui);
+        for (cancelled == 0.0 && next < len(runs) && active < workers) {
             p := runs[next];
             o1, o2, ok1 := util.Pipe();
             e1, e2, ok2 := util.Pipe();
@@ -152,6 +187,8 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
             util.CloseFd(o2); util.CloseFd(e2); util.CloseFd(g1);
             if (pid < 0) { util.CloseFd(o1); util.CloseFd(e1); util.CloseFd(g2); return 1; }
             p.started = util.MonoSeconds(); p.pid = pid; p.out = o1; p.errs = e1; p.grant = g2;
+            // show the package while it is still compiling
+            if (p.r.displayFD >= 0 && !p.r.displayStarted) { displaySend(p.r, "start", "", "", 0.0); p.r.displayStarted = true; }
             util.SetNonblock(g2);
             next++; active++;
         }
@@ -198,8 +235,18 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
             if (!granted) break;
         }
     }
-    packageSummary(runs[0].r, runs, util.MonoSeconds() - start);
+    if (interrupted != 0) status = 128 + interrupted;
+    stopDisplay(ui, util.MonoSeconds() - start, status);
+    if (tmpDir != "") util.RemoveAll(tmpDir);
+    util.UnblockSignals();
+    done := make([]*PackageRun);
+    for (i := 0; i < next; i++) done.append(runs[i]);
+    packageSummary(runs[0].r, done, util.MonoSeconds() - start);
     if (!ast_nilBuf(reportBuf) && !util.WriteBufFile(reportPath, reportBuf)) status = 1;
-    if (!ast_nilBuf(jsonBuf) && !util.WriteBufFile(jsonPath, jsonBuf)) status = 1;
+    if (jsonFD >= 0) {
+        bad := !util.Close(jsonFD);
+        for (_, p := range runs) { if (p.r.jsonFailed) bad = true; }
+        if (bad) status = 1;
+    }
     return status;
 }

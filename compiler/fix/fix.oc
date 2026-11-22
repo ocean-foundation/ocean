@@ -29,7 +29,7 @@ func ocFiles(dir string) []string {
 }
 
 // directoryTypes collects declared type names (token scan) and the package name.
-func directoryTypes(dir string, qualifier string, exportedOnly bool, known map[string]bool) string {
+func directoryTypes(dir string, qualifier string, exportedOnly bool, known *map[string]bool) string {
     pkgName := "";
     for (_, path := range ocFiles(dir)) {
         text, ok := util.ReadFile(path);
@@ -40,8 +40,8 @@ func directoryTypes(dir string, qualifier string, exportedOnly bool, known map[s
             if (t.kind == scanner.Kind.KwPackage && nx.kind == scanner.Kind.Ident && pkgName == "") pkgName = nx.text;
             if ((t.kind == scanner.Kind.KwStruct || t.kind == scanner.Kind.KwType || t.kind == scanner.Kind.KwEnum || t.kind == scanner.Kind.KwInterface) &&
                 nx.kind == scanner.Kind.Ident && (!exportedOnly || scanner.IsExported(nx.text))) {
-                if (qualifier != "") known[qualifier + "." + nx.text] = true;
-                else known[nx.text] = true;
+                if (qualifier != "") (*known)[qualifier + "." + nx.text] = true;
+                else (*known)[nx.text] = true;
             }
         }
     }
@@ -124,7 +124,7 @@ func stPtr(b buffer<i8>) *u32 { return ((b -> int) + 24) -> (*u32); }
 
 func fixDirectory(b *loader.Build, dir string) bool {
     known: map[string]bool;
-    directoryTypes(dir, "", false, known);
+    directoryTypes(dir, "", false, &known);
     mod := b.FindModule(dir);
     files := ocFiles(dir);
     // exported types of imported packages, under each file's import name
@@ -148,10 +148,10 @@ func fixDirectory(b *loader.Build, dir string) bool {
                 location := importDirectory(b, mod, importPath);
                 if (location != "" && util.IsDir(location) && (!hasAlias || alias != "_")) {
                     ignored: map[string]bool;
-                    declared := directoryTypes(location, "", true, ignored);
+                    declared := directoryTypes(location, "", true, &ignored);
                     slash := util.LastIndexByte(importPath, '/');
                     qualifier := hasAlias ? alias : (declared != "" ? declared : (slash >= 0 ? importPath[slash + 1:] : importPath));
-                    directoryTypes(location, qualifier == "." ? "" : qualifier, true, known);
+                    directoryTypes(location, qualifier == "." ? "" : qualifier, true, &known);
                 }
                 if (j < len(toks) && (toks[j].kind == scanner.Kind.Comma || toks[j].kind == scanner.Kind.Semi)) j++;
                 if (!group || (j < len(toks) && toks[j].kind == scanner.Kind.RParen)) break;
@@ -186,7 +186,7 @@ func fixTree(b *loader.Build, dir string) bool {
 
 // Main implements `ocean fix [location...]`.
 func Main(locations []string) int {
-    b := loader.NewBuild(quiet());
+    b := loader.NewBuild(diag.NewList());
     failed := false;
     if (len(locations) == 0) locations.append(".");
     for (_, original := range locations) {
@@ -203,5 +203,6 @@ func Main(locations []string) int {
         if (recursive) failed = fixTree(b, path) || failed;
         else failed = fixDirectory(b, path) || failed;
     }
+    if (b.Errors() > 0) failed = true;
     return failed ? 1 : 0;
 }

@@ -1,0 +1,128 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+
+// Editor index: references and scope spans recorded while checking, used by
+// the language server for hover, navigation, rename, and completion.
+
+struct Ref {
+    src *ast.Source;
+    line int;
+    col int;
+    name string;
+    key string;          // identity shared by a declaration and its uses
+    ty *ast.Type;        // value or declared type
+    decl bool;
+    sym *ast.Symbol;     // symbol, when the reference names one
+    owner *ast.Symbol;   // struct symbol for fields, enum symbol for variants
+    kind int;            // 1 var, 2 func, 3 type, 4 field, 5 method, 6 variant, 7 package
+}
+
+struct ScopeSpan { src *ast.Source; start int; end int; scope *ast.Scope; fn *FuncCtx; pkg *ast.Package; }
+
+struct Index { refs []*Ref; spans []*ScopeSpan; decls map[string]*Ref; }
+
+func (c *Checker) EnableIndex() { c.index = new(Index); }
+func (c *Checker) Index() *Index { return c.index; }
+func nilIndex(x *Index) bool { return (x -> int) == 0; }
+
+func symKind(s *ast.Symbol) int {
+    switch (s.kind) {
+    case ast.SK.Var: return 1;
+    case ast.SK.Func, ast.SK.Extern, ast.SK.BuiltinFunc: return s.owner -> int != 0 ? 5 : 2;
+    case ast.SK.Package: return 7;
+    }
+    return 3;
+}
+
+func symKey(s *ast.Symbol) string { return "s" + itoa(s.id); }
+
+func addRef(c *Checker, src *ast.Source, line int, col int, name string, key string, ty *ast.Type, decl bool, sym *ast.Symbol, kind int) *Ref {
+    if (nilIndex(c.index) || nilSrc(src) || line <= 0 || name == "") return zero(*Ref);
+    r := new(Ref);
+    r.src = src; r.line = line; r.col = col; r.name = name; r.key = key; r.ty = ty; r.decl = decl; r.sym = sym; r.kind = kind;
+    c.index.refs.append(r);
+    if (decl) c.index.decls[key] = r;
+    return r;
+}
+
+// refSym records a use of a symbol at node n (or its name position).
+func refSym(c *Checker, n *ast.Node, line int, col int, s *ast.Symbol, ty *ast.Type) {
+    if (nilIndex(c.index) || nilS(s)) return;
+    addRef(c, n.src, line, col, s.name, symKey(s), ty, false, s, symKind(s));
+}
+
+// declRef records the declaration of s at the given position.
+func declRef(c *Checker, src *ast.Source, line int, col int, s *ast.Symbol, ty *ast.Type) {
+    if (nilIndex(c.index) || nilS(s)) return;
+    addRef(c, src, line, col, s.name, symKey(s), ty, true, s, symKind(s));
+}
+
+func fieldKey(owner *ast.Symbol, name string) string { return "f" + itoa(owner.id) + "." + name; }
+func variantKey(owner *ast.Symbol, name string) string { return "v" + itoa(owner.id) + "." + name; }
+
+func refField(c *Checker, src *ast.Source, line int, col int, owner *ast.Symbol, name string, ty *ast.Type, decl bool) {
+    if (nilIndex(c.index) || nilS(owner)) return;
+    r := addRef(c, src, line, col, name, fieldKey(owner, name), ty, decl, zero(*ast.Symbol), 4);
+    if ((r -> int) != 0) r.owner = owner;
+}
+
+func refVariant(c *Checker, src *ast.Source, line int, col int, owner *ast.Symbol, name string, ty *ast.Type, decl bool) {
+    if (nilIndex(c.index) || nilS(owner)) return;
+    r := addRef(c, src, line, col, name, variantKey(owner, name), ty, decl, zero(*ast.Symbol), 6);
+    if ((r -> int) != 0) r.owner = owner;
+}
+
+// span records the scope of a syntactic region for completion.
+func span(c *Checker, n *ast.Node) {
+    if (nilIndex(c.index) || nilN(n) || nilSrc(n.src)) return;
+    sp := new(ScopeSpan);
+    sp.src = n.src; sp.start = n.off; sp.end = n.end; sp.scope = c.scope; sp.fn = c.fn; sp.pkg = c.pkg;
+    if (sp.end < sp.start) sp.end = sp.start;
+    c.index.spans.append(sp);
+}
+
+// ---- queries used by the language server ----
+
+// TypeAt types an expression in the scope enclosing offset off of src.
+func (c *Checker) TypeAt(src *ast.Source, off int, e *ast.Node) *ast.Type {
+    sp := c.SpanAt(src, off);
+    saved := c.scope; savedPkg := c.pkg; savedSrc := c.src; savedFn := c.fn;
+    c.src = src; c.pkg = src.pkg;
+    if ((sp -> int) != 0) { c.scope = sp.scope; c.fn = sp.fn; } else { c.scope = src.pkg.scope; c.fn = zero(*FuncCtx); }
+    if (nilF(c.fn)) { f := new(FuncCtx); f.node = new(ast.Node); f.level = 1000; c.fn = f; }
+    savedIndex := c.index;
+    c.index = zero(*Index);
+    t := expr(c, e, zero(*ast.Type));
+    c.index = savedIndex;
+    c.scope = saved; c.pkg = savedPkg; c.src = savedSrc; c.fn = savedFn;
+    return t;
+}
+
+// SpanAt is the innermost recorded scope containing off.
+func (c *Checker) SpanAt(src *ast.Source, off int) *ScopeSpan {
+    best := zero(*ScopeSpan);
+    if (nilIndex(c.index)) return best;
+    for (_, sp := range c.index.spans) {
+        if (sp.src != src || off < sp.start || off > sp.end) continue;
+        if ((best -> int) == 0 || sp.end - sp.start <= best.end - best.start) best = sp;
+    }
+    return best;
+}
+
+func (c *Checker) LookupAt(src *ast.Source, off int, name string) *ast.Symbol {
+    sp := c.SpanAt(src, off);
+    saved := c.scope; savedPkg := c.pkg; savedSrc := c.src;
+    c.src = src; c.pkg = src.pkg;
+    c.scope = (sp -> int) != 0 ? sp.scope : src.pkg.scope;
+    s := lookup(c, name);
+    c.scope = saved; c.pkg = savedPkg; c.src = savedSrc;
+    return s;
+}
+
+func (c *Checker) TypeOfSymbol(s *ast.Symbol) *ast.Type {
+    if (s.kind == ast.SK.Var && s.global) return resolveSymType(c, s);
+    if (s.kind == ast.SK.Package || s.kind == ast.SK.BuiltinFunc) return zero(*ast.Type);
+    if (s.kind == ast.SK.Var || s.kind == ast.SK.Func || s.kind == ast.SK.Extern) { if (s.kind != ast.SK.Var) resolveSymType(c, s); return s.ty; }
+    if (s.kind == ast.SK.BuiltinType) return s.ty;
+    return symToType(c, s.node, s);
+}

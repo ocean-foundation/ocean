@@ -33,6 +33,68 @@ struct Build {
     fatal bool;
 }
 
+// Linker-flag string injections: -ldflags "-X importpath.name=value".
+struct Injection { path string; name string; value string; }
+injections: []*Injection;
+
+func ldWords(flags string) []string {
+    out := make([]string);
+    i := 0;
+    for (i < len(flags)) {
+        for (i < len(flags) && (flags[i] == ' ' || flags[i] == '\t' || flags[i] == '\n')) i++;
+        if (i >= len(flags)) break;
+        b: util.Buf;
+        quote: i8 = 0;
+        for (i < len(flags)) {
+            c := flags[i];
+            if (quote != 0) { if (c == quote) quote = 0; else b.Addc(c); i++; continue; }
+            if (c == '\'' || c == '"') { quote = c; i++; continue; }
+            if (c == ' ' || c == '\t' || c == '\n') break;
+            b.Addc(c); i++;
+        }
+        out.append(b.String());
+    }
+    return out;
+}
+
+// SetLinkerFlags parses -X specs; false for a malformed flag string.
+func SetLinkerFlags(flags string) bool {
+    words := ldWords(flags);
+    for (i := 0; i < len(words); i++) {
+        w := words[i];
+        spec := "";
+        if (w == "-X" || w == "--X") { i++; if (i >= len(words)) return false; spec = words[i]; }
+        else if (util.HasPrefix(w, "-X=")) spec = w[3:];
+        else return false;
+        eq := util.IndexByte(spec, '=');
+        if (eq < 0) return false;
+        target := spec[0:eq];
+        dot := util.LastIndexByte(target, '.');
+        if (dot <= 0 || dot == len(target) - 1) return false;
+        inj := new(Injection);
+        inj.path = target[0:dot]; inj.name = target[dot + 1:]; inj.value = spec[eq + 1:];
+        injections.append(inj);
+    }
+    return true;
+}
+
+func injectStrings(b *Build, p *ast.Package, src *ast.Source, d *ast.Node) {
+    for (k, id := range d.list) {
+        for (_, inj := range injections) {
+            if (inj.name != id.name) continue;
+            isRoot := p.id == 0 && inj.path == src.file.name;
+            if (inj.path != p.path && !isRoot) continue;
+            if (len(d.list2) != len(d.list) && !(len(d.list2) == 0 && len(d.list) == 1)) {
+                error(b, src.abs, "cannot inject -X " + inj.path + "." + inj.name + ": declare it with its own initializer");
+                continue;
+            }
+            lit := new(ast.Node);
+            lit.kind = ast.NK.StrLit; lit.text = inj.value; lit.src = src; lit.line = id.line; lit.col = id.col;
+            if (len(d.list2) == 0) d.list2.append(lit); else d.list2[k] = lit;
+        }
+    }
+}
+
 func NewBuild(diags *diag.List) *Build { b := new(Build); b.diags = diags; return b; }
 
 // RelativeSourcePath displays absolute paths relative to the working directory.
@@ -221,6 +283,7 @@ func download(b *Build, module string, version string) string {
     }
     dest := moduleCache() + "/" + module + "@" + (version == "" ? "latest" : version);
     if (util.IsDir(dest)) { r, _ := util.Realpath(dest); return r; }
+    if (b.recover) return "";  // editor analysis never downloads
     base := util.Dir(dest);
     if (!util.MkdirAll(base)) { error(b, base, "cannot create module cache"); return ""; }
     tmp := base + "/.download-" + util.Itoa(util.Pid());
@@ -346,7 +409,7 @@ func loadDirectory(b *Build, location string) *ast.Package {
     std := b.StandardSource();
     if (std != "") {
         stdReal, ok := util.Realpath(std);
-        if (ok && pathPrefix(location, stdReal)) { p.std = true; p.path = location[len(stdReal) + 1:]; }
+        if (ok && len(location) > len(stdReal) + 1 && pathPrefix(location, stdReal)) { p.std = true; p.path = location[len(stdReal) + 1:]; }
     }
     if (p.path == "") {
         if (!NilModule(p.module) && p.module.path != "") {
@@ -418,6 +481,7 @@ func loadDirectory(b *Build, location string) *ast.Package {
         p.files.append(src);
         if (!pok) { b.errors++; if (!b.recover) continue; }
         if (file.name == "") continue;
+        if (len(injections) > 0) { for (_, d := range file.list) { if (d.kind == ast.NK.VarDecl) injectStrings(b, p, src, d); } }
         if (!validPackageName(file.name)) error(b, path, "package name must be an identifier");
         if (p.name == "") p.name = file.name;
         else if (p.name != file.name) error(b, path, "package " + file.name + " conflicts with package " + p.name);
