@@ -190,7 +190,7 @@ func setupDefer(g *Gen, recovered string) {
     jb := allocaBytes(g, 512, 16);
     emit(g, "store ptr " + jb + ", ptr " + gep(g, f.frame, 32));
     r := tmp(g);
-    emit(g, r + " = call i32 @_setjmp(ptr " + jb + ") returns_twice");
+    emit(g, r + " = call i32 @" + recoverySymbol() + "(ptr " + jb + (util.Windows() ? ", ptr null" : "") + ") returns_twice");
     c := tmp(g);
     emit(g, c + " = icmp ne i32 " + r + ", 0");
     body := newLabel(g, "body");
@@ -205,6 +205,16 @@ func hasDefer(n *ast.Node) bool {
     if (hasDefer(n.a) || hasDefer(n.b) || hasDefer(n.c) || hasDefer(n.d)) return true;
     for (_, x := range n.list) { if (hasDefer(x)) return true; }
     for (_, x := range n.list2) { if (hasDefer(x)) return true; }
+    return false;
+}
+
+func hasAsm(n *ast.Node) bool {
+    if (nilN(n)) return false;
+    if (n.kind == ast.NK.Asm) return true;
+    if (n.kind == ast.NK.FuncLit) return false;
+    if (hasAsm(n.a) || hasAsm(n.b) || hasAsm(n.c) || hasAsm(n.d)) return true;
+    for (_, x := range n.list) { if (hasAsm(x)) return true; }
+    for (_, x := range n.list2) { if (hasAsm(x)) return true; }
     return false;
 }
 
@@ -248,7 +258,8 @@ func emitInst(g *Gen, inst *Inst) {
     if (!nilT(recvT)) hdr.Add(", ").Add(paramLL(recvT)).Add(" %recv");
     for (i, p := range ft.params) hdr.Add(", ").Add(paramLL(sub(g, p))).Add(" %p").AddInt(i);
     hdr.Add(")");
-    if (f.hasDefer) hdr.Add(" noinline");
+    if (f.hasDefer || hasAsm(body)) hdr.Add(" noinline");
+    if (hasAsm(body)) hdr.Add(" noredzone");
     hdr.Add(" {\n");
     f.envParam = "%env";
     f.cur = "entry";
@@ -400,4 +411,10 @@ func emitThunk(g *Gen, inst *Inst) {
     recvT.cache = "";
     g.mod.AddBuf(&hdr);
     g.mod.Add("entry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
+}
+
+// Win64 passes the optional unwind frame explicitly. ARM64's CRT exports
+// _setjmpex; non-SEH recovery pairs it with MinGW's longjmp implementation.
+func recoverySymbol() string {
+    return util.Windows() && util.HostArch() == "aarch64" ? "_setjmpex" : "_setjmp";
 }

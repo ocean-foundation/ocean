@@ -684,8 +684,8 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
 
 // ---- inline assembly ----
 
-func hostArch() string { return "x86_64"; }
-func hostPlatform() string { return "linux"; }
+func hostArch() string { return util.HostArch(); }
+func hostPlatform() string { return util.HostOS(); }
 
 func genAsm(g *Gen, n *ast.Node) {
     if (g.wasm) { if (n.name != "wasm") return; }
@@ -730,6 +730,15 @@ func genAsm(g *Gen, n *ast.Node) {
         for (_, r := range regs) cons += ",~{" + r + "}";
         for (k := 0; k < 16; k++) cons += ",~{xmm" + itoa(k) + "}";
         cons += ",~{dirflag},~{fpsr},~{flags}";
+    }
+    if (n.name == "aarch64") {
+        for (k := 0; k <= 30; k++) { if (k != 18 && k != 29 && !(k >= 9 && k <= 15)) cons += ",~{x" + itoa(k) + "}"; }
+        for (k := 0; k < 32; k++) cons += ",~{v" + itoa(k) + "}";
+        cons += ",~{cc}";
+    }
+    if (n.name == "riscv64") {
+        for (k := 1; k < 28; k++) { if (k != 2 && k != 3 && k != 4 && k != 8) cons += ",~{x" + itoa(k) + "}"; }
+        for (k := 0; k < 32; k++) cons += ",~{f" + itoa(k) + "}";
     }
     args := "";
     for (k := 0; k < len(order) * 2; k++) {

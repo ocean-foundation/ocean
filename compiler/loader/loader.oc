@@ -5,7 +5,6 @@ import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/parser";
 import "github.com/ocean-foundation/ocean/compiler/util";
 
-extern int readlink(buffer<i8> path, buffer<i8> out, int size);
 
 // Overlay supplies unsaved editor text for a path.
 struct Overlay { path string; text string; }
@@ -241,14 +240,7 @@ func (b *Build) FindModule(location string) *ast.Module {
 
 func NilModule(m *ast.Module) bool { return (m -> int) == 0; }
 
-func Executable() string {
-    out := make([]i8);
-    for (i := 0; i < 4096; i++) out.append(0);
-    path := util.CStr("/proc/self/exe");
-    n := extern.readlink(path.data, out.data, 4095);
-    if (n <= 0) return "";
-    return out[0:n] -> string;
-}
+func Executable() string { return util.Executable(); }
 
 // StandardSource locates the standard library: $OCEAN_SRC, else <exe>/../src.
 func (b *Build) StandardSource() string {

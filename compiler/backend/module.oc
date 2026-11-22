@@ -66,7 +66,7 @@ func runtimeDecls() string {
         "declare void @oc_map_missing(i64) noreturn\n" +
         "declare void @oc_recover(ptr)\n" +
         "declare void @oc_run_defers(ptr)\n" +
-        "declare i32 @_setjmp(ptr) returns_twice\n" +
+        "declare i32 @" + recoverySymbol() + "(ptr" + (util.Windows() ? ", ptr" : "") + ") returns_twice\n" +
         "declare void @llvm.trap() noreturn\n" +
         "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n" +
         "declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n" +
@@ -192,7 +192,7 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
         m := root.scope.LookupLocal("main");
         if (!nilS(m) && m.kind == ast.SK.Func) mainWrapper(g, m);
         setArgsWrapper(g, c.OsSetArgs());
-        g.mod.Add("declare i32 @oc_start()\ndefine i32 @main() {\nentry:\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
+        g.mod.Add("@oc_argc = external global i32\n@oc_argv = external global ptr\ndeclare i32 @oc_start()\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n  store i32 %argc, ptr @oc_argc\n  store ptr %argv, ptr @oc_argv\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
     } else {
         for (_, p := range packages) {
             if (p != root) continue;
@@ -205,6 +205,14 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
                 }
             }
         }
+    }
+    if (!g.usesThreads) {
+        // Mach-O and COFF do not resolve optional ELF-style weak imports.
+        // Supply the single-thread behavior in the emitted Ocean module.
+        declare(g, "@\"exit\"", "declare void @\"exit\"(i32)");
+        g.mod.Add("define void @ocean_threads_panic_exit(i32 %code) { ret void }\n");
+        g.mod.Add("define void @ocean_threads_begin_return() { ret void }\n");
+        g.mod.Add("define void @ocean_threads_exit() noreturn { call void @\"exit\"(i32 0)\n unreachable }\n");
     }
     initFunction(g, packages);
     drain(g);

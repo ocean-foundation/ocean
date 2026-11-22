@@ -498,6 +498,7 @@ func parseTimeout(s string) (float, bool) {
 }
 
 func isTerminalOk(noTTY bool, json bool) bool {
+    if (util.Windows()) return false;
     term, has := util.Getenv("TERM");
     return !noTTY && !json && util.IsTerminal(0) && util.IsTerminal(1) && (!has || term != "dumb");
 }
@@ -546,7 +547,7 @@ func testOne(args []string, shared bool) int {
     }
     dir, dok := util.MakeTempDir(".ocean-test-");
     if (!dok) { util.Stderr("ocean test: temporary directory\n"); return 1; }
-    exe := dir + "/program";
+    exe := dir + "/program" + util.ExeSuffix();
     diags := newDiags();
     prog := Frontend(location, true, dir + "/harness", diags);
     failed := prog.fatal || !prog.ok;

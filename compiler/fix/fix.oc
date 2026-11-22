@@ -6,8 +6,6 @@ import "github.com/ocean-foundation/ocean/compiler/parser";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/util";
 
-extern i32 chmod(buffer<i8> path, u32 mode);
-extern i32 stat(buffer<i8> path, buffer<i8> st);
 
 func quiet() *diag.List { d := diag.NewList(); d.live = false; return d; }
 
@@ -107,20 +105,13 @@ func fixFile(path string, known map[string]bool) int {
         tmp := path + ".ocean-fix-" + util.Itoa(util.Pid());
         if (!util.WriteFile(tmp, current)) { util.Stderr("ocean fix: cannot write " + path + "\n"); util.Remove(tmp); return -1; }
         m := statMode(path);
-        if (m >= 0) { t := util.CStr(tmp); extern.chmod(t.data, (m & 4095)->u32); }
+        if (m >= 0) util.Chmod(tmp, m & 4095);
         if (!util.Rename(tmp, path)) { util.Stderr("ocean fix: cannot write " + path + "\n"); util.Remove(tmp); return -1; }
     }
     return total;
 }
 
-func statMode(path string) int {
-    st: buffer<i8, 256>;
-    c := util.CStr(path);
-    if (extern.stat(c.data, st) != 0) return -1;
-    p := stPtr(st);
-    return (*p) -> int;
-}
-func stPtr(b buffer<i8>) *u32 { return ((b -> int) + 24) -> (*u32); }
+func statMode(path string) int { return util.StatMode(path); }
 
 func fixDirectory(b *loader.Build, dir string) bool {
     known: map[string]bool;

@@ -65,8 +65,44 @@ func TestFiles(t *testing.T) {
 }
 
 func TestProcess(t *testing.T) {
+    if (Windows()) {
+        st, out := RunCapture([]string{"cmd.exe", "/d", "/c", "echo hi"}.array());
+        if (st.Failed || st.Code != 0 || Trim(out) != "hi") t.Error("capture ", st.Code, " ", out);
+        return;
+    }
     st, out := RunCapture([]string{"sh", "-c", "echo hi; echo err >&2; exit 3"}.array());
     if (st.Code != 3 || out != "hi\nerr\n") t.Error("capture ", st.Code, " ", out);
     st2 := Run([]string{"sh", "-c", "kill -9 $$"}.array());
     if (st2.Signal != 9) t.Error("signal");
+}
+
+func TestHost(t *testing.T) {
+    if (HostOS() != "linux" && HostOS() != "macos" && HostOS() != "windows") t.Error("host OS");
+    if (HostArch() != "x86_64" && HostArch() != "aarch64" && HostArch() != "riscv64") t.Error("host architecture");
+    if (!IsRegular(Executable())) t.Error("executable path ", Executable());
+    first := MonoSeconds();
+    second := MonoSeconds();
+    if (first <= 0.0 || second < first) t.Error("monotonic clock");
+    if (Windows()) {
+        if (Clean("C:\\one\\..\\two") != "C:/two") t.Error("drive path");
+        if (Dir("C:/one") != "C:/" || Dir("C:/") != "C:/") t.Error("drive root");
+        if (Clean("//server/share/../file") != "//server/share/file") t.Error("UNC root");
+        if (windowsArg("a b\\") != "\"a b\\\\\"") t.Error("argument quoting");
+    }
+}
+
+func TestBinaryFiles(t *testing.T) {
+    dir, ok := MakeTempDir("ocean binary ");
+    if (!ok) { t.Fatal("temp directory"); }
+    defer RemoveAll(dir);
+    path := JoinPath(dir, "with spaces.bin");
+    data := "a\x00b\r\n\x1az";
+    if (!WriteFile(path, data)) t.Fatal("binary write");
+    actual, read := ReadFile(path);
+    if (!read || actual != data || StatSize(path) != len(data)) t.Error("binary round trip");
+    if (StatMtime(path) <= 0) t.Error("mtime");
+    replacement := JoinPath(dir, "replacement");
+    if (!WriteFile(replacement, "new") || !Rename(replacement, path)) t.Error("replace existing file");
+    actual, read = ReadFile(path);
+    if (!read || actual != "new") t.Error("replacement contents");
 }

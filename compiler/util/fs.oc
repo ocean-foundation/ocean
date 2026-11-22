@@ -1,30 +1,9 @@
 package util;
 
-// Thin libc wrappers. Layout offsets assume 64-bit Linux glibc (x86-64/AArch64/RISC-V64).
-extern i32 open(buffer<i8> path, i32 flags, ...);
-extern int read(i32 fd, buffer<i8> data, int count);
-extern int write(i32 fd, buffer<i8> data, int count);
-extern i32 close(i32 fd);
-extern i32 stat(buffer<i8> path, buffer<i8> st);
-extern i32 lstat(buffer<i8> path, buffer<i8> st);
-extern *void opendir(buffer<i8> path);
-extern buffer<i8> readdir(*void dir);
-extern i32 closedir(*void dir);
-extern i32 mkdir(buffer<i8> path, u32 mode);
-extern i32 unlink(buffer<i8> path);
-extern i32 rmdir(buffer<i8> path);
-extern i32 rename(buffer<i8> from, buffer<i8> to);
-extern buffer<i8> getcwd(buffer<i8> data, int size);
-extern buffer<i8> realpath(buffer<i8> path, buffer<i8> resolved);
+// Filesystem policy in Ocean; native ABI calls live in native.oc.
 extern buffer<i8> getenv(buffer<i8> name);
-extern buffer<i8> mkdtemp(buffer<i8> template);
-extern i32 mkstemp(buffer<i8> template);
 extern void free(*void p);
 extern int strlen(buffer<i8> s);
-extern i32 isatty(i32 fd);
-extern i32 access(buffer<i8> path, i32 mode);
-extern i32 chmod(buffer<i8> path, u32 mode);
-extern i32 getpid();
 
 func CStr(s string) []i8 { b := s -> []i8; b.append(0); return b; }
 
@@ -45,37 +24,37 @@ func Getenv(name string) (string, bool) {
 
 func ReadFile(path string) (string, bool) {
     c := CStr(path);
-    fd := extern.open(c.data, 0->i32);
+    fd := native_open((c.data)->int, ReadFlags(), 0);
     if (fd < 0) return "", false;
     out := make([]i8);
     chunk := make([]i8);
     for (i := 0; i < 65536; i++) chunk.append(0);
     for (;;) {
-        n := extern.read(fd, chunk.data, 65536);
-        if (n < 0) { extern.close(fd); return "", false; }
+        n := native_read((fd)->int, (chunk.data)->int, (65536)->int);
+        if (n < 0) { native_close((fd)->int); return "", false; }
         if (n == 0) break;
         out.append(chunk[0:n]...);
     }
-    extern.close(fd);
+    native_close((fd)->int);
     return out -> string, true;
 }
 
-func WriteFd(fd i32, s string) bool {
+func WriteFd(fd int, s string) bool {
     if (len(s) == 0) return true;
     b := s -> []i8;
     off := 0;
     for (off < len(b)) {
-        n := extern.write(fd, (&b[off]) -> (buffer<i8>), len(b) - off);
+        n := native_write((fd)->int, ((&b[off]) -> (buffer<i8>))->int, (len(b) - off)->int);
         if (n <= 0) return false;
         off += n;
     }
     return true;
 }
 
-func WriteBytesFd(fd i32, b *[]i8) bool {
+func WriteBytesFd(fd int, b *[]i8) bool {
     off := 0;
     for (off < len(*b)) {
-        n := extern.write(fd, (&(*b)[off]) -> (buffer<i8>), len(*b) - off);
+        n := native_write((fd)->int, ((&(*b)[off]) -> (buffer<i8>))->int, (len(*b) - off)->int);
         if (n <= 0) return false;
         off += n;
     }
@@ -88,10 +67,10 @@ func Stderr(s string) { WriteFd(2->i32, s); }
 // WriteFile writes s to path (create/truncate) with the given mode bits.
 func WriteFileMode(path string, s string, mode int) bool {
     c := CStr(path);
-    fd := extern.open(c.data, (64 | 512 | 1)->i32, mode->u32);
+    fd := native_open((c.data)->int, WriteFlags(), (mode->u32)->int);
     if (fd < 0) return false;
     ok := WriteFd(fd, s);
-    if (extern.close(fd) != 0) ok = false;
+    if (native_close((fd)->int) != 0) ok = false;
     return ok;
 }
 func WriteFile(path string, s string) bool { return WriteFileMode(path, s, 438); }
@@ -99,17 +78,17 @@ func WriteFile(path string, s string) bool { return WriteFileMode(path, s, 438);
 // OpenTrunc opens path for writing (create/truncate); -1 on failure.
 func OpenTrunc(path string) int {
     c := CStr(path);
-    return extern.open(c.data, (64 | 512 | 1)->i32, 438->u32) -> int;
+    return native_open((c.data)->int, WriteFlags(), (438->u32)->int) -> int;
 }
 func WriteString(fd int, s string) bool { return WriteFd(fd->i32, s); }
-func Close(fd int) bool { return extern.close(fd->i32) == 0; }
+func Close(fd int) bool { return native_close((fd->i32)->int) == 0; }
 
 func WriteBufFile(path string, b *Buf) bool {
     c := CStr(path);
-    fd := extern.open(c.data, (64 | 512 | 1)->i32, 438->u32);
+    fd := native_open((c.data)->int, WriteFlags(), (438->u32)->int);
     if (fd < 0) return false;
     ok := WriteBytesFd(fd, &b.bytes);
-    if (extern.close(fd) != 0) ok = false;
+    if (native_close((fd)->int) != 0) ok = false;
     return ok;
 }
 
@@ -119,63 +98,69 @@ func BufAt(n int) buffer<i8> { p := n -> (*void); b := p -> (buffer<i8>); return
 func statMode(path string, follow bool) int {
     c := CStr(path);
     st: buffer<i8, 256>;
-    r := follow ? extern.stat(c.data, st) : extern.lstat(c.data, st);
+    r := follow ? native_stat((c.data)->int, (st)->int) : native_lstat((c.data)->int, (st)->int);
     if (r != 0) return -1;
-    p := (addr(st) + 24) -> (*u32);
-    return (*p) -> int;
+    if (MacOS()) return (*((addr(st) + 4) -> (*u16))) -> int;
+    if (Windows()) return (*((addr(st) + 6) -> (*u16))) -> int;
+    offset := HostArch() == "x86_64" ? 24 : 16;
+    return (*((addr(st) + offset) -> (*u32))) -> int;
 }
 
 func StatSize(path string) int {
     c := CStr(path);
     st: buffer<i8, 256>;
-    if (extern.stat(c.data, st) != 0) return -1;
-    return *((addr(st) + 48) -> (*int));
+    if (native_stat((c.data)->int, (st)->int) != 0) return -1;
+    return *((addr(st) + (Windows() ? 24 : (MacOS() ? 96 : 48))) -> (*int));
 }
 
 func StatMtime(path string) int {
     c := CStr(path);
     st: buffer<i8, 256>;
-    if (extern.stat(c.data, st) != 0) return -1;
-    sec := *((addr(st) + 88) -> (*int));
-    nsec := *((addr(st) + 96) -> (*int));
+    if (native_stat((c.data)->int, (st)->int) != 0) return -1;
+    if (Windows()) return *((addr(st) + 40) -> (*int)) * 1000000000;
+    offset := MacOS() ? 48 : 88;
+    sec := *((addr(st) + offset) -> (*int));
+    nsec := *((addr(st) + offset + 8) -> (*int));
     return sec * 1000000000 + nsec;
 }
 
 func Exists(path string) bool { return statMode(path, true) >= 0; }
 func IsDir(path string) bool { m := statMode(path, true); return m >= 0 && (m & 61440) == 16384; }
 func IsRegular(path string) bool { m := statMode(path, true); return m >= 0 && (m & 61440) == 32768; }
-func IsSymlink(path string) bool { m := statMode(path, false); return m >= 0 && (m & 61440) == 40960; }
-func IsExecutable(path string) bool { c := CStr(path); return extern.access(c.data, 1->i32) == 0; }
+func StatMode(path string) int { return statMode(path, true); }
+func IsSymlink(path string) bool { if (Windows()) { c := CStr(path); flags := WinAttributes(c.data->int); return flags != -1 && (flags & 1024) != 0; } m := statMode(path, false); return m >= 0 && (m & 61440) == 40960; }
+func IsExecutable(path string) bool { c := CStr(path); return IsRegular(path) && native_access((c.data)->int, Windows() ? 0 : 1) == 0; }
 
 // ListDir returns the entry names of a directory (excluding . and ..), sorted.
 func ListDir(path string) ([]string, bool) {
     out := make([]string);
+    if (Windows()) return windowsListDir(path);
     c := CStr(path);
-    d := extern.opendir(c.data);
+    d := (native_opendir((c.data)->int) -> (*void));
     if ((d -> int) == 0) return out, false;
     for (;;) {
-        e := extern.readdir(d);
+        e := (native_readdir((d)->int) -> (buffer<i8>));
         if ((e -> int) == 0) break;
-        name := FromC(BufAt((e -> int) + 19));
+        name := FromC(BufAt((e -> int) + (MacOS() ? 21 : 19)));
         if (name == "." || name == "..") continue;
         out.append(name);
     }
-    extern.closedir(d);
+    native_closedir((d)->int);
     SortStrings(&out);
     return out, true;
 }
 
-func Mkdir(path string) bool { c := CStr(path); return extern.mkdir(c.data, 511->u32) == 0; }
+func Mkdir(path string) bool { c := CStr(path); return native_mkdir((c.data)->int, (511->u32)->int) == 0; }
 func MkdirAll(path string) bool {
     if (IsDir(path)) return true;
     parent := Dir(path);
     if (parent != path && parent != "" && !IsDir(parent)) { if (!MkdirAll(parent)) return false; }
     return Mkdir(path) || IsDir(path);
 }
-func Remove(path string) bool { c := CStr(path); return extern.unlink(c.data) == 0; }
-func Rmdir(path string) bool { c := CStr(path); return extern.rmdir(c.data) == 0; }
-func Rename(from string, to string) bool { a := CStr(from); b := CStr(to); return extern.rename(a.data, b.data) == 0; }
-func Chmod(path string, mode int) bool { c := CStr(path); return extern.chmod(c.data, mode->u32) == 0; }
+func Remove(path string) bool { c := CStr(path); if (Windows() && IsSymlink(path) && IsDir(path)) return WinRemoveDir(c.data->int) != 0; return native_unlink((c.data)->int) == 0; }
+func Rmdir(path string) bool { c := CStr(path); return native_rmdir((c.data)->int) == 0; }
+func Rename(from string, to string) bool { a := CStr(from); b := CStr(to); if (Windows()) return WinMove(a.data->int, b.data->int, 9) != 0; return native_rename((a.data)->int, (b.data)->int) == 0; }
+func Chmod(path string, mode int) bool { c := CStr(path); return native_chmod((c.data)->int, (mode->u32)->int) == 0; }
 
 func RemoveAll(path string) bool {
     if (IsSymlink(path) || !IsDir(path)) return Remove(path);
@@ -187,59 +172,113 @@ func RemoveAll(path string) bool {
 func Getcwd() string {
     b := make([]i8);
     for (i := 0; i < 4096; i++) b.append(0);
-    p := extern.getcwd(b.data, 4096);
-    return FromC(p);
+    p := (native_getcwd((b.data)->int, (4096)->int) -> (buffer<i8>));
+    return NormalizePath(FromC(p));
 }
 
 func Realpath(path string) (string, bool) {
+    if (Windows() && !Exists(path)) return "", false;
     c := CStr(path);
-    p := extern.realpath(c.data, zero(buffer<i8>));
+    p := (Windows() ? WinFullPath(0, c.data->int, 0) : native_realpath(c.data->int, 0)) -> (buffer<i8>);
     if ((p -> int) == 0) return "", false;
     s := FromC(p);
     extern.free(p -> (*void));
-    return s, true;
+    return NormalizePath(s), true;
 }
 
 func TempBase() string {
-    t, ok := Getenv("TMPDIR");
-    if (ok && t != "") return t;
-    return "/tmp";
+    for (_, name := range []string{"TMPDIR", "TEMP", "TMP"}) {
+        t, ok := Getenv(name);
+        if (ok && t != "") return NormalizePath(t);
+    }
+    return Windows() ? Getcwd() : "/tmp";
 }
 
+tempCounter: int;
+func tempName(prefix string) string {
+    tempCounter++;
+    sec, ns := RealNow();
+    return JoinPath(TempBase(), prefix + Itoa(Pid()) + "-" + Itoa(sec) + "-" + Itoa(ns) + "-" + Itoa(tempCounter));
+}
 func MakeTempDir(prefix string) (string, bool) {
-    c := CStr(TempBase() + "/" + prefix + "XXXXXX");
-    p := extern.mkdtemp(c.data);
-    if ((p -> int) == 0) return "", false;
-    return FromC(p), true;
+    for (i := 0; i < 100; i++) {
+        path := tempName(prefix);
+        c := CStr(path);
+        if (native_mkdir(c.data->int, 448) == 0) return path, true;
+    }
+    return "", false;
 }
-
 func MakeTempFile(prefix string) (string, bool) {
-    c := CStr(TempBase() + "/" + prefix + "XXXXXX");
-    fd := extern.mkstemp(c.data);
-    if (fd < 0) return "", false;
-    extern.close(fd);
-    return FromC(c.data), true;
+    for (i := 0; i < 100; i++) {
+        path := tempName(prefix);
+        c := CStr(path);
+        exclusive := Windows() ? 1024 : (MacOS() ? 2048 : 128);
+        fd := native_open(c.data->int, WriteFlags() | exclusive, 384);
+        if (fd >= 0) { Close(fd); return path, true; }
+    }
+    return "", false;
 }
 
-func IsTerminal(fd int) bool { return extern.isatty(fd->i32) != 0; }
-func Pid() int { return extern.getpid() -> int; }
+func ReadFlags() int { return Windows() ? 32768 : 0; }
+func WriteFlags() int { return Windows() ? 33537 : (MacOS() ? 1537 : 577); }
 
-// Path helpers.
+func windowsListDir(path string) ([]string, bool) {
+    out := make([]string);
+    pattern := CStr(JoinPath(path, "*"));
+    data: buffer<i8, 320>;
+    handle := WinFindFirst(pattern.data->int, data->int);
+    if (handle == -1) return out, false;
+    for (;;) {
+        name := FromC(BufAt((data->int) + 44));
+        if (name != "." && name != "..") out.append(name);
+        if (WinFindNext(handle, data->int) == 0) break;
+    }
+    WinFindClose(handle);
+    SortStrings(&out);
+    return out, true;
+}
+
+func IsTerminal(fd int) bool { return native_isatty((fd->i32)->int) != 0; }
+func Pid() int { return native_getpid() -> int; }
+
+// Path helpers. Canonical internal paths use forward slashes.
+func NormalizePath(path string) string { return Windows() ? Replace(path, "\\", "/") : path; }
+func IsAbs(path string) bool {
+    path = NormalizePath(path);
+    return len(path) > 0 && (path[0] == '/' || (Windows() && len(path) >= 3 && path[1] == ':' && path[2] == '/'));
+}
+func pathRoot(path string) string {
+    if (Windows() && len(path) >= 3 && path[1] == ':' && path[2] == '/') return path[0:3];
+    if (Windows() && HasPrefix(path, "//")) {
+        server := IndexByte(path[2:], '/');
+        if (server >= 0) {
+            share := IndexByte(path[server + 3:], '/');
+            if (share < 0) return path;
+            return path[:server + 3 + share];
+        }
+    }
+    return HasPrefix(path, "/") ? "/" : "";
+}
 func Dir(path string) string {
+    path = NormalizePath(path);
+    root := pathRoot(path);
+    if (path == root) return root;
     i := LastIndexByte(path, '/');
     if (i < 0) return ".";
-    if (i == 0) return "/";
+    if (i < len(root)) return root;
     return path[0:i];
 }
 func Base(path string) string {
+    path = NormalizePath(path);
     for (len(path) > 1 && path[len(path) - 1] == '/') path = path[0:len(path) - 1];
     i := LastIndexByte(path, '/');
     if (i < 0) return path;
     return path[i + 1:];
 }
 func JoinPath(a string, b string) string {
+    a = NormalizePath(a); b = NormalizePath(b);
     if (a == "" || a == ".") return b;
-    if (len(b) > 0 && b[0] == '/') return b;
+    if (IsAbs(b)) return b;
     if (HasSuffix(a, "/")) return a + b;
     return a + "/" + b;
 }
@@ -247,8 +286,10 @@ func JoinPath(a string, b string) string {
 // Clean normalizes a path lexically (., .., duplicate slashes).
 func Clean(path string) string {
     if (path == "") return ".";
-    abs := path[0] == '/';
-    parts := Split(path, '/');
+    path = NormalizePath(path);
+    root := pathRoot(path);
+    abs := root != "";
+    parts := Split(path[len(root):], '/');
     out := make([]string);
     for (_, p := range parts) {
         if (p == "" || p == ".") continue;
@@ -259,13 +300,13 @@ func Clean(path string) string {
         out.append(p);
     }
     s := JoinList(out, "/");
-    if (abs) return "/" + s;
+    if (abs) return s == "" ? root : JoinPath(root, s);
     if (s == "") return ".";
     return s;
 }
 
 func Abs(path string) string {
-    if (len(path) > 0 && path[0] == '/') return Clean(path);
+    if (IsAbs(path)) return Clean(path);
     return Clean(Getcwd() + "/" + path);
 }
 

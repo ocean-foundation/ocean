@@ -52,6 +52,13 @@ func runtimeSources(p *Program, dir string) []string {
 }
 
 func clangRun(args []string) bool {
+    // pkg-config supplies SDK/Homebrew/MinGW include and library directories.
+    if (args[0] == "clang") {
+        if (util.Windows()) args.append("-D_longjmp=longjmp", "-D__USE_MINGW_SETJMP_NON_SEH");
+        for (_, arg := range args) {
+            if (util.HasSuffix(arg, "ocean_ffi.c")) { flags, ok := packageFlags("libffi", "--cflags"); if (ok) args.append(flags...); break; }
+        }
+    }
     st, out := util.RunCapture(args.array());
     if (st.Failed || st.Code != 0) {
         util.Stderr(out);
@@ -95,13 +102,13 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
         }
         if (len(parts) == 1) util.Rename(parts[0], obj);
         else {
-            rargs := []string{"clang", "-r", "-nostdlib", "-o", obj};
+            rargs := objectLinkArgs(obj);
             rargs.append(parts...);
             if (!clangRun(rargs)) { util.RemoveAll(dir); return false; }
         }
         cacheStore(key, obj);
     }
-    staged := output + ".ocean-tmp";
+    staged := output + ".ocean-tmp" + (p.isLibrary ? "" : util.ExeSuffix());
     args := []string{"clang", obj, "-o", staged};
     if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
     ok2 := clangRun(args);
@@ -113,8 +120,15 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
 
 // appendLinkFlags adds the system libraries and static flags of a final link.
 func appendLinkFlags(p *Program, args *[]string, staticLink bool) bool {
-    if (p.checker.UsesThreads()) (*args).append("-pthread");
-    if (p.usesFFI) (*args).append("-lffi");
+    if (p.checker.UsesThreads() && !util.Windows()) (*args).append("-pthread");
+    if (util.Windows()) {
+        (*args).append("-Wl,--stack,8388608");
+        if (usesPackage(p, "os/exec")) (*args).append("-lshell32");
+    }
+    if (p.usesFFI) {
+        flags, ok := packageFlags("libffi", "--libs");
+        if (ok) (*args).append(flags...); else (*args).append("-lffi");
+    }
     if (p.usesCurl && !targetWasm()) {
         if (staticLink) {
             flags, fok := staticCurlFlags();
@@ -132,7 +146,7 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
     irPath := dir + "/program.ll";
     if (!util.WriteFile(irPath, ir)) { util.Stderr("ocean: could not create IR file\n"); util.RemoveAll(dir); return false; }
     rts := runtimeSources(p, dir);
-    staged := output + ".ocean-tmp";
+    staged := output + ".ocean-tmp" + (p.isLibrary ? "" : util.ExeSuffix());
     args := []string{"clang", optLevel(), "-w", "-Wno-override-module"};
     if (p.isLibrary) {
         objs := make([]string);
@@ -148,7 +162,7 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
             if (!clangRun(cargs)) { util.RemoveAll(dir); return false; }
             objs.append(obj);
         }
-        largs := []string{"clang", "-r", "-nostdlib", "-o", staged};
+        largs := objectLinkArgs(staged);
         largs.append(objs...);
         if (!clangRun(largs)) { util.RemoveAll(dir); return false; }
     } else {
@@ -227,7 +241,7 @@ func emitAndLink(p *Program, o *BuildOptions) int {
     if (o.run) {
         dir, dok := util.MakeTempDir(".ocean-run-");
         if (!dok) { util.Stderr("ocean run: temporary directory\n"); return 1; }
-        exe := dir + "/program";
+        exe := dir + "/program" + util.ExeSuffix();
         if (!compileProgram(p, ir, exe, o.staticLink)) { util.RemoveAll(dir); return 1; }
         argv := make([]string);
         argv.append(exe);
@@ -240,7 +254,7 @@ func emitAndLink(p *Program, o *BuildOptions) int {
     out := o.output;
     if (out == "") {
         if (p.isLibrary) out = p.name + ".o";
-        else { b := util.Base(p.dir); out = b == "" ? "main" : b; }
+        else { b := util.Base(p.dir); out = (b == "" ? "main" : b) + util.ExeSuffix(); }
     }
     for (_, pk := range p.checker.Packages()) {
         for (_, src := range pk.files) {
@@ -276,3 +290,31 @@ func staticCurlFlags() ([]string, bool) {
 }
 
 func labelChar(ch i8) bool { return util.IsLetter(ch) || util.IsDigit(ch) || ch == '_' || ch == '.' || ch == '$'; }
+
+// COFF libraries are indexed archives. Darwin relocatable links must retain
+// private externals referenced by other cached objects.
+func objectLinkArgs(output string) []string {
+    if (util.Windows()) return []string{"llvm-ar", "rcs", output};
+    args := []string{"clang", "-r", "-nostdlib", "-o", output};
+    if (util.MacOS()) args.append("-Wl,-keep_private_externs");
+    return args;
+}
+
+func packageFlags(packageName string, option string) ([]string, bool) {
+    st, text := util.RunCapture([]string{"pkg-config", option, packageName}.array());
+    out := make([]string);
+    if (st.Failed || st.Code != 0) return out, false;
+    word := ""; quote: i8 = 0; escaped := false;
+    for (i := 0; i < len(text); i++) {
+        c := text[i];
+        if (escaped) { word += c; escaped = false; continue; }
+        if (c == '\\' && quote != '\'') { escaped = true; continue; }
+        if (quote != 0) { if (c == quote) quote = 0; else word += c; continue; }
+        if (c == '\'' || c == '"') { quote = c; continue; }
+        if (c == ' ' || c == '\n' || c == '\t' || c == '\r') { if (word != "") out.append(word); word = ""; }
+        else word += c;
+    }
+    if (quote != 0 || escaped) return out, false;
+    if (word != "") out.append(word);
+    return out, true;
+}

@@ -2,7 +2,11 @@
 # OCEAN is the bootstrap compiler (an installed ocean, or a previous build).
 OCEAN ?= ocean
 VERSION ?= dev
-OUT ?= build/ocean
+# Windows builds use GNU Make in an MSYS2 CLANG64/CLANGARM64 shell.
+EXE := $(if $(filter Windows_NT,$(OS)),.exe,)
+OUT ?= build/ocean$(EXE)
+STAGE2 ?= build/ocean-stage2$(EXE)
+EMBED := build/embed-runtime$(EXE)
 PKG := github.com/ocean-foundation/ocean/compiler/driver
 COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 COMMIT_DATE ?= $(shell git log -1 --format=%cs 2>/dev/null || echo unknown)
@@ -14,19 +18,22 @@ LDFLAGS := -X $(PKG).version=$(VERSION) -X $(PKG).commit=$(COMMIT) \
 
 .PHONY: all test selfhost clean runtime
 all: runtime
-	mkdir -p $(dir $(OUT))
-	$(OCEAN) build -ldflags "$(LDFLAGS)" -o $(OUT) .
+	mkdir -p "$(dir $(OUT))"
+	"$(OCEAN)" build -ldflags "$(LDFLAGS)" -o "$(OUT)" .
 
 # Regenerate the embedded runtime after editing compiler/runtime/*.c.
 runtime:
-	python3 scripts/embed_runtime.py
+	mkdir -p build
+	"$(OCEAN)" build -o "$(EMBED)" tools/embedruntime
+	"$(EMBED)"
 
 test: all
-	$(OUT) test ./... --notty
+	"$(OUT)" test ./... --notty
 
 # Rebuild the compiler with itself.
 selfhost: all
-	$(OUT) build -ldflags "$(LDFLAGS)" -o $(OUT)-stage2 .
+	mkdir -p "$(dir $(STAGE2))"
+	"$(OUT)" build -ldflags "$(LDFLAGS)" -o "$(STAGE2)" .
 
 clean:
 	rm -rf build

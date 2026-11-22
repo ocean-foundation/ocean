@@ -222,6 +222,7 @@ func semanticRequest(s *Server, id *J, method string, params *J) {
 // isolated runs an analysis in a forked child so failures and memory growth
 // never affect the server. The child writes its JSON answer to a pipe.
 func isolated(s *Server, d *Document, method string, params *J) string {
+    if (util.Windows()) return answer(s, d, method, params);
     r, w, ok := util.Pipe();
     if (!ok) return answer(s, d, method, params);
     pid := util.Fork();
