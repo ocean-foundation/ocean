@@ -331,6 +331,9 @@ Statements end in `;` unless they end in a block. Use braces and parenthesized
 control-flow conditions. Variables use `name: Type` and inferred declarations
 use `:=`. Parameters, named results, and fields use `name Type`. Extern
 declarations use C ordering.
+Parenthesized result lists may use unnamed types, including qualified and
+generic types such as `(string, Optional<float>)`. To name results, name every
+result in the list.
 
 Every type modifier is a prefix that applies to the whole type after it:
 `[]T` (dynamic array), `[n]T` (array), `[...]T{...}` (array sized by its literal),
@@ -683,6 +686,9 @@ one array to get an `int` element difference. Arithmetic has no bounds checks
 and traps on `null`. `ip: *int = 5;` and `ip := 5->(*int);` both initialize the
 pointer to address `0x5`. Use an explicit cast for integer addresses in
 reassignments and function arguments, as in `ip = 5->(*int)` or `f(5->(*int))`.
+A sized buffer casts to its storage address (`st: buffer<i8, 256>; a := st->int;`
+or `st->(*int)`), and an integer address casts directly to a view, as in
+`f((a + 19)->(buffer<i8>))` or `(a + 48)->(buffer<i8, 4>)`.
 `new(T)` returns an explicitly managed `*T` initialized to `zero(T)`;
 `free(pointer)` releases owned contents and the allocation, without following
 pointer fields. Pointer scope exit never frees the pointee. `free(items)` can
@@ -931,6 +937,10 @@ field, and unit variants return no fields. The same deep-copy rules apply.
 `io.Print`, `io.Println`, `io.Sprint`, and formatted output use this reflection
 to print enums recursively: `Event.Load`, `Event.Key(65)`, and
 `Event.Click(x: 2, y: 3)`. Fixed payloads print as `Number.One(1)`.
+
+`reflect.VarIntegerDecimal(value)` returns exact decimal text for boxed
+`varint(n)` and `varuint(n)` values, including named types, or an empty string
+for other types. The `io` print and format functions use it automatically.
 
 ## Native calls and current limits
 
