@@ -3,6 +3,7 @@ import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/diag";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "strconv";
 
 struct FuncCtx {
     node *ast.Node;
@@ -510,7 +511,7 @@ func resolveConstraints(c *Checker, params []*ast.Symbol) {
     }
 }
 
-func itoa(n int) string { return util.Itoa(n); }
+func itoa(n int) string { return strconv.Itoa(n); }
 
 func (c *Checker) RecordType(et *ast.Type, v *ast.VariantInfo) *ast.Type { return recordType(c, et, v); }
 func (c *Checker) LitInfo(n *ast.Node) (bool, bool) { l := intLiteral(c, n); return l.ok, l.neg; }

@@ -1,5 +1,11 @@
 package util;
 
+import "os";
+import "os/signal";
+import "strconv";
+import "strings";
+import "time";
+
 extern void _exit(i32 code);
 extern *void signal(i32 sig, *void handler);
 
@@ -30,7 +36,7 @@ func decode(raw i32) Status {
     return s;
 }
 
-func SignalName(sig int) string { if (Windows()) return Itoa(sig); return FromC((native_strsignal((sig->i32)->int) -> (buffer<i8>))); }
+func SignalName(sig int) string { if (Windows()) return strconv.Itoa(sig); return FromC((native_strsignal((sig->i32)->int) -> (buffer<i8>))); }
 
 // spawn forks and executes argv; returns the child pid or -1.
 func spawn(argv array<string>, r *Redirect) int {
@@ -55,7 +61,7 @@ func spawn(argv array<string>, r *Redirect) int {
         if (r.stderrFd >= 0) native_dup2((r.stderrFd->i32)->int, (2->i32)->int);
         if (r.extraFd >= 0) native_dup2((r.extraFd->i32)->int, (r.extraTarget->i32)->int);
         if (r.dir != "") native_chdir((dir.data)->int);
-        if (IndexByte(argv[0], '/') >= 0) native_execv((storage[0].data)->int, (ptrs.data)->int);
+        if (strings.IndexByte(argv[0], '/') >= 0) native_execv((storage[0].data)->int, (ptrs.data)->int);
         else native_execvp((storage[0].data)->int, (ptrs.data)->int);
         extern._exit(127->i32);
     }
@@ -93,23 +99,18 @@ func Run(argv array<string>) Status {
 // RunForeground runs a child, forwarding SIGINT/SIGTERM/SIGHUP to it.
 func RunForeground(argv array<string>) Status {
     if (Windows()) return Run(argv);
-    set: buffer<i8, 128>;
-    old: buffer<i8, 128>;
-    native_sigemptyset((set)->int);
-    native_sigaddset((set)->int, (2->i32)->int); native_sigaddset((set)->int, (15->i32)->int); native_sigaddset((set)->int, (1->i32)->int);
-    native_sigprocmask((MacOS() ? 1 : 0), (set)->int, (old)->int);
+    signal.Block();
     r := NewRedirect();
     pid := spawn(argv, &r);
-    if (pid < 0) { native_sigprocmask((MacOS() ? 3 : 2), (old)->int, (zero(buffer<i8>))->int); s: Status; s.Failed = true; s.Code = 1; return s; }
-    ts: buffer<i64, 2> = {0, 50000000};
+    if (pid < 0) { signal.Unblock(); s: Status; s.Failed = true; s.Code = 1; return s; }
     st: Status;
     for (;;) {
-        sig := timedSignal(set, ts);
+        sig := signal.Wait(50000000);
         if (sig > 0) native_kill((pid->i32)->int, (sig)->int);
         done, status := WaitNoHang(pid);
         if (done) { st = status; break; }
     }
-    native_sigprocmask((MacOS() ? 3 : 2), (old)->int, (zero(buffer<i8>))->int);
+    signal.Unblock();
     return st;
 }
 
@@ -176,29 +177,13 @@ func ReadFd(fd int, max int) string {
 }
 func ReadAllFd(fd int) string { return readAll(fd->i32); }
 func Kill(pid int, sig int) { if (Windows()) { WinTerminate(pid, 128 + sig); return; } native_kill((pid->i32)->int, (sig->i32)->int); }
-func Setenv(name string, value string) { a := CStr(name); b := CStr(value); if (Windows()) { WinEnv(a.data->int, b.data->int); return; } native_setenv((a.data)->int, (b.data)->int, (1->i32)->int); }
-func Unsetenv(name string) { if (Windows()) { Setenv(name, ""); return; } a := CStr(name); native_unsetenv((a.data)->int); }
+func Setenv(name string, value string) { os.Setenv(name, value); }
+func Unsetenv(name string) { os.Unsetenv(name); }
 
 
 // SpawnMapped starts argv with descriptor mappings (pairs: from, to). Every
 // other inherited mapping source is closed in the child.
-// BlockSignals defers SIGINT/SIGTERM/SIGHUP so PendingSignal can poll them.
-func BlockSignals() {
-    set: buffer<i8, 128>;
-    native_sigemptyset((set)->int);
-    native_sigaddset((set)->int, (2->i32)->int); native_sigaddset((set)->int, (15->i32)->int); native_sigaddset((set)->int, (1->i32)->int);
-    native_sigprocmask((MacOS() ? 1 : 0), (set)->int, (zero(buffer<i8>))->int);
-}
-// PendingSignal consumes one blocked SIGINT/SIGTERM/SIGHUP (0 if none).
-func PendingSignal() int {
-    set: buffer<i8, 128>;
-    native_sigemptyset((set)->int);
-    native_sigaddset((set)->int, (2->i32)->int); native_sigaddset((set)->int, (15->i32)->int); native_sigaddset((set)->int, (1->i32)->int);
-    ts: buffer<i64, 2> = {0, 0};
-    sig := timedSignal(set, ts);
-    return sig > 0 ? sig -> int : 0;
-}
-func UnblockSignals() { unblockSignals(); }
+
 
 func SpawnMapped(argv array<string>, maps []int, devNullStdin bool, ownGroup bool) int {
     return SpawnMappedSig(argv, maps, devNullStdin, ownGroup, false);
@@ -242,7 +227,7 @@ func SpawnMappedSig(argv array<string>, maps []int, devNullStdin bool, ownGroup 
             fd := native_open((devnull.data)->int, (0->i32)->int, 0);
             if (fd >= 0) { native_dup2((fd)->int, (0->i32)->int); native_close((fd)->int); }
         }
-        if (IndexByte(argv[0], '/') >= 0) native_execv((storage[0].data)->int, (ptrs.data)->int);
+        if (strings.IndexByte(argv[0], '/') >= 0) native_execv((storage[0].data)->int, (ptrs.data)->int);
         else native_execvp((storage[0].data)->int, (ptrs.data)->int);
         extern._exit(127->i32);
     }
@@ -288,45 +273,16 @@ func WriteSome(fd int, s string) int {
     return native_write((fd->i32)->int, (b.data)->int, (len(b))->int);
 }
 
-func clock(id int) (int, int) {
-    if (Windows()) {
-        value: int;
-        if (id == 0) { WinTime((&value)->int); value -= 116444736000000000; return value / 10000000, (value % 10000000) * 100; }
-        frequency: int; WinFrequency((&frequency)->int); WinCounter((&value)->int);
-        return value / frequency, ((value % frequency) * 1000000000) / frequency;
-    }
-    ts: buffer<i8, 16>;
-    native_clock_gettime((id->i32)->int, (ts)->int);
-    base := addr(ts);
-    return *(base -> (*int)), *((base + 8) -> (*int));
-}
 // MonoSeconds is a monotonic clock in seconds.
-func MonoSeconds() float { s, ns := clock(MacOS() ? 6 : 1); return (s -> float) + (ns -> float) / 1000000000.0; }
-func RealNow() (int, int) { return clock(0); }
+func MonoSeconds() float { return (time.Monotonic() -> float) / 1000000000.0; }
+// RealNow is the wall clock as Unix seconds and nanoseconds.
+func RealNow() (int, int) { now := time.Now(); return now / 1000000000, now % 1000000000; }
 func KillGroup(pid int, sig int) { if (Windows()) { Kill(pid, sig); return; } native_kill(((-pid)->i32)->int, (sig->i32)->int); }
 
 // Fork duplicates the process; returns 0 in the child.
 func Fork() int { return native_fork() -> int; }
 // ExitNow terminates immediately without running atexit handlers.
 func ExitNow(code int) { extern._exit(code->i32); }
-
-// macOS has sigwait and sigpending, but no sigtimedwait. Only consume a
-// signal already pending in the blocked set, sleeping between foreground polls.
-func timedSignal(set buffer<i8>, timeout buffer<i64>) int {
-    if (!MacOS()) return native_sigtimedwait(set->int, 0, timeout->int);
-    pending: buffer<i8, 128>;
-    for (attempt := 0; attempt < 2; attempt++) {
-        native_sigpending(pending->int);
-        for (_, sig := range []int{2, 15, 1}) {
-            if (native_sigismember(pending->int, sig) == 1) {
-                received: i32;
-                if (native_sigwait(set->int, (&received)->int) == 0) return received->int;
-            }
-        }
-        if (attempt == 0) native_nanosleep(timeout->int, 0);
-    }
-    return 0;
-}
 
 // The CRT spawn API reparses a command line on Windows. Quote every argument,
 // doubling backslashes before quotes and before the closing quote.
@@ -336,7 +292,7 @@ func windowsArg(arg string) string {
         if (i < len(arg) && arg[i] == '\\') { slashes++; continue; }
         end := i == len(arg);
         quote := !end && arg[i] == '"';
-        out += Repeat("\\", (end || quote) ? slashes * 2 : slashes);
+        out += strings.Repeat("\\", (end || quote) ? slashes * 2 : slashes);
         slashes = 0;
         if (end) break;
         if (quote) out += "\\";

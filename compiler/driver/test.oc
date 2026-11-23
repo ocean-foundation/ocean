@@ -2,6 +2,12 @@ package driver;
 import "github.com/ocean-foundation/ocean/compiler/loader";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "os";
+import "os/signal";
+import "path" as filepath;
+import "strconv";
+import "strings";
+import "unicode";
 
 struct TestResult { name string; output string; status int; elapsed float; }
 
@@ -80,7 +86,7 @@ func jsonQuote(s string) string {
 // jsonField extracts a string field from one event line (fixed testing.oc shape).
 func jsonField(line string, key string) string {
     prefix := "\"" + key + "\":\"";
-    p := util.Index(line, prefix);
+    p := strings.Index(line, prefix);
     if (p < 0) return "";
     i := p + len(prefix);
     b: util.Buf;
@@ -109,11 +115,11 @@ func hexValue(c i8) int {
     return 0;
 }
 func jsonElapsed(line string) float {
-    p := util.Index(line, "\"Elapsed\":");
+    p := strings.Index(line, "\"Elapsed\":");
     if (p < 0) return 0.0;
     i := p + 10;
     j := i;
-    for (j < len(line) && (util.IsDigit(line[j]) || line[j] == '.' || line[j] == '-' || line[j] == 'e')) j++;
+    for (j < len(line) && (unicode.IsDigit(line[j]) || line[j] == '.' || line[j] == '-' || line[j] == 'e')) j++;
     return parseFloatText(line[i:j]);
 }
 func parseFloatText(s string) float {
@@ -123,7 +129,7 @@ func parseFloatText(s string) float {
     for (; i < len(s); i++) {
         c := s[i];
         if (c == '.') { seenDot = true; continue; }
-        if (!util.IsDigit(c)) break;
+        if (!unicode.IsDigit(c)) break;
         d := (c - '0') -> float;
         if (seenDot) { scale = scale / 10.0; frac = frac + d * scale; } else v = v * 10.0 + d;
     }
@@ -131,7 +137,7 @@ func parseFloatText(s string) float {
     return neg ? -v : v;
 }
 
-func two(n int) string { if (n < 10) return "0" + util.Itoa(n); return util.Itoa(n); }
+func two(n int) string { if (n < 10) return "0" + strconv.Itoa(n); return strconv.Itoa(n); }
 
 // timestamp formats the current UTC time as RFC 3339 with nanoseconds.
 func timestamp() string {
@@ -149,9 +155,9 @@ func timestamp() string {
     d := doy - (153 * mp + 2) / 5 + 1;
     m := mp < 10 ? mp + 3 : mp - 9;
     if (m <= 2) y++;
-    ns := util.Itoa(nsec);
+    ns := strconv.Itoa(nsec);
     for (len(ns) < 9) ns = "0" + ns;
-    return util.Itoa(y) + "-" + two(m) + "-" + two(d) + "T" + two(rem / 3600) + ":" + two((rem / 60) % 60) + ":" + two(rem % 60) + "." + ns + "Z";
+    return strconv.Itoa(y) + "-" + two(m) + "-" + two(d) + "T" + two(rem / 3600) + ":" + two((rem / 60) % 60) + ":" + two(rem % 60) + "." + ns + "Z";
 }
 
 func hexEncode(s string) string {
@@ -235,11 +241,11 @@ func testEvent(r *Reporter, line string) {
 
 func outputLines(r *Reporter, text string, indent int) {
     if (text == "") return;
-    lines := util.Split(text, '\n');
+    lines := strings.Split(text, "\n");
     if (len(lines) > 0 && lines[len(lines) - 1] == "") lines.pop();
-    for (_, l := range lines) tprint(r, util.Repeat(" ", indent) + l + "\n");
+    for (_, l := range lines) tprint(r, strings.Repeat(" ", indent) + l + "\n");
 }
-func rule(r *Reporter, n int) { tprint(r, util.Repeat("─", n)); }
+func rule(r *Reporter, n int) { tprint(r, strings.Repeat("─", n)); }
 
 func durationText(e float) string {
     s := "";
@@ -247,10 +253,10 @@ func durationText(e float) string {
     else if (e >= 0.001) s = util.FormatFixed(e * 1000.0, 3) + "ms";
     else if (e >= 0.000001) s = util.FormatFixed(e * 1000000.0, 3) + "µs";
     else s = util.FormatFixed(e * 1000000000.0, 0) + "ns";
-    dot := util.IndexByte(s, '.');
+    dot := strings.IndexByte(s, '.');
     if (dot >= 0) {
         end := dot + 1;
-        for (end < len(s) && util.IsDigit(s[end])) end++;
+        for (end < len(s) && unicode.IsDigit(s[end])) end++;
         trim := end;
         for (trim > dot + 1 && s[trim - 1] == '0') trim--;
         if (trim == dot + 1) trim = dot;
@@ -281,11 +287,11 @@ func details(r *Reporter, lineWidth int, status int) {
         word := t.status == 1 ? "PASS" : (t.status == 3 ? "SKIP" : "FAIL");
         color := "";
         if (r.color) color = t.status == 1 ? "\x1b[32m" : (t.status == 3 ? "\x1b[33m" : "\x1b[31m");
-        tprint(r, util.Repeat(" ", 4 + depth * 4) + "--- " + color + word + (r.color ? "\x1b[0m" : "") + ": " + t.name + " (" + util.FormatFixed(t.elapsed, 2) + "s)\n");
+        tprint(r, strings.Repeat(" ", 4 + depth * 4) + "--- " + color + word + (r.color ? "\x1b[0m" : "") + ": " + t.name + " (" + util.FormatFixed(t.elapsed, 2) + "s)\n");
         outputLines(r, t.output, 4 + depth * 4);
     }
     if (shown > 0) tprint(r, "\n");
-    if (status != 0 && (!r.completed || r.failed == 0)) tprint(r, "✗ " + r.pkg + ": test process exited before completing (status " + util.Itoa(status) + ")\n");
+    if (status != 0 && (!r.completed || r.failed == 0)) tprint(r, "✗ " + r.pkg + ": test process exited before completing (status " + strconv.Itoa(status) + ")\n");
 }
 
 func clip(s string, w int) string { if (len(s) > w) return s[0:w]; return s; }
@@ -320,8 +326,8 @@ func summary(r *Reporter, elapsed float, status int) {
         counts := []int{r.passed, r.failed, r.skipped, total};
         for (i := 0; i < 4; i++) {
             if (i > 0) tprint(r, "   ");
-            if (row == 0 && counts[i] == 0) tprint(r, util.Repeat(" ", widths[i]));
-            else tprint(r, util.PadLeft(util.Itoa(counts[i]), widths[i]));
+            if (row == 0 && counts[i] == 0) tprint(r, strings.Repeat(" ", widths[i]));
+            else tprint(r, util.PadLeft(strconv.Itoa(counts[i]), widths[i]));
         }
         tprint(r, "  " + util.PadLeft(dur, timeWidth) + "\n");
     }
@@ -356,7 +362,7 @@ func testExecute(r *Reporter, executable string, displayExe string) int {
     if (!r.shared) { maps.append(grR); maps.append(199); }
     else maps.append(199, 199);
     if (!r.shared) util.SetNonblock(grR);
-    argv := []string{executable, "--ocean-test-workers", util.Itoa(r.workers)};
+    argv := []string{executable, "--ocean-test-workers", strconv.Itoa(r.workers)};
     pid := util.SpawnMapped(argv.array(), maps, r.displayFD >= 0, false);
     util.CloseFd(evW); util.CloseFd(outW);
     if (!r.shared) { util.CloseFd(grR); r.grantFD = grW; util.SetNonblock(grW); }
@@ -366,10 +372,10 @@ func testExecute(r *Reporter, executable string, displayExe string) int {
     fds := []int{evR, outR};
     open := 2;
     interrupted := 0;
-    if (!r.shared) util.BlockSignals();
+    if (!r.shared) signal.Block();
     for (open > 0) {
         if (!r.shared) {
-            sig := util.PendingSignal();
+            sig := signal.Pending();
             if (sig == 0 && checkDisplay(r)) sig = 2;
             if (sig != 0 && interrupted == 0) { interrupted = sig; util.Kill(pid, sig); }
         }
@@ -396,7 +402,7 @@ func testExecute(r *Reporter, executable string, displayExe string) int {
         }
     }
     st := util.Wait(pid);
-    if (!r.shared) util.UnblockSignals();
+    if (!r.shared) signal.Unblock();
     if (r.grantFD >= 0) { util.CloseFd(r.grantFD); r.grantFD = -1; }
     status := st.Code;
     if (st.Failed) status = 1;
@@ -494,12 +500,12 @@ func parseTimeout(s string) (float, int) {
     neg := false;
     if (i < len(s) && (s[i] == '+' || s[i] == '-')) { neg = s[i] == '-'; i++; }
     digits := 0; numStart := i;
-    for (i < len(s) && util.IsDigit(s[i])) { i++; digits++; }
-    if (i < len(s) && s[i] == '.') { i++; for (i < len(s) && util.IsDigit(s[i])) { i++; digits++; } }
+    for (i < len(s) && unicode.IsDigit(s[i])) { i++; digits++; }
+    if (i < len(s) && s[i] == '.') { i++; for (i < len(s) && unicode.IsDigit(s[i])) { i++; digits++; } }
     if (digits > 0 && i < len(s) && (s[i] == 'e' || s[i] == 'E')) {
         k := i + 1;
         if (k < len(s) && (s[k] == '+' || s[k] == '-')) k++;
-        if (k < len(s) && util.IsDigit(s[k])) { i = k; for (i < len(s) && util.IsDigit(s[i])) i++; }
+        if (k < len(s) && unicode.IsDigit(s[k])) { i = k; for (i < len(s) && unicode.IsDigit(s[i])) i++; }
     }
     if (digits == 0) i = start; // no conversion: the whole text is the suffix
     unit := s[i:];
@@ -533,8 +539,9 @@ func testOne(args []string, shared bool) int {
         else if (a == "-t") {
             i++;
             if (i >= len(args)) { util.Stderr("ocean test: -t requires a positive thread count\n"); return 1; }
-            n, ok := util.Atoi(args[i]);
-            if (!ok || n < 1 || n > 2147483647) { util.Stderr("ocean test: -t requires a positive thread count (1..2147483647)\n"); return 1; }
+            parsed := strconv.Atoi(args[i]);
+            n := parsed.unwrapOrZero();
+            if (parsed.hasError() || n < 1 || n > 2147483647) { util.Stderr("ocean test: -t requires a positive thread count (1..2147483647)\n"); return 1; }
             r.workers = n;
         } else if (a == "--timeout" || a == "-timeout") {
             i++;
@@ -551,7 +558,7 @@ func testOne(args []string, shared bool) int {
         else if (a == "--outfile" || a == "-outfile" || a == "-o" || a == "--jsonfile" || a == "-jsonfile") {
             i++;
             if (i >= len(args)) { util.Stderr("ocean test: " + a + " requires a path\n"); return 1; }
-            if (util.Contains(a, "jsonfile")) jsonPath = args[i]; else reportPath = args[i];
+            if (strings.Contains(a, "jsonfile")) jsonPath = args[i]; else reportPath = args[i];
         } else if (len(a) > 0 && a[0] == '-') { util.Stderr("ocean test: unknown option: " + a + "\n"); return 1; }
         else if (haveLocation) { util.Stderr("ocean test accepts one package location\n"); return 1; }
         else { location = a; haveLocation = true; }
@@ -564,7 +571,7 @@ func testOne(args []string, shared bool) int {
     }
     dir, dok := util.MakeTempDir(".ocean-test-");
     if (!dok) { util.Stderr("ocean test: temporary directory\n"); return 1; }
-    exe := dir + "/program" + util.ExeSuffix();
+    exe := dir + "/program" + os.ExeSuffix();
     diags := newDiags();
     prog := Frontend(location, true, dir + "/harness", diags);
     failed := prog.fatal || !prog.ok;
@@ -597,7 +604,7 @@ func testOne(args []string, shared bool) int {
         if (r.jsonFD < 0) { util.Stderr("ocean test: result file: could not open " + jsonPath + "\n"); util.RemoveAll(dir); return 1; }
     }
     pkg, ok := util.Realpath(location);
-    if (ok && !util.IsDir(pkg)) pkg = util.Dir(pkg);
+    if (ok && !util.IsDir(pkg)) pkg = filepath.Dir(pkg);
     if (!ok) pkg = location;
     if (shared) pkg = loader.NewBuild(newDiags()).PackageTestPath(location);
     r.pkg = pkg;
@@ -627,7 +634,7 @@ func findPackages(list *[]string, path string) bool {
     names, ok := util.ListDir(path);
     if (!ok) { util.Stderr(path + ": cannot read directory\n"); return false; }
     sources := false;
-    for (_, n := range names) { if (len(n) > 3 && util.HasSuffix(n, ".oc")) sources = true; }
+    for (_, n := range names) { if (len(n) > 3 && strings.HasSuffix(n, ".oc")) sources = true; }
     if (sources) addLocation(list, path);
     for (_, n := range names) {
         if (n[0] == '.' || n == "vendor" || n == "node_modules") continue;
@@ -641,8 +648,8 @@ func addLocation(list *[]string, path string) bool {
     resolved := loader.NewBuild(newDiags()).PackageTestLocation(path);
     if (resolved == "") { util.Stderr(path + ": No such file or directory\n"); return false; }
     if (!util.IsDir(resolved)) {
-        if (!util.HasSuffix(resolved, ".oc")) { util.Stderr("ocean test: expected an Ocean file or package directory: " + path + "\n"); return false; }
-        resolved = util.Dir(resolved);
+        if (!strings.HasSuffix(resolved, ".oc")) { util.Stderr("ocean test: expected an Ocean file or package directory: " + path + "\n"); return false; }
+        resolved = filepath.Dir(resolved);
     }
     for (_, x := range *list) { if (x == resolved) return true; }
     (*list).append(resolved);
@@ -674,13 +681,13 @@ func testMain(args []string) int {
             if (value && i + 1 < len(rest)) {
                 i++;
                 flags.append(rest[i]);
-                if (util.Contains(a, "jsonfile")) jsonFile = rest[i];
-                else if (a == "-o" || util.Contains(a, "outfile")) report = rest[i];
+                if (strings.Contains(a, "jsonfile")) jsonFile = rest[i];
+                else if (a == "-o" || strings.Contains(a, "outfile")) report = rest[i];
             }
             continue;
         }
         count++;
-        if (a == "..." || util.HasSuffix(a, "/...")) {
+        if (a == "..." || strings.HasSuffix(a, "/...")) {
             recursive = true;
             base := a == "..." ? "." : a[0:len(a) - 4];
             if (base == "") base = "/";
@@ -698,7 +705,7 @@ func testMain(args []string) int {
         if (len(list) == 0) util.Stderr("ocean test: no packages matched\n");
         return 1;
     }
-    if ((report != "" && util.HasSuffix(report, ".oc")) || (jsonFile != "" && util.HasSuffix(jsonFile, ".oc"))) {
+    if ((report != "" && strings.HasSuffix(report, ".oc")) || (jsonFile != "" && strings.HasSuffix(jsonFile, ".oc"))) {
         util.Stderr("ocean test: output would overwrite an Ocean source file\n"); return 1;
     }
     return testPackages(flags, list, report, jsonFile, json, notty);

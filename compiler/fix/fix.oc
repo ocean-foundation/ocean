@@ -5,6 +5,9 @@ import "github.com/ocean-foundation/ocean/compiler/loader";
 import "github.com/ocean-foundation/ocean/compiler/parser";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "path" as filepath;
+import "strconv";
+import "strings";
 
 
 func quiet() *diag.List { d := diag.NewList(); d.live = false; return d; }
@@ -19,7 +22,7 @@ func ocFiles(dir string) []string {
     names, ok := util.ListDir(dir);
     if (!ok) return out;
     for (_, n := range names) {
-        if (len(n) < 4 || !util.HasSuffix(n, ".oc")) continue;
+        if (len(n) < 4 || !strings.HasSuffix(n, ".oc")) continue;
         p := dir + "/" + n;
         if (util.IsRegular(p)) out.append(p);
     }
@@ -46,7 +49,7 @@ func directoryTypes(dir string, qualifier string, exportedOnly bool, known *map[
     return pkgName;
 }
 
-func pathPrefix(path string, base string) bool { return util.HasPrefix(path, base) && (len(path) == len(base) || path[len(base)] == '/'); }
+func pathPrefix(path string, base string) bool { return strings.HasPrefix(path, base) && (len(path) == len(base) || path[len(base)] == '/'); }
 
 // importDirectory resolves an import without downloading anything.
 func importDirectory(b *loader.Build, mod *ast.Module, path string) string {
@@ -109,7 +112,7 @@ func fixFile(path string, known map[string]bool) int {
     ftoks, sok := scanner.Scan(path, current, live, true);
     if (sok) { final.tokens = ftoks; parser.ParseFile(final, live, false); }
     if (total > 0 && current != text) {
-        tmp := path + ".ocean-fix-" + util.Itoa(util.Pid());
+        tmp := path + ".ocean-fix-" + strconv.Itoa(util.Pid());
         if (!util.WriteFile(tmp, current)) { util.Stderr("ocean fix: cannot write " + path + "\n"); util.Remove(tmp); return -1; }
         m := statMode(path);
         if (m >= 0) util.Chmod(tmp, m & 4095);
@@ -147,7 +150,7 @@ func fixDirectory(b *loader.Build, dir string) bool {
                 if (location != "" && util.IsDir(location) && (!hasAlias || alias != "_")) {
                     ignored: map[string]bool;
                     declared := directoryTypes(location, "", true, &ignored);
-                    slash := util.LastIndexByte(importPath, '/');
+                    slash := strings.LastIndexByte(importPath, '/');
                     qualifier := hasAlias ? alias : (declared != "" ? declared : (slash >= 0 ? importPath[slash + 1:] : importPath));
                     directoryTypes(location, qualifier == "." ? "" : qualifier, true, &known);
                 }
@@ -160,7 +163,7 @@ func fixDirectory(b *loader.Build, dir string) bool {
     for (_, path := range files) {
         changed := fixFile(path, known);
         if (changed < 0) failed = true;
-        else if (changed > 0) util.Stdout("ocean fix: " + loader.RelativeSourcePath(path) + ": " + util.Itoa(changed) + " type" + (changed == 1 ? "" : "s") + " rewritten\n");
+        else if (changed > 0) util.Stdout("ocean fix: " + loader.RelativeSourcePath(path) + ": " + strconv.Itoa(changed) + " type" + (changed == 1 ? "" : "s") + " rewritten\n");
     }
     return failed;
 }
@@ -171,7 +174,7 @@ func fixTree(b *loader.Build, dir string) bool {
     hasSource := false;
     children := make([]string);
     for (_, n := range names) {
-        if (len(n) > 3 && util.HasSuffix(n, ".oc")) hasSource = true;
+        if (len(n) > 3 && strings.HasSuffix(n, ".oc")) hasSource = true;
         if (n[0] == '.' || n == "vendor" || n == "node_modules") continue;
         p := dir + "/" + n;
         if (util.IsDir(p) && !util.IsSymlink(p)) children.append(p);
@@ -189,14 +192,14 @@ func Main(locations []string) int {
     if (len(locations) == 0) locations.append(".");
     for (_, original := range locations) {
         location := original;
-        recursive := util.HasSuffix(location, "...") && (len(location) == 3 || location[len(location) - 4] == '/');
+        recursive := strings.HasSuffix(location, "...") && (len(location) == 3 || location[len(location) - 4] == '/');
         if (recursive) location = len(location) > 3 ? location[0:len(location) - 4] : "";
         if (location == "") location = ".";
         path, ok := util.Realpath(location);
         if (!ok) { util.Stderr("ocean fix: location does not exist: " + original + "\n"); failed = true; continue; }
         if (!util.IsDir(path)) {
-            if (!util.HasSuffix(path, ".oc")) { util.Stderr("ocean fix: expected an Ocean file or package directory: " + original + "\n"); failed = true; continue; }
-            path = util.Dir(path);
+            if (!strings.HasSuffix(path, ".oc")) { util.Stderr("ocean fix: expected an Ocean file or package directory: " + original + "\n"); failed = true; continue; }
+            path = filepath.Dir(path);
         }
         if (recursive) failed = fixTree(b, path) || failed;
         else failed = fixDirectory(b, path) || failed;

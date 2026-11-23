@@ -1,6 +1,9 @@
 package driver;
 import "github.com/ocean-foundation/ocean/compiler/loader";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "os/signal";
+import "strconv";
+import "strings";
 
 struct PackageRun {
     pid int;
@@ -46,7 +49,7 @@ func packageSummary(out *Reporter, runs []*PackageRun, elapsed float) {
         if (util.Width(d) > timeWidth) timeWidth = util.Width(d);
     }
     widths := []int{digits(totals[0]), digits(totals[1]), digits(totals[2]), digits(totals[3])};
-    label := "(" + util.Itoa(len(runs)) + " packages)";
+    label := "(" + strconv.Itoa(len(runs)) + " packages)";
     minLabel := len(label);
     if (minLabel < 13) minLabel = 13;
     if (nameWidth + statusWidth + 4 < minLabel) nameWidth = minLabel - statusWidth - 4;
@@ -84,8 +87,8 @@ func packageSummary(out *Reporter, runs []*PackageRun, elapsed float) {
         }
         for (j := 0; j < 4; j++) {
             if (j > 0) tprint(out, "   ");
-            if (row < len(runs) && vals[j] == 0) tprint(out, util.Repeat(" ", widths[j]));
-            else tprint(out, util.PadLeft(util.Itoa(vals[j]), widths[j]));
+            if (row < len(runs) && vals[j] == 0) tprint(out, strings.Repeat(" ", widths[j]));
+            else tprint(out, util.PadLeft(strconv.Itoa(vals[j]), widths[j]));
         }
         tprint(out, "  " + util.PadLeft(dur, timeWidth) + "\n");
     }
@@ -102,8 +105,9 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
         else if (f == "-t") {
             i++;
             if (i >= len(flags)) { util.Stderr("ocean test: -t requires a thread count\n"); return 1; }
-            n, ok := util.Atoi(flags[i]);
-            if (!ok || n < 1) { util.Stderr("ocean test: invalid thread count\n"); return 1; }
+            parsed := strconv.Atoi(flags[i]);
+            n := parsed.unwrapOrZero();
+            if (parsed.hasError() || n < 1) { util.Stderr("ocean test: invalid thread count\n"); return 1; }
             workers = n;
         } else if (f == "--no-color") color = false;
         else if (f == "-v" || f == "--include-passed") includePassed = true;
@@ -140,7 +144,7 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
             else util.Stderr("ocean test: live display unavailable; using final report\n");
         }
     }
-    util.BlockSignals();
+    signal.Block();
     interrupted := 0;
     cancelled := 0.0;
     runs := make([]*PackageRun);
@@ -162,7 +166,7 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
     for (finished < len(runs)) {
         if (checkDisplay(ui) && interrupted == 0) interrupted = 2;
         if (ui.displayFD < 0) { for (_, p := range runs) p.r.displayFD = -1; }
-        sig := util.PendingSignal();
+        sig := signal.Pending();
         if (sig != 0 && interrupted == 0) interrupted = sig;
         if (interrupted != 0 && cancelled == 0.0) {
             cancelled = util.MonoSeconds(); status = 128 + interrupted;
@@ -238,7 +242,7 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
     if (interrupted != 0) status = 128 + interrupted;
     stopDisplay(ui, util.MonoSeconds() - start, status);
     if (tmpDir != "") util.RemoveAll(tmpDir);
-    util.UnblockSignals();
+    signal.Unblock();
     done := make([]*PackageRun);
     for (i := 0; i < next; i++) done.append(runs[i]);
     packageSummary(runs[0].r, done, util.MonoSeconds() - start);

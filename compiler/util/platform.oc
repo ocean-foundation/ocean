@@ -1,52 +1,12 @@
 package util;
 
-// Host detection uses matching Ocean asm blocks; no environment override can
-// change the ABI of the running compiler.
-func HostOS() string {
-    n := 0;
-    asm x86_64/macos { mov qword ptr ${n}, 1 }
-    asm aarch64/macos {
-        mov x0, #1
-        str x0, ${n}
-    }
-    asm x86_64/windows { mov qword ptr ${n}, 2 }
-    asm aarch64/windows {
-        mov x0, #2
-        str x0, ${n}
-    }
-    return n == 1 ? "macos" : (n == 2 ? "windows" : "linux");
-}
-func HostArch() string {
-    n := 0;
-    asm aarch64 {
-        mov x0, #1
-        str x0, ${n}
-    }
-    asm riscv64 {
-        li a0, 2
-        sd a0, ${n}
-    }
-    return n == 1 ? "aarch64" : (n == 2 ? "riscv64" : "x86_64");
-}
-func Windows() bool { return HostOS() == "windows"; }
-func MacOS() bool { return HostOS() == "macos"; }
-func ExeSuffix() string { return Windows() ? ".exe" : ""; }
+import "os";
+import "path" as filepath;
 
-func Executable() string {
-    out := make([]i8);
-    for (i := 0; i < 32768; i++) out.append(0);
-    if (Windows()) {
-        n := WinExecutable(0, out.data->int, len(out));
-        if (n <= 0 || n >= len(out)) return "";
-        return NormalizePath(out[:n]->string);
-    }
-    if (MacOS()) {
-        size := len(out)->u32;
-        if (MacExecutable(out.data->int, (&size)->int) != 0) return "";
-        path, ok := Realpath(FromC(out.data));
-        return ok ? path : "";
-    }
-    path := CStr("/proc/self/exe");
-    n := native_readlink(path.data->int, out.data->int, len(out) - 1);
-    return n > 0 ? out[:n]->string : "";
-}
+// Host helpers over the standard library. The compiler runs on its own target,
+// so the target reported by os.OS() is the host.
+func Windows() bool { return os.OS() == "windows"; }
+func MacOS() bool { return os.OS() == "macos"; }
+
+// Executable is the running compiler's absolute path, with '/' separators.
+func Executable() string { return filepath.ToSlash(os.Executable().unwrapOrZero()); }

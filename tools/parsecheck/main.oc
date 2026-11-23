@@ -5,6 +5,7 @@ import "github.com/ocean-foundation/ocean/compiler/diag";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/parser";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "strconv";
 
 func main() int {
     args := os.Args();
@@ -21,6 +22,6 @@ func main() int {
         _, pok := parser.ParseFile(src, d, false);
         if (!pok) bad++;
     }
-    util.Stdout(util.Itoa(len(args) - 1) + " files, " + util.Itoa(bad) + " failed\n");
+    util.Stdout(strconv.Itoa(len(args) - 1) + " files, " + strconv.Itoa(bad) + " failed\n");
     return bad > 0 ? 1 : 0;
 }

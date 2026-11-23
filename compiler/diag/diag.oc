@@ -1,5 +1,6 @@
 package diag;
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "strconv";
 
 // Diagnostic is one compiler message, reported in ocean-c's format:
 // [file:line:col]: phase severity: message, then a source snippet.
@@ -70,7 +71,7 @@ func Snippet(text string, line int, col int) string {
     end := start;
     for (end < len(text) && text[end] != '\n' && text[end] != '\r' && text[end] != 0) end++;
     b: util.Buf;
-    prefix := " " + util.Itoa(line) + " | ";
+    prefix := " " + strconv.Itoa(line) + " | ";
     b.Add(prefix).Add(text[start:end]).Add("\n");
     for (i := 0; i < len(prefix); i++) b.Addc(prefix[i] == '|' ? '|'->i8 : ' '->i8);
     caret := col - 1;

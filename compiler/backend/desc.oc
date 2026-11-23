@@ -2,6 +2,7 @@ package backend;
 import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/check";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "strings";
 
 func descKind(t *ast.Type) int {
     u := under(t);
@@ -168,7 +169,7 @@ func methodTable(g *Gen, t *ast.Type, name string) string {
     if (len(entries) == 0) return "null";
     g.lastMethodCount = len(entries);
     tn := name + ".methods";
-    g.globals.Add(tn).Add(" = private constant [").AddInt(len(entries)).Add(" x {ptr, ptr}] [").Add(util.JoinList(entries, ", ")).Add("]\n");
+    g.globals.Add(tn).Add(" = private constant [").AddInt(len(entries)).Add(" x {ptr, ptr}] [").Add(strings.Join(entries, ", ")).Add("]\n");
     return tn;
 }
 

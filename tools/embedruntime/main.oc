@@ -1,5 +1,6 @@
 package main;
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "strings";
 
 // Keep the runtime generator in Ocean so Make only needs the bootstrap compiler.
 func main() int {
@@ -9,8 +10,8 @@ func main() int {
     names := []string{"Core", "Threads", "Process", "Ffi", "Wasm"};
     for (i, file := range files) {
         source, ok := util.ReadFile(dir + file);
-        if (!ok || util.Contains(source, "`")) { util.Stderr("cannot embed " + file + "\n"); return 1; }
-        source = util.Replace(source, "\r\n", "\n");
+        if (!ok || strings.Contains(source, "`")) { util.Stderr("cannot embed " + file + "\n"); return 1; }
+        source = strings.ReplaceAll(source, "\r\n", "\n");
         out += "func " + names[i] + "() string {\n    return `" + source + "`;\n}\n";
         if (i + 1 < len(files)) out += "\n";
     }

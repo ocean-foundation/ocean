@@ -2,6 +2,7 @@ package backend;
 import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/check";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "strings";
 
 func runtimeDecls() string {
     return "declare ptr @oc_alloc(i64)\n" +
@@ -232,7 +233,7 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
     }
     decls := runtimeDecls();
     // WebAssembly (without the threads proposal) has no thread-local storage.
-    if (g.wasm) decls = util.Replace(decls, "external thread_local global", "external global");
+    if (g.wasm) decls = strings.ReplaceAll(decls, "external thread_local global", "external global");
     out.Add(decls);
     if (g.usesThreads) out.Add(threadDecls());
     for (_, name := range g.declOrder) out.Add(g.decls[name]).Add("\n");
@@ -271,5 +272,5 @@ func emitGenericMethods(g *Gen) {
     }
     g.globals.Add("@oc_generic_method_count = constant i64 ").AddInt(len(entries)).Add("\n");
     if (len(entries) == 0) { g.globals.Add("@oc_generic_methods = constant [0 x {ptr, ptr, ptr}] zeroinitializer\n"); return; }
-    g.globals.Add("@oc_generic_methods = constant [").AddInt(len(entries)).Add(" x {ptr, ptr, ptr}] [").Add(util.JoinList(entries, ", ")).Add("]\n");
+    g.globals.Add("@oc_generic_methods = constant [").AddInt(len(entries)).Add(" x {ptr, ptr, ptr}] [").Add(strings.Join(entries, ", ")).Add("]\n");
 }

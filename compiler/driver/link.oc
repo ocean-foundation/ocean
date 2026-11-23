@@ -4,6 +4,11 @@ import "github.com/ocean-foundation/ocean/compiler/diag";
 import "github.com/ocean-foundation/ocean/compiler/backend";
 import "github.com/ocean-foundation/ocean/compiler/runtime";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "os";
+import "path" as filepath;
+import "strconv";
+import "strings";
+import "unicode";
 
 func usesPackage(p *Program, path string) bool {
     for (_, pk := range p.checker.Packages()) { if (pk.std && pk.path == path) return true; }
@@ -16,8 +21,8 @@ func generate(p *Program) (string, bool) {
     opts.usesThreads = p.checker.UsesThreads();
     opts.wasm = targetWasm();
     ir, ok := backend.Generate(p.checker, p.checker.Packages(), p.build.Root(), opts);
-    p.usesFFI = util.Contains(ir, "@oc_cvar_call(");
-    p.usesCurl = util.Contains(ir, "@\"curl_") || util.Contains(ir, "@curl_");
+    p.usesFFI = strings.Contains(ir, "@oc_cvar_call(");
+    p.usesCurl = strings.Contains(ir, "@\"curl_") || strings.Contains(ir, "@curl_");
     return ir, ok;
 }
 
@@ -65,7 +70,7 @@ func clangRun(args []string) bool {
     if (args[0] == "clang") {
         if (util.Windows()) args.append("-D_longjmp=longjmp", "-D__USE_MINGW_SETJMP_NON_SEH");
         for (_, arg := range args) {
-            if (util.HasSuffix(arg, "ocean_ffi.c")) { flags, ok := packageFlags("libffi", "--cflags"); if (ok) args.append(flags...); break; }
+            if (strings.HasSuffix(arg, "ocean_ffi.c")) { flags, ok := packageFlags("libffi", "--cflags"); if (ok) args.append(flags...); break; }
         }
     }
     st, out := util.RunCapture(args.array());
@@ -102,9 +107,9 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
         all.append(irPath);
         all.append(runtimeSources(p, dir)...);
         for (i, f := range all) {
-            o := dir + "/part" + util.Itoa(i) + ".o";
+            o := dir + "/part" + strconv.Itoa(i) + ".o";
             cargs := []string{"clang", optLevel(), "-w", "-Wno-override-module", "-c"};
-            if (util.HasSuffix(f, ".ll")) cargs.append("-x", "ir"); else cargs.append("-x", "c");
+            if (strings.HasSuffix(f, ".ll")) cargs.append("-x", "ir"); else cargs.append("-x", "c");
             cargs.append(f, "-o", o);
             if (!clangRun(cargs)) { util.RemoveAll(dir); return false; }
             parts.append(o);
@@ -117,7 +122,7 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
         }
         cacheStore(key, obj);
     }
-    staged := output + ".ocean-tmp" + (p.isLibrary ? "" : util.ExeSuffix());
+    staged := output + ".ocean-tmp" + (p.isLibrary ? "" : os.ExeSuffix());
     if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
     args := []string{"clang", obj, "-o", staged};
     if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
@@ -160,7 +165,7 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
         util.RemoveAll(dir); return false;
     }
     rts := runtimeSources(p, dir);
-    staged := output + ".ocean-tmp" + (p.isLibrary || targetWasm() ? "" : util.ExeSuffix());
+    staged := output + ".ocean-tmp" + (p.isLibrary || targetWasm() ? "" : os.ExeSuffix());
     if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
     args := []string{"clang", optLevel(), "-w", "-Wno-override-module"};
     if (targetWasm()) {
@@ -174,10 +179,10 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
         all.append(irPath);
         all.append(rts...);
         for (i, f := range all) {
-            obj := dir + "/part" + util.Itoa(i) + ".o";
+            obj := dir + "/part" + strconv.Itoa(i) + ".o";
             cargs := []string{"clang", optLevel(), "-w", "-Wno-override-module", "-ffunction-sections", "-fdata-sections", "-DOC_LIBRARY", "-c"};
             if (targetWasm()) cargs.append(wasmCompileFlags(dir)...);
-            if (util.HasSuffix(f, ".ll")) cargs.append("-x", "ir");
+            if (strings.HasSuffix(f, ".ll")) cargs.append("-x", "ir");
             else cargs.append("-x", "c");
             cargs.append(f, "-o", obj);
             if (!clangRun(cargs)) { util.RemoveAll(dir); return false; }
@@ -210,9 +215,9 @@ func selfContainedIR(p *Program, ir string) (string, bool) {
     if (!ok) return ir, true;
     out: util.Buf;
     out.Add(ir);
-    if (!util.HasSuffix(ir, "\n")) out.Add("\n");
+    if (!strings.HasSuffix(ir, "\n")) out.Add("\n");
     for (i, f := range runtimeSources(p, dir)) {
-        asmPath := dir + "/rt" + util.Itoa(i) + ".s";
+        asmPath := dir + "/rt" + strconv.Itoa(i) + ".s";
         if (!clangRun([]string{"clang", optLevel(), "-w", "-S", "-g0", "-fno-asynchronous-unwind-tables", "-x", "c", f, "-o", asmPath})) { util.RemoveAll(dir); return ir, true; }
         text, rok := util.ReadFile(asmPath);
         if (!rok) { util.RemoveAll(dir); return ir, true; }
@@ -221,13 +226,13 @@ func selfContainedIR(p *Program, ir string) (string, bool) {
             if (k < len(text) && text[k] != '\n') continue;
             line := text[start:k];
             start = k + 1;
-            if (line == "" || util.HasPrefix(util.Trim(line), ".addrsig") || util.HasPrefix(util.Trim(line), ".ident")) continue;
+            if (line == "" || strings.HasPrefix(strings.TrimSpace(line), ".addrsig") || strings.HasPrefix(strings.TrimSpace(line), ".ident")) continue;
             out.Add("module asm \"");
             for (c := 0; c < len(line); c++) {
                 ch := line[c];
                 // local labels are renamed per unit so they cannot collide
                 if (ch == '.' && c + 1 < len(line) && line[c + 1] == 'L' && (c == 0 || !labelChar(line[c - 1]))) {
-                    out.Add(".Locrt").Add(util.Itoa(i)).Add("_");
+                    out.Add(".Locrt").Add(strconv.Itoa(i)).Add("_");
                     c++;
                     continue;
                 }
@@ -265,20 +270,20 @@ func emitAndLink(p *Program, o *BuildOptions) int {
     if (o.run) {
         dir, dok := util.MakeTempDir(".ocean-run-");
         if (!dok) { util.Stderr("ocean run: temporary directory\n"); return 1; }
-        exe := dir + "/program" + util.ExeSuffix();
+        exe := dir + "/program" + os.ExeSuffix();
         if (!compileProgram(p, ir, exe, o.staticLink)) { util.RemoveAll(dir); return 1; }
         argv := make([]string);
         argv.append(exe);
         argv.append(o.programArgs...);
         st := util.RunForeground(argv.array());
         util.RemoveAll(dir);
-        if (st.Signal > 0) util.Stderr("ocean run: program terminated by signal " + util.Itoa(st.Signal) + " (" + util.SignalName(st.Signal) + ")\n");
+        if (st.Signal > 0) util.Stderr("ocean run: program terminated by signal " + strconv.Itoa(st.Signal) + " (" + util.SignalName(st.Signal) + ")\n");
         return st.Code;
     }
     out := o.output;
     if (out == "") {
         if (p.isLibrary) out = p.name + ".o";
-        else { b := util.Base(p.dir); out = (b == "" ? "main" : b) + util.ExeSuffix(); }
+        else { b := filepath.Base(p.dir); out = (b == "" ? "main" : b) + os.ExeSuffix(); }
     }
     for (_, pk := range p.checker.Packages()) {
         for (_, src := range pk.files) {
@@ -313,7 +318,7 @@ func staticCurlFlags() ([]string, bool) {
     return out2, len(out2) > 0;
 }
 
-func labelChar(ch i8) bool { return util.IsLetter(ch) || util.IsDigit(ch) || ch == '_' || ch == '.' || ch == '$'; }
+func labelChar(ch i8) bool { return unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' || ch == '.' || ch == '$'; }
 
 // COFF libraries are indexed archives. Darwin relocatable links must retain
 // private externals referenced by other cached objects.

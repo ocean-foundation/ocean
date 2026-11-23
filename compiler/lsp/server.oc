@@ -1,5 +1,9 @@
 package lsp;
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "path" as filepath;
+import "strconv";
+import "strings";
+import "unicode";
 
 struct Document { uri string; path string; text string; version int; }
 
@@ -13,7 +17,7 @@ struct Server {
 }
 
 func send(body string) {
-    util.Stdout("Content-Length: " + util.Itoa(len(body)) + "\r\n\r\n" + body);
+    util.Stdout("Content-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n" + body);
 }
 
 func reply(id *J, result string) {
@@ -22,7 +26,7 @@ func reply(id *J, result string) {
 }
 func replyError(id *J, code int, message string) {
     idText := nilJ(id) ? "null" : id.raw;
-    send("{\"jsonrpc\":\"2.0\",\"id\":" + idText + ",\"error\":{\"code\":" + util.Itoa(code) + ",\"message\":" + Quote(message) + "}}");
+    send("{\"jsonrpc\":\"2.0\",\"id\":" + idText + ",\"error\":{\"code\":" + strconv.Itoa(code) + ",\"message\":" + Quote(message) + "}}");
 }
 
 // fill reads more of stdin; false at EOF.
@@ -71,9 +75,9 @@ func hexVal(c i8) int {
 
 // uriPath converts a file:// URI to a resolved path ("" if invalid).
 func uriPath(uri string) string {
-    if (!util.HasPrefix(uri, "file://")) return "";
+    if (!strings.HasPrefix(uri, "file://")) return "";
     s := uri[7:];
-    if (util.HasPrefix(s, "localhost/")) s = s[9:];
+    if (strings.HasPrefix(s, "localhost/")) s = s[9:];
     if (len(s) == 0 || s[0] != '/') return "";
     b: util.Buf;
     for (i := 0; i < len(s); i++) {
@@ -88,8 +92,8 @@ func uriPath(uri string) string {
     path := b.String();
     r, ok := util.Realpath(path);
     if (ok) return r;
-    dir, dok := util.Realpath(util.Dir(path));
-    if (dok) return dir + "/" + util.Base(path);
+    dir, dok := util.Realpath(filepath.Dir(path));
+    if (dok) return dir + "/" + filepath.Base(path);
     return "";
 }
 
@@ -100,7 +104,7 @@ func pathURI(path string) string {
     for (i := 0; i < len(path); i++) {
         c := path[i];
         u := (c -> int) & 255;
-        if (util.IsLetter(c) || util.IsDigit(c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') b.Addc(c);
+        if (unicode.IsLetter(c) || unicode.IsDigit(c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') b.Addc(c);
         else { b.Addc('%'); b.Addc(hexUpper(u >> 4)); b.Addc(hexUpper(u & 15)); }
     }
     return b.String();
@@ -121,9 +125,10 @@ func Main() int {
             line, ok := readLine(s);
             if (!ok) { if (len(s.inbuf) - s.inpos == 0) break; bad = true; break; }
             if (line == "\r\n" || line == "\n") break;
-            if (util.HasPrefix(lower(line), "content-length:")) {
-                v, vok := util.Atoi(util.Trim(line[15:]));
-                if (!vok || length >= 0 || v <= 0 || v > 16777216) { bad = true; break; }
+            if (strings.HasPrefix(lower(line), "content-length:")) {
+                parsed := strconv.Atoi(strings.TrimSpace(line[15:]));
+                v := parsed.unwrapOrZero();
+                if (parsed.hasError() || length >= 0 || v <= 0 || v > 16777216) { bad = true; break; }
                 length = v;
             }
         }
@@ -193,12 +198,12 @@ func Main() int {
 }
 
 func publishEmpty(d *Document) {
-    send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" + Quote(d.uri) + ",\"version\":" + util.Itoa(d.version) + ",\"diagnostics\":[]}}");
+    send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" + Quote(d.uri) + ",\"version\":" + strconv.Itoa(d.version) + ",\"diagnostics\":[]}}");
 }
 
 func publish(s *Server, d *Document) {
     items := isolated(s, d, "diagnostics", zero(*J));
-    send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" + Quote(d.uri) + ",\"version\":" + util.Itoa(d.version) + ",\"diagnostics\":[" + items + "]}}");
+    send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" + Quote(d.uri) + ",\"version\":" + strconv.Itoa(d.version) + ",\"diagnostics\":[" + items + "]}}");
 }
 
 func semanticRequest(s *Server, id *J, method string, params *J) {
@@ -211,11 +216,11 @@ func semanticRequest(s *Server, id *J, method string, params *J) {
         if (path == "" || !ok) { reply(id, method == "textDocument/completion" ? "{\"isIncomplete\":false,\"items\":[]}" : "null"); return; }
         d := new(Document); d.uri = uri; d.path = path; d.text = text;
         out := isolated(s, d, method, params);
-        if (util.HasPrefix(out, "!")) replyError(id, -32602, out[1:]); else reply(id, out);
+        if (strings.HasPrefix(out, "!")) replyError(id, -32602, out[1:]); else reply(id, out);
         return;
     }
     out := isolated(s, s.docs[i], method, params);
-    if (util.HasPrefix(out, "!")) replyError(id, -32602, out[1:]);
+    if (strings.HasPrefix(out, "!")) replyError(id, -32602, out[1:]);
     else reply(id, out);
 }
 

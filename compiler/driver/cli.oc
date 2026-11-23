@@ -3,6 +3,7 @@ import "github.com/ocean-foundation/ocean/compiler/diag";
 import "github.com/ocean-foundation/ocean/compiler/fix";
 import "github.com/ocean-foundation/ocean/compiler/lsp";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "path" as filepath;
 
 func usage() string {
     return "Usage: ocean build [--check | --emit-llvm | --static | -s] [-o output] [location]\n" +
@@ -71,7 +72,7 @@ func modMain(args []string) int {
     if (argc < 3 || argc > 4 || args[2] != "init") { util.Stderr(use); return 1; }
     name := "";
     if (argc == 4) name = args[3];
-    else name = util.Base(util.Getcwd());
+    else name = filepath.Base(util.Getcwd());
     if (!loaderValidModulePath(name)) {
         util.Stderr("ocean mod init: invalid module name; provide a name such as github.com/user/project\n");
         return 1;

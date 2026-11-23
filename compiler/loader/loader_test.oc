@@ -2,6 +2,8 @@ package loader;
 import "testing";
 import "github.com/ocean-foundation/ocean/compiler/diag";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "path" as filepath;
+import "strings";
 
 func quiet() *diag.List { d := diag.NewList(); d.live = false; return d; }
 
@@ -11,7 +13,7 @@ func writeTree(t *testing.T, files []string) string {
     real, _ := util.Realpath(dir);
     for (i := 0; i + 1 < len(files); i += 2) {
         path := real + "/" + files[i];
-        util.MkdirAll(util.Dir(path));
+        util.MkdirAll(filepath.Dir(path));
         util.WriteFile(path, files[i + 1]);
     }
     return real;
@@ -33,7 +35,7 @@ func TestModuleResolution(t *testing.T) {
     if (b.root.name != "main" || b.isLibrary) t.Error("root");
     names := "";
     for (_, p := range b.order) names += p.name + " ";
-    if (!util.Contains(names, "helper") || !util.Contains(names, "io") || !util.Contains(names, "sub")) t.Error("order: ", names);
+    if (!strings.Contains(names, "helper") || !strings.Contains(names, "io") || !strings.Contains(names, "sub")) t.Error("order: ", names);
     for (_, p := range b.packages) {
         if (p.name == "helper" && len(p.files) != 2) t.Error("helper files ", len(p.files));
         if (p.name == "io" && !p.std) t.Error("io std");
@@ -73,7 +75,7 @@ func TestTestHarness(t *testing.T) {
     ok := b.LoadTestPackage(root + "/p", root + "/.harness");
     if (!ok) { t.Fatal("load failed: ", b.diags.items[0].message); }
     text := b.root.files[0].text;
-    if (!util.Contains(text, "testing.RunTest(\"TestAdd\", tested.TestAdd);") || !util.Contains(text, "external.TestExt")) t.Error("harness: ", text);
+    if (!strings.Contains(text, "testing.RunTest(\"TestAdd\", tested.TestAdd);") || !strings.Contains(text, "external.TestExt")) t.Error("harness: ", text);
     util.RemoveAll(root);
 }
 
@@ -82,6 +84,6 @@ func TestPaths(t *testing.T) {
     cwd := util.Getcwd();
     if (RelativeSourcePath(cwd + "/x/y.oc") != "x/y.oc") t.Error("rel1 ", RelativeSourcePath(cwd + "/x/y.oc"));
     if (RelativeSourcePath("./a.oc") != "a.oc") t.Error("rel2");
-    if (RelativeSourcePath(util.Dir(cwd) + "/z.oc") != "../z.oc") t.Error("rel3 ", RelativeSourcePath(util.Dir(cwd) + "/z.oc"));
+    if (RelativeSourcePath(filepath.Dir(cwd) + "/z.oc") != "../z.oc") t.Error("rel3 ", RelativeSourcePath(filepath.Dir(cwd) + "/z.oc"));
     if (!TargetSource("a.oc") || !TargetSource("a_native.oc") || TargetSource("a_wasm_test.oc")) t.Error("target");
 }

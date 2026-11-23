@@ -2,6 +2,7 @@ package main;
 import "os";
 import "github.com/ocean-foundation/ocean/compiler/driver";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "strconv";
 
 
 
@@ -12,6 +13,6 @@ func main() int {
     prog := driver.Frontend(args[1], false, "", driver.NewDiagsQuiet());
     if (phase == "front") return 0;
     ir, _ := driver.Generate(prog);
-    util.Stdout("ir bytes: " + util.Itoa(len(ir)) + "\n");
+    util.Stdout("ir bytes: " + strconv.Itoa(len(ir)) + "\n");
     return 0;
 }

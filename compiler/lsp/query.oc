@@ -6,6 +6,8 @@ import "github.com/ocean-foundation/ocean/compiler/loader";
 import "github.com/ocean-foundation/ocean/compiler/parser";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "path" as filepath;
+import "strconv";
 
 struct Analysis { build *loader.Build; checker *check.Checker; diags *diag.List; src *ast.Source; doc *Document; }
 
@@ -34,7 +36,7 @@ func analyze(s *Server, d *Document) *Analysis {
     for (_, o := range s.docs) b.AddOverlay(o.path, o.text);
     if (findDoc(s, d.uri) < 0) b.AddOverlay(d.path, d.text);
     a.build = b;
-    dir := util.Dir(d.path);
+    dir := filepath.Dir(d.path);
     if (b.HasTestSources(dir)) b.LoadTestPackage(dir, "/tmp/.ocean-check-harness");
     else b.LoadPackage(dir);
     if (b.IsFatal() || ast.NilPkg(b.Root())) return a;
@@ -112,7 +114,7 @@ func textOf(a *Analysis, src *ast.Source) string { return src.abs == a.doc.path 
 func rangeJSON(text string, line int, col int, length int) string {
     sc := utf16Col(text, line, col);
     ec := utf16Col(text, line, col + length);
-    return "{\"start\":{\"line\":" + util.Itoa(line - 1) + ",\"character\":" + util.Itoa(sc) + "},\"end\":{\"line\":" + util.Itoa(line - 1) + ",\"character\":" + util.Itoa(ec) + "}}";
+    return "{\"start\":{\"line\":" + strconv.Itoa(line - 1) + ",\"character\":" + strconv.Itoa(sc) + "},\"end\":{\"line\":" + strconv.Itoa(line - 1) + ",\"character\":" + strconv.Itoa(ec) + "}}";
 }
 
 func refRange(a *Analysis, r *check.Ref) string { return rangeJSON(textOf(a, r.src), r.line, r.col, len(r.name)); }
@@ -130,7 +132,7 @@ func diagnosticsJSON(a *Analysis) string {
         n++;
         line := d.line > 0 ? d.line : 1;
         col := utf16Col(a.doc.text, line, d.col > 0 ? d.col : 1);
-        r := "{\"start\":{\"line\":" + util.Itoa(line - 1) + ",\"character\":" + util.Itoa(col) + "},\"end\":{\"line\":" + util.Itoa(line - 1) + ",\"character\":" + util.Itoa(col) + "}}";
+        r := "{\"start\":{\"line\":" + strconv.Itoa(line - 1) + ",\"character\":" + strconv.Itoa(col) + "},\"end\":{\"line\":" + strconv.Itoa(line - 1) + ",\"character\":" + strconv.Itoa(col) + "}}";
         sev := d.severity == "warning" ? "2" : "1";
         b.Add("{\"range\":").Add(r).Add(",\"severity\":").Add(sev).Add(",\"source\":\"ocean\",\"message\":").Add(Quote(d.phase + " " + d.severity + ": " + d.message)).Add("}");
     }
@@ -204,7 +206,7 @@ func typeDefinition(a *Analysis, off int) string {
     if (nilT(t)) return "[]";
     for (t.kind == ast.TK.Ptr) t = t.elem;
     if (ast.NilSym(t.sym) || t.sym.builtin) return "[]";
-    d, ok := a.checker.Index().decls["s" + util.Itoa(t.sym.id)];
+    d, ok := a.checker.Index().decls["s" + strconv.Itoa(t.sym.id)];
     if (!ok) return "[]";
     return "[" + refLocation(a, d) + "]";
 }

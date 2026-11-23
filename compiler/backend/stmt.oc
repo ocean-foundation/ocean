@@ -3,6 +3,8 @@ import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/check";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "os";
+import "strings";
 
 func genBlock(g *Gen, n *ast.Node) {
     if (nilN(n)) return;
@@ -694,12 +696,12 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
 func crossTarget() (string, string) {
     t, ok := util.Getenv("OCEAN_CROSS_TARGET");
     if (!ok || t == "") return "", "";
-    i := util.IndexByte(t, '-');
+    i := strings.IndexByte(t, '-');
     if (i < 0) return "", "";
     return t[:i], t[i + 1:];
 }
-func hostArch() string { a, _ := crossTarget(); return a != "" ? a : util.HostArch(); }
-func hostPlatform() string { _, o := crossTarget(); return o != "" ? o : util.HostOS(); }
+func hostArch() string { a, _ := crossTarget(); return a != "" ? a : os.Arch(); }
+func hostPlatform() string { _, o := crossTarget(); return o != "" ? o : os.OS(); }
 func targetWindows() bool { return hostPlatform() == "windows"; }
 
 // targetTriple is the LLVM triple for a cross target ("" for the host).

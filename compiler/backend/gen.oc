@@ -2,6 +2,7 @@ package backend;
 import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/check";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "strconv";
 
 // V is a generated value. Scalars are SSA operands; aggregates live in memory
 // and r is a pointer to their storage. fresh marks temporaries we own.
@@ -120,7 +121,7 @@ func NewGen(c *check.Checker) *Gen {
 func nilT(t *ast.Type) bool { return (t -> int) == 0; }
 func nilN(n *ast.Node) bool { return (n -> int) == 0; }
 func nilS(s *ast.Symbol) bool { return (s -> int) == 0; }
-func itoa(n int) string { return util.Itoa(n); }
+func itoa(n int) string { return strconv.Itoa(n); }
 
 // ---- types ----
 
