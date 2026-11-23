@@ -80,9 +80,7 @@ func wait(pid int) Status {
     for (;;) {
         r := native_waitpid((pid->i32)->int, (&raw)->int, (0->i32)->int);
         if (r >= 0) break;
-        // EINTR retry; give up on other errors after one more try.
-        r2 := native_waitpid((pid->i32)->int, (&raw)->int, (0->i32)->int);
-        if (r2 >= 0) break;
+        if (native_errno() == 4) continue; // EINTR
         s: Status; s.Failed = true; s.Code = 1; return s;
     }
     return decode(raw);

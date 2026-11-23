@@ -189,7 +189,9 @@ defaults; this also applies to native test workers on macOS.
 Darwin relocatable runtime and library links preserve private external symbols
 so cached package objects can resolve shared constants and helpers.
 Native Darwin recovery pairs `_setjmp` with `_longjmp`; WebAssembly and
-Windows keep their target-specific recovery ABI.
+Windows keep their target-specific recovery ABI. On WebAssembly, recovery
+does not resume the panicking function: a deferred call that recovers a
+panic traps there, so WebAssembly programs must not rely on `recover()`.
 The embedded process runtime uses the standard spawn working-directory API on
 macOS 26, with a guarded Darwin extension fallback for older SDKs and systems.
 
@@ -581,6 +583,8 @@ caller. Outside that context, including an indirect helper call or a normally
 returning function's deferred call, `recover()` returns `null`. A second call
 after recovery also returns `null`; `defer recover();` does not recover a panic.
 Use an inline deferred literal for recovery: `defer func() { message := recover(); }();`
+On WebAssembly, deferred recovery traps instead of resuming the panicking
+function, so WebAssembly programs must not rely on `recover()`.
 
 An ordinary `panic` runs the function's defers, then its callers' defers as it
 propagates. `return panic` skips the originating function's defers. A caller

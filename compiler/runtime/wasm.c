@@ -99,9 +99,11 @@ static OcBlock *free_blocks;
 static void *carve(size_t n) {
     if (!heap_next) { heap_next = &__heap_base; heap_end = (unsigned char *)(__builtin_wasm_memory_size(0) * 65536); }
     heap_next = (unsigned char *)(((uintptr_t)heap_next + 15) & ~(uintptr_t)15);
+    if (n > SIZE_MAX - OC_HEADER) return NULL;
     size_t need = OC_HEADER + n;
     if ((size_t)(heap_end - heap_next) < need) {
-        size_t pages = (need - (size_t)(heap_end - heap_next) + 65535) / 65536;
+        size_t shortfall = need - (size_t)(heap_end - heap_next);
+        size_t pages = shortfall / 65536 + (shortfall % 65536 != 0);
         if (__builtin_wasm_memory_grow(0, pages) == (size_t)-1) return NULL;
         heap_end += pages * 65536;
     }
@@ -111,11 +113,12 @@ static void *carve(size_t n) {
     return (unsigned char *)b + OC_HEADER;
 }
 void *malloc(size_t n) {
+    if (n > SIZE_MAX - 15 - OC_HEADER) return NULL;
     n = (n + 15) & ~(size_t)15;
     if (!n) n = 16;
     for (OcBlock **link = &free_blocks; *link; link = &(*link)->next) {
         OcBlock *b = *link;
-        if (b->size >= n && b->size <= 2 * n + 64) { *link = b->next; return (unsigned char *)b + OC_HEADER; }
+        if (b->size >= n && (n > (SIZE_MAX - 64) / 2 || b->size <= 2 * n + 64)) { *link = b->next; return (unsigned char *)b + OC_HEADER; }
     }
     return carve(n);
 }
