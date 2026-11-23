@@ -77,6 +77,13 @@ func literalOf(c *Checker, n *ast.Node, t *ast.Type) *ast.Type {
             checkElem(c, e.b, u.elem);
         }
         return t;
+    case ast.TK.String:
+        // a string is a dynamic array of i8 bytes, as in ocean-c
+        for (_, e := range n.list) {
+            if (!nilN(e.a)) { err(c, e, "array and buffer literals require positional elements"); return t; }
+        }
+        for (_, e := range n.list) checkElem(c, e.b, tI8);
+        return t;
     case ast.TK.Struct: return structLiteral(c, n, t, c.FieldsOf(u));
     case ast.TK.Interface:
         err(c, n, "literal requires an array, buffer, or struct assignment destination");

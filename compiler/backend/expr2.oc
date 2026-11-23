@@ -436,6 +436,18 @@ func genComposite(g *Gen, n *ast.Node, t *ast.Type) V {
         for (i, v := range vals) store(g, u.elem, gep(g, data, i * es), v);
         if (homogeneous(t)) emit(g, "call void @oc_hom_range(ptr " + arr + ", i64 0, i64 " + itoa(len(vals)) + ")");
         return freshV(g, arr, t);
+    case ast.TK.String:
+        // string bytes share the dynamic-array layout (empty is null)
+        i8 := check.TI8();
+        vals := make([]V);
+        for (_, e := range n.list) vals.append(genAs(g, e.b, i8));
+        if (len(vals) == 0) return freshV(g, "null", t);
+        arr := tmp(g);
+        emit(g, arr + " = call ptr @oc_arr_new(i64 " + itoa(len(vals)) + ", i64 1, i64 0)");
+        data := tmp(g);
+        emit(g, data + " = call ptr @oc_arr_data(ptr " + arr + ")");
+        for (i, v := range vals) store(g, i8, gep(g, data, i), v);
+        return freshV(g, arr, t);
     case ast.TK.Map:
         slot := alloca(g, t);
         emit(g, "store ptr null, ptr " + slot);
