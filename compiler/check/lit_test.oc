@@ -22,6 +22,18 @@ func TestLargeDecimalParse(t *testing.T) {
     if (fast.Decimal() != digits) t.Fatal("decimal round trip failed");
 }
 
+// A string literal in braces holds i8 bytes, like ocean-c.
+func TestStringBraceLiteral(t *testing.T) {
+    c: i8 = 'x';
+    s: string = {c, 'y'};
+    if (s != "xy" || len(s) != 2) t.Fatal("string {c, 'y'}: ", s);
+    e: string = {};
+    if (e != "" || len(e) != 0) t.Fatal("empty string literal");
+    q := string{'h', 'i'};
+    q += "!";
+    if (q != "hi!") t.Fatal("prefixed string literal: ", q);
+}
+
 func TestHexSpelling(t *testing.T) {
     if (ParseBigNat("255").Hex() != "ff") t.Fatal("hex 255");
     if (ParseBigNat("0").Hex() != "0") t.Fatal("hex 0");
