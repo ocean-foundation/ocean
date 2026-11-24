@@ -11,6 +11,7 @@ func usage() string {
         "       ocean test [location] [--json] [--outfile path] [--jsonfile path]\n" +
         "       ocean check [location]\n" +
         "       ocean check --lsp\n" +
+        "       ocean target [--list | --remove target... | target...]\n" +
         "       ocean mod init [name]\n" +
         "       ocean fix [location...]\n" +
         "       ocean clean --cache\n" +
@@ -22,6 +23,7 @@ func Main(argv array<string>) int {
     for (i := 0; i < len(argv); i++) args.append(argv[i]);
     argc := len(args);
     if (argc == 2 && (args[1] == "-v" || args[1] == "--version")) { util.Stdout(versionText()); return 0; }
+    if (argc > 1 && args[1] == "target") return targetMain(args[2:]);
     if (argc > 1 && args[1] == "test") return testMain(args);
     if (argc > 1 && args[1] == "check") {
         if (argc == 3 && args[2] == "--lsp") return lsp.Main();

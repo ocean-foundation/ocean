@@ -1,0 +1,278 @@
+package driver;
+
+import "github.com/ocean-foundation/ocean/compiler/util";
+import "os";
+import "strconv";
+import "strings";
+
+func targetMain(args []string) int {
+    usage := "Usage: ocean target --list | ocean target [--remove] <target>...\n";
+    if (len(args) == 0 || (len(args) == 1 && (args[0] == "--help" || args[0] == "-h"))) {
+        util.Stdout(usage);
+        return 0;
+    }
+    if (len(args) == 1 && args[0] == "--list") {
+        util.Stdout("TARGET           OCOS     OCARCH\n");
+        for (_, target := range util.KnownTargets()) {
+            name := target.Name();
+            util.Stdout(name + strings.Repeat(" ", 17 - len(name)) +
+                target.system + strings.Repeat(" ", 9 - len(target.system)) + target.arch + "\n");
+        }
+        return 0;
+    }
+    remove := args[0] == "--remove";
+    if (remove) args = args[1:];
+    if (len(args) == 0) { util.Stderr(usage); return 1; }
+
+    // Validate the entire argument list before changing any installation.
+    targets := make([]util.Target);
+    seen: map[string]bool;
+    for (_, name := range args) {
+        if (name == "86_64-windows") name = "x86_64-windows";
+        found := false;
+        for (_, target := range util.KnownTargets()) {
+            if (target.Name() != name) continue;
+            _, duplicate := seen[name];
+            if (!duplicate) { targets.append(target); seen[name] = true; }
+            found = true;
+            break;
+        }
+        if (!found) {
+            util.Stderr("ocean target: unknown target " + name + ". See ocean target --list.\n");
+            return 1;
+        }
+    }
+
+    root := targetRoot();
+    if (root == "") {
+        util.Stderr("ocean target: set OCEAN_TARGET_DIR to an absolute, writable directory\n");
+        return 1;
+    }
+    failed := false;
+    for (_, target := range targets) {
+        if (remove) {
+            if (!removeTarget(root, target)) failed = true;
+        } else if (!installTarget(root, target)) failed = true;
+    }
+    return failed ? 1 : 0;
+}
+
+func targetRoot() string {
+    root, _ := util.Getenv("OCEAN_TARGET_DIR");
+    if (root != "") return util.IsAbs(root) ? util.NormalizePath(root) : "";
+    if (util.Windows()) root, _ = util.Getenv("LOCALAPPDATA");
+    else root, _ = util.Getenv("HOME");
+    if (root == "") return "";
+    return util.NormalizePath(root + (util.Windows() ? "/Ocean" : "/.ocean") + "/targets");
+}
+
+// Each release uses the same tested sysroots and runtime libraries on every host.
+func bundleRelease() string { return "nightly-2026.11.22"; }
+
+func bundleDigest(target util.Target) string {
+    switch (target.Name()) {
+    case "aarch64-linux": return "73020116a8e3d99da0b5e95feb467082e0c61d1cfb103431c345956a7438c869";
+    case "aarch64-macos": return "5a7c8c41d012f2a703a921a765b1bdd33f62754671d0996e3ee6973c9cb86347";
+    case "aarch64-windows": return "6b1716aab98f274ff094baba20dab8dc53ff5bfa143e4d6bae13b6e19899b410";
+    case "riscv64-linux": return "061c860b9fd34700f8092e2977683552fa27c48a2ddc7fa6139f06b977920df7";
+    case "x86_64-linux": return "f3d0b0ba9f2d1129cb86aae7389941bcc482284cce45356b22f2360735b388af";
+    case "x86_64-macos": return "6745d345555e7a2a5d001e1bbd6f38564925e89fb6efb3c5f71da1be75a6b133";
+    case "x86_64-windows": return "ea863e3d097b86c16f31d0836b21efab508f3f37a8ab1f5031c07ed6f89dfe82";
+    }
+    return "";
+}
+
+func versionedTargetRoot(root string) string { return root + "/" + bundleRelease(); }
+
+func targetPath(root string, target util.Target) string {
+    return versionedTargetRoot(root) + "/" + target.Name();
+}
+
+func hostToolPath(root string) string {
+    return versionedTargetRoot(root) + "/host-" + util.HostTarget().Name();
+}
+
+func targetInstalled(path string) bool { return util.IsRegular(path + "/installed"); }
+
+func removeTarget(root string, target util.Target) bool {
+    path := targetPath(root, target);
+    if (!targetInstalled(path)) {
+        util.Stdout(target.Name() + " is not installed\n");
+        return true;
+    }
+    // Detach the complete installation before deleting its contents.
+    stage := targetStage(versionedTargetRoot(root));
+    if (stage == "" || !util.Rename(path, stage + "/removed")) {
+        if (stage != "") util.RemoveAll(stage);
+        util.Stderr("ocean target: could not remove " + target.Name() + "\n");
+        return false;
+    }
+    if (!util.RemoveAll(stage)) {
+        util.Stderr("ocean target: could not clean up " + stage + "\n");
+        return false;
+    }
+    util.Stdout("Removed " + target.Name() + "\n");
+    return true;
+}
+
+func targetStage(parent string) string {
+    if (!util.MkdirAll(parent)) return "";
+    for (i := 0; i < 32; i++) {
+        stage := parent + "/.target-" + strconv.Itoa(util.Pid()) + "-" + strconv.Itoa(i);
+        if (util.Mkdir(stage)) return stage;
+    }
+    return "";
+}
+
+func targetCommand(args []string) bool {
+    status, output := util.RunCapture(args.array());
+    if (!status.Failed && status.Code == 0) return true;
+    if (output != "") util.Stderr(output);
+    util.Stderr("ocean target: " + args[0] + " failed\n");
+    return false;
+}
+
+func verifyTargetArchive(archive string, digest string) bool {
+    args := []string{"sha256sum", archive};
+    if (util.MacOS()) args = []string{"shasum", "-a", "256", archive};
+    if (util.Windows()) args = []string{"certutil.exe", "-hashfile", archive, "SHA256"};
+    status, output := util.RunCapture(args.array());
+    if (!status.Failed && status.Code == 0) {
+        for (_, line := range strings.Split(output, "\n")) {
+            line = strings.TrimSpace(line);
+            if (line == digest || strings.HasPrefix(line, digest + " ")) return true;
+        }
+    }
+    util.Stderr("ocean target: could not verify the SHA-256 of " + archive + "\n");
+    return false;
+}
+
+func unpackTargetBundle(stage string, destination string, target util.Target) bool {
+    digest := bundleDigest(target);
+    if (digest == "") {
+        util.Stderr("ocean target: no published bundle for " + target.Name() + "\n");
+        return false;
+    }
+    asset := "ocean-deps_" + bundleRelease() + "_" + target.Name() + ".tar.xz";
+    url := "https://github.com/ocean-foundation/ocean-c/releases/download/" + bundleRelease() + "/" + asset;
+    archive := stage + "/" + asset;
+    util.Stdout("Downloading " + asset + "\n");
+    if (!targetCommand([]string{"curl", "--fail", "--location", "--silent", "--show-error", "--retry", "2",
+        "--connect-timeout", "15", "--proto", "=https", "--proto-redir", "=https", "--output", archive, url})) return false;
+    if (!verifyTargetArchive(archive, digest) || !util.Mkdir(destination)) return false;
+    if (!targetCommand([]string{"tar", "-xf", archive, "-C", destination})) return false;
+    return util.Remove(archive);
+}
+
+func ensureHostTools(root string) bool {
+    path := hostToolPath(root);
+    if (targetInstalled(path)) return true;
+    stage := targetStage(versionedTargetRoot(root));
+    if (stage == "") { util.Stderr("ocean target: cannot stage host tools\n"); return false; }
+    defer util.RemoveAll(stage);
+    payload := stage + "/payload";
+    if (!unpackTargetBundle(stage, payload, util.HostTarget())) return false;
+    suffix := os.ExeSuffix();
+    clang := payload + "/bin/clang" + suffix;
+    linker := payload + "/bin/ld.lld" + suffix;
+    if (!targetCommand([]string{clang, "--version"}) || !targetCommand([]string{linker, "--version"})) return false;
+    // LLD selects its linker driver from the executable basename.
+    if (!util.IsExecutable(payload + "/bin/wasm-ld" + suffix)) {
+        binary, ok := util.ReadFile(linker);
+        if (!ok || !util.WriteFileMode(payload + "/bin/wasm-ld" + suffix, binary, 493)) {
+            util.Stderr("ocean target: could not install wasm-ld\n");
+            return false;
+        }
+    }
+    return publishTarget(payload, path);
+}
+
+func publishTarget(payload string, path string) bool {
+    if (util.WriteFile(payload + "/installed", bundleRelease() + "\n") &&
+        (util.Rename(payload, path) || targetInstalled(path))) return true;
+    util.Stderr("ocean target: could not install into " + path + "\n");
+    return false;
+}
+
+func installTarget(root string, target util.Target) bool {
+    path := targetPath(root, target);
+    if (targetInstalled(path)) {
+        util.Stdout(target.Name() + " is already installed\n");
+        return true;
+    }
+    sdk := "";
+    if (target.system == "macos") {
+        if (!util.MacOS()) {
+            util.Stderr("ocean target: " + target.Name() + " requires the Apple SDK on a macOS host\n");
+            return false;
+        }
+        status, output := util.RunCapture([]string{"xcrun", "--show-sdk-path"}.array());
+        sdk = strings.TrimSpace(output);
+        if (status.Code != 0 || status.Failed || !util.IsDir(sdk)) {
+            util.Stderr("ocean target: install the Apple SDK with xcode-select --install, then retry\n");
+            return false;
+        }
+    } else if (!ensureHostTools(root)) return false;
+    stage := targetStage(versionedTargetRoot(root));
+    if (stage == "") { util.Stderr("ocean target: cannot stage " + target.Name() + "\n"); return false; }
+    defer util.RemoveAll(stage);
+    payload := stage + "/payload";
+    if (target.system == "macos" || target.Wasm()) {
+        if (!util.Mkdir(payload)) return false;
+        if (sdk != "" && !util.WriteFile(payload + "/sdk", sdk)) return false;
+    } else if (!unpackTargetBundle(stage, payload, target)) return false;
+    if (!probeTarget(root, target, stage, payload, sdk) || !publishTarget(payload, path)) return false;
+    util.Stdout("Installed " + target.Name() + "\n");
+    return true;
+}
+
+// Probe the SDK and bundled libraries before making a target visible to builds.
+func probeTarget(root string, target util.Target, stage string, payload string, sdk string) bool {
+    source := stage + "/probe.c";
+    program := "#include <stdlib.h>\n#include <ffi.h>\n#include <curl/curl.h>\nint main(void) { return curl_version() == NULL || ffi_type_void.size != 1; }\n";
+    if (target.Wasm()) program = "int main(void) { return 0; }\n";
+    if (!util.WriteFile(source, program)) return false;
+    args := managedClangArgs(root, target, payload, sdk);
+    if (len(args) == 0) return false;
+    args.append(source, "-o", stage + "/probe" + target.ExeSuffix());
+    if (target.Wasm()) args.append("-nostdlib", "-Wl,--no-entry", "-Wl,--export=main");
+    else args.append("-lffi", "-lcurl");
+    return targetCommand(args);
+}
+
+func managedTargetRoot(target util.Target) string {
+    if (!target.explicit || !target.Supported()) return "";
+    clang, _ := util.Getenv("OCEAN_CLANG");
+    sysroot, _ := util.Getenv("OCEAN_SYSROOT");
+    if (clang != "" || sysroot != "") return "";
+    root := targetRoot();
+    return root != "" && targetInstalled(targetPath(root, target)) ? root : "";
+}
+
+func managedClangArgs(root string, target util.Target, payload string, sdk string) []string {
+    suffix := os.ExeSuffix();
+    bin := hostToolPath(root) + "/bin/";
+    if (target.system == "macos") {
+        return []string{"/usr/bin/clang", "--target=" + target.Triple(), "-isysroot", sdk, "-iwithsysroot", "/usr/include/ffi"};
+    }
+    args := []string{bin + "clang" + suffix, "--no-default-config", "--target=" + target.Triple()};
+    if (target.Wasm()) {
+        args.append("-B" + bin);
+    } else {
+        args.append("-I" + payload + "/include", "-L" + payload + "/lib",
+            "-fuse-ld=lld", "--ld-path=" + bin + "ld.lld" + suffix);
+        if (target.system == "linux") {
+            sysroot := payload + "/sysroot";
+            args.append("--sysroot=" + sysroot, "--gcc-toolchain=" + sysroot + "/usr",
+                "-Wl,-rpath-link," + payload + "/lib");
+        } else {
+            args.append("--sysroot=" + payload, "--rtlib=compiler-rt");
+            versions, _ := util.ListDir(payload + "/lib/clang");
+            for (_, version := range versions) {
+                resource := payload + "/lib/clang/" + version;
+                if (util.IsDir(resource + "/include")) { args.append("-resource-dir=" + resource); break; }
+            }
+        }
+    }
+    return args;
+}
