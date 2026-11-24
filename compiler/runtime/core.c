@@ -503,7 +503,7 @@ uint64_t oc_hash(const void *p, const OcType *t) {
         return h;
     }
     case K_PTR: return mix(load_u(p, t->size));
-    case K_FUNC: return mix(load_u(p, 8));
+    case K_FUNC: return hash_bytes(p, t->size);
     case K_ARRAY: {
         if (t->bits < 0) { p = *(void *const *)p; if (!p) return 11; }
         int64_t off = array_elems_offset(t->elem), n = block_count(p, t->elem); uint64_t h = 11;
@@ -511,7 +511,7 @@ uint64_t oc_hash(const void *p, const OcType *t) {
         return h;
     }
     case K_BUFFER: {
-        if (t->bits <= 0) return mix(load_u(p, 8));
+        if (t->bits <= 0) return mix(load_u(p, t->size));
         uint64_t h = 13;
         for (int64_t i = 0; i < t->bits; i++) h = mix(h * 31 + oc_hash((const char *)p + i * t->elem->size, t->elem));
         return h;
@@ -559,7 +559,7 @@ int64_t oc_equal(const void *a, const void *b, const OcType *t) {
     case K_BOOL: return (*(const unsigned char *)a & 1) == (*(const unsigned char *)b & 1);
     case K_STRING: return oc_str_eq(*(OcArr *const *)a, *(OcArr *const *)b);
     case K_PTR: return load_u(a, t->size) == load_u(b, t->size);
-    case K_FUNC: return !memcmp(a, b, 16);
+    case K_FUNC: return !memcmp(a, b, (size_t)t->size);
     case K_DYN: {
         const OcArr *x = *(OcArr *const *)a, *y = *(OcArr *const *)b;
         int64_t n = alen(x);
@@ -578,7 +578,7 @@ int64_t oc_equal(const void *a, const void *b, const OcType *t) {
         return 1;
     }
     case K_BUFFER:
-        if (t->bits <= 0) return load_u(a, 8) == load_u(b, 8);
+        if (t->bits <= 0) return load_u(a, t->size) == load_u(b, t->size);
         for (int64_t i = 0; i < t->bits; i++) if (!oc_equal((const char *)a + i * t->elem->size, (const char *)b + i * t->elem->size, t->elem)) return 0;
         return 1;
     case K_STRUCT:
@@ -682,7 +682,7 @@ static void destroy_boxed(const OcType *t, void *data) {
 /* Destroy then clear a slot (temporaries, reassignment, scope exit). */
 void oc_drop(void *slot, const OcType *t) {
     oc_destroy(slot, t);
-    memset(slot, 0, (size_t)(t->kind == K_ARRAY && t->bits < 0 ? 8 : t->size));
+    memset(slot, 0, (size_t)t->size);
 }
 void oc_free_ptr(void *p, const OcType *pointee) {
     if (!p || p == NULL_MARK) return;

@@ -1493,6 +1493,8 @@ errors like Run), `Poll() Result<bool>`, `Kill() Result<bool>`. Always Wait.
 There are no pipes, started-process capture, timeouts or cancellation. The
 backend covers Linux, macOS and Windows (not Wasm).
 
+This example requires a `printf` executable on PATH, as provided on Unix systems.
+
 ```ocean
 import "os/exec";
 command := exec.Command("printf", "%s", "hello world");

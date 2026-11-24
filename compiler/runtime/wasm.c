@@ -93,23 +93,31 @@ char *strchr(const char *s, int c) {
 typedef struct OcBlock { size_t size; struct OcBlock *next; } OcBlock;
 #define OC_HEADER 16
 extern unsigned char __heap_base;
-static unsigned char *heap_next, *heap_end;
+static uintptr_t heap_next;
+/* The exclusive end can reach 4 GiB even though the cursor must fit uintptr_t. */
+static uint64_t heap_end;
 static OcBlock *free_blocks;
 
 static void *carve(size_t n) {
-    if (!heap_next) { heap_next = &__heap_base; heap_end = (unsigned char *)(__builtin_wasm_memory_size(0) * 65536); }
-    heap_next = (unsigned char *)(((uintptr_t)heap_next + 15) & ~(uintptr_t)15);
+    if (!heap_next) {
+        uintptr_t base = (uintptr_t)&__heap_base;
+        if (base > UINTPTR_MAX - 15) return NULL;
+        heap_next = (base + 15) & ~(uintptr_t)15;
+        heap_end = (uint64_t)__builtin_wasm_memory_size(0) * 65536;
+    }
     if (n > SIZE_MAX - OC_HEADER) return NULL;
     size_t need = OC_HEADER + n;
-    if ((size_t)(heap_end - heap_next) < need) {
-        size_t shortfall = need - (size_t)(heap_end - heap_next);
+    if (need > UINTPTR_MAX - heap_next) return NULL;
+    uintptr_t next = heap_next + need;
+    if (next > heap_end) {
+        size_t shortfall = (size_t)(next - heap_end);
         size_t pages = shortfall / 65536 + (shortfall % 65536 != 0);
         if (__builtin_wasm_memory_grow(0, pages) == (size_t)-1) return NULL;
-        heap_end += pages * 65536;
+        heap_end += (uint64_t)pages * 65536;
     }
     OcBlock *b = (OcBlock *)heap_next;
     b->size = n;
-    heap_next += need;
+    heap_next = next;
     return (unsigned char *)b + OC_HEADER;
 }
 void *malloc(size_t n) {

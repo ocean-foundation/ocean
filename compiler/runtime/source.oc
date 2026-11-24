@@ -508,7 +508,7 @@ uint64_t oc_hash(const void *p, const OcType *t) {
         return h;
     }
     case K_PTR: return mix(load_u(p, t->size));
-    case K_FUNC: return mix(load_u(p, 8));
+    case K_FUNC: return hash_bytes(p, t->size);
     case K_ARRAY: {
         if (t->bits < 0) { p = *(void *const *)p; if (!p) return 11; }
         int64_t off = array_elems_offset(t->elem), n = block_count(p, t->elem); uint64_t h = 11;
@@ -516,7 +516,7 @@ uint64_t oc_hash(const void *p, const OcType *t) {
         return h;
     }
     case K_BUFFER: {
-        if (t->bits <= 0) return mix(load_u(p, 8));
+        if (t->bits <= 0) return mix(load_u(p, t->size));
         uint64_t h = 13;
         for (int64_t i = 0; i < t->bits; i++) h = mix(h * 31 + oc_hash((const char *)p + i * t->elem->size, t->elem));
         return h;
@@ -564,7 +564,7 @@ int64_t oc_equal(const void *a, const void *b, const OcType *t) {
     case K_BOOL: return (*(const unsigned char *)a & 1) == (*(const unsigned char *)b & 1);
     case K_STRING: return oc_str_eq(*(OcArr *const *)a, *(OcArr *const *)b);
     case K_PTR: return load_u(a, t->size) == load_u(b, t->size);
-    case K_FUNC: return !memcmp(a, b, 16);
+    case K_FUNC: return !memcmp(a, b, (size_t)t->size);
     case K_DYN: {
         const OcArr *x = *(OcArr *const *)a, *y = *(OcArr *const *)b;
         int64_t n = alen(x);
@@ -583,7 +583,7 @@ int64_t oc_equal(const void *a, const void *b, const OcType *t) {
         return 1;
     }
     case K_BUFFER:
-        if (t->bits <= 0) return load_u(a, 8) == load_u(b, 8);
+        if (t->bits <= 0) return load_u(a, t->size) == load_u(b, t->size);
         for (int64_t i = 0; i < t->bits; i++) if (!oc_equal((const char *)a + i * t->elem->size, (const char *)b + i * t->elem->size, t->elem)) return 0;
         return 1;
     case K_STRUCT:
@@ -687,7 +687,7 @@ static void destroy_boxed(const OcType *t, void *data) {
 /* Destroy then clear a slot (temporaries, reassignment, scope exit). */
 void oc_drop(void *slot, const OcType *t) {
     oc_destroy(slot, t);
-    memset(slot, 0, (size_t)(t->kind == K_ARRAY && t->bits < 0 ? 8 : t->size));
+    memset(slot, 0, (size_t)t->size);
 }
 void oc_free_ptr(void *p, const OcType *pointee) {
     if (!p || p == NULL_MARK) return;
@@ -2182,23 +2182,31 @@ char *strchr(const char *s, int c) {
 typedef struct OcBlock { size_t size; struct OcBlock *next; } OcBlock;
 #define OC_HEADER 16
 extern unsigned char __heap_base;
-static unsigned char *heap_next, *heap_end;
+static uintptr_t heap_next;
+/* The exclusive end can reach 4 GiB even though the cursor must fit uintptr_t. */
+static uint64_t heap_end;
 static OcBlock *free_blocks;
 
 static void *carve(size_t n) {
-    if (!heap_next) { heap_next = &__heap_base; heap_end = (unsigned char *)(__builtin_wasm_memory_size(0) * 65536); }
-    heap_next = (unsigned char *)(((uintptr_t)heap_next + 15) & ~(uintptr_t)15);
+    if (!heap_next) {
+        uintptr_t base = (uintptr_t)&__heap_base;
+        if (base > UINTPTR_MAX - 15) return NULL;
+        heap_next = (base + 15) & ~(uintptr_t)15;
+        heap_end = (uint64_t)__builtin_wasm_memory_size(0) * 65536;
+    }
     if (n > SIZE_MAX - OC_HEADER) return NULL;
     size_t need = OC_HEADER + n;
-    if ((size_t)(heap_end - heap_next) < need) {
-        size_t shortfall = need - (size_t)(heap_end - heap_next);
+    if (need > UINTPTR_MAX - heap_next) return NULL;
+    uintptr_t next = heap_next + need;
+    if (next > heap_end) {
+        size_t shortfall = (size_t)(next - heap_end);
         size_t pages = shortfall / 65536 + (shortfall % 65536 != 0);
         if (__builtin_wasm_memory_grow(0, pages) == (size_t)-1) return NULL;
-        heap_end += pages * 65536;
+        heap_end += (uint64_t)pages * 65536;
     }
     OcBlock *b = (OcBlock *)heap_next;
     b->size = n;
-    heap_next += need;
+    heap_next = next;
     return (unsigned char *)b + OC_HEADER;
 }
 void *malloc(size_t n) {
