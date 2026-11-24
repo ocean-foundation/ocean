@@ -1,6 +1,8 @@
 package driver;
 import "github.com/ocean-foundation/ocean/compiler/runtime";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "os";
+import "strconv";
 
 // Build cache: finished artifacts keyed by a hash of everything that affects
 // them (IR, runtime sources, link mode, optimization level, compiler version).
@@ -32,7 +34,7 @@ func cacheKey(p *Program, ir string, staticLink bool) string {
     if (p.usesFFI) h = fnv(h, runtime.Ffi());
     if (p.usesCurl) h = fnv(h, "curl");
     h2 := fnv(h ^ 6148914691236517205->uint, ir);
-    tag := (p.isLibrary ? "lib" : "exe") + (staticLink ? "-static" : "") + optLevel() + Version() + Commit() + util.HostOS() + util.HostArch();
+    tag := (p.isLibrary ? "lib" : "exe") + (staticLink ? "-static" : "") + optLevel() + Version() + Commit() + os.OS() + os.Arch();
     h = fnv(h, tag); h2 = fnv(h2, tag);
     return util.Hex(h, 16) + util.Hex(h2, 16);
 }
@@ -57,7 +59,7 @@ func cacheStore(key string, output string) {
     if (!util.MkdirAll(dir)) return;
     data, ok := util.ReadFile(output);
     if (!ok) return;
-    tmp := dir + "/." + key + "." + util.Itoa(util.Pid());
+    tmp := dir + "/." + key + "." + strconv.Itoa(util.Pid());
     if (util.WriteFile(tmp, data)) util.Rename(tmp, dir + "/" + key);
     else util.Remove(tmp);
 }

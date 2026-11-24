@@ -2,6 +2,7 @@ package backend;
 import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/check";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "strings";
 
 func runtimeDecls() string {
     return "declare ptr @oc_alloc(i64)\n" +
@@ -66,7 +67,7 @@ func runtimeDecls() string {
         "declare void @oc_map_missing(i64) noreturn\n" +
         "declare void @oc_recover(ptr)\n" +
         "declare void @oc_run_defers(ptr)\n" +
-        "declare i32 @" + recoverySymbol() + "(ptr" + (util.Windows() ? ", ptr" : "") + ") returns_twice\n" +
+        "declare i32 @" + recoverySymbol() + "(ptr" + (targetWindows() ? ", ptr" : "") + ") returns_twice\n" +
         "declare void @llvm.trap() noreturn\n" +
         "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n" +
         "declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n" +
@@ -195,7 +196,7 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
         setArgsWrapper(g, c.OsSetArgs());
         // ELF (glibc) hands argc/argv to the runtime's constructor, so main
         // takes no parameters there, as in ocean-c; elsewhere main stores them.
-        if (hostPlatform() == "linux") g.mod.Add("declare i32 @oc_start()\ndefine i32 @main() {\nentry:\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
+        if (hostPlatform() == "linux" || g.wasm) g.mod.Add("declare i32 @oc_start()\ndefine i32 @main() {\nentry:\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
         else g.mod.Add("@oc_argc = external global i32\n@oc_argv = external global ptr\ndeclare i32 @oc_start()\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n  store i32 %argc, ptr @oc_argc\n  store ptr %argv, ptr @oc_argv\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
     } else {
         for (_, p := range packages) {
@@ -225,7 +226,15 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
     emitGenericMethods(g);
     out := util.NewBuf();
     out.Add("; Ocean program module\n");
-    out.Add(runtimeDecls());
+    if (!g.wasm && targetTriple() != "") out.Add("target triple = \"").Add(targetTriple()).Add("\"\n");
+    if (g.wasm) {
+        out.Add("target datalayout = \"e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20\"\n");
+        out.Add("target triple = \"wasm32-unknown-unknown\"\n");
+    }
+    decls := runtimeDecls();
+    // WebAssembly (without the threads proposal) has no thread-local storage.
+    if (g.wasm) decls = strings.ReplaceAll(decls, "external thread_local global", "external global");
+    out.Add(decls);
     if (g.usesThreads) out.Add(threadDecls());
     for (_, name := range g.declOrder) out.Add(g.decls[name]).Add("\n");
     out.Add("@oc_sites = constant [").AddInt(g.nsites).Add(" x {ptr, i64, i64, ptr}] [{ptr, i64, i64, ptr} zeroinitializer").AddBuf(g.sites).Add("]\n");
@@ -263,5 +272,5 @@ func emitGenericMethods(g *Gen) {
     }
     g.globals.Add("@oc_generic_method_count = constant i64 ").AddInt(len(entries)).Add("\n");
     if (len(entries) == 0) { g.globals.Add("@oc_generic_methods = constant [0 x {ptr, ptr, ptr}] zeroinitializer\n"); return; }
-    g.globals.Add("@oc_generic_methods = constant [").AddInt(len(entries)).Add(" x {ptr, ptr, ptr}] [").Add(util.JoinList(entries, ", ")).Add("]\n");
+    g.globals.Add("@oc_generic_methods = constant [").AddInt(len(entries)).Add(" x {ptr, ptr, ptr}] [").Add(strings.Join(entries, ", ")).Add("]\n");
 }

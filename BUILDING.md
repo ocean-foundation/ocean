@@ -48,6 +48,11 @@ Override the bootstrap executable if needed:
 make OCEAN=/path/to/ocean VERSION=dev
 ```
 
+The compiler is built with the standard library's `strings`, `strconv`, `sort`,
+`unicode`, `path`, `os`, `os/signal` and `time` packages, so the bootstrap's
+library must provide them: a matching release or nightly, or `OCEAN_SRC` set to
+a current `ocean-src` checkout.
+
 For a checkout whose standard library is not installed beside the executable,
 set `OCEAN_SRC` to the matching standard-library source directory before building
 or testing. On Windows, use a native path such as `C:/ocean/src`, including in an

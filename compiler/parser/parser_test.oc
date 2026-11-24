@@ -96,6 +96,20 @@ func TestFunctions(t *testing.T) {
     if (!ast.Nil(f2.list[2].a)) t.Error("extern void");
 }
 
+func TestUnnamedMapParams(t *testing.T) {
+    // map[K]V is a whole unnamed type, not a parameter named map of type [K]V.
+    f, d, ok := parse("package p; interface I { m(map[string]float) int; n(map[string]int, int); } func f(map[int]bool) {} func g(map int, m map[string]int) {}");
+    if (!ok) { t.Fatal("parse: ", d.items[0].message); }
+    m := f.list[0].list[0];
+    if (len(m.list) != 1 || m.list[0].name != "" || m.list[0].a.kind != ast.NK.TMap) t.Error("interface map param: ", ast.Dump(m.list[0]));
+    n := f.list[0].list[1];
+    if (len(n.list) != 2 || n.list[0].name != "" || n.list[0].a.kind != ast.NK.TMap) t.Error("interface map params: ", ast.Dump(n.list[0]));
+    fp := f.list[1].list[0];
+    if (fp.name != "" || fp.a.kind != ast.NK.TMap) t.Error("func map param: ", ast.Dump(fp));
+    g := f.list[2];
+    if (g.list[0].name != "map" || g.list[1].name != "m" || g.list[1].a.kind != ast.NK.TMap) t.Error("named map params");
+}
+
 func TestTypeDecls(t *testing.T) {
     f, _, ok := parse("package p; struct Flags(size int) { low uint : 4; x, y int; } enum E<T> { A, B(int, T), C{x int; y string}, D := 5, F: u8 = 3 } interface I { m(int) int; func n<T int | float>(T) float; } interface N { int | ~float } type ID int; type A = []int;");
     if (!ok) { t.Fatal("parse"); }

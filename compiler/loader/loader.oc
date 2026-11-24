@@ -4,6 +4,11 @@ import "github.com/ocean-foundation/ocean/compiler/diag";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/parser";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "path" as filepath;
+import "sort";
+import "strconv";
+import "strings";
+import "unicode";
 
 
 // Overlay supplies unsaved editor text for a path.
@@ -63,12 +68,12 @@ func SetLinkerFlags(flags string) bool {
         w := words[i];
         spec := "";
         if (w == "-X" || w == "--X") { i++; if (i >= len(words)) return false; spec = words[i]; }
-        else if (util.HasPrefix(w, "-X=")) spec = w[3:];
+        else if (strings.HasPrefix(w, "-X=")) spec = w[3:];
         else return false;
-        eq := util.IndexByte(spec, '=');
+        eq := strings.IndexByte(spec, '=');
         if (eq < 0) return false;
         target := spec[0:eq];
-        dot := util.LastIndexByte(target, '.');
+        dot := strings.LastIndexByte(target, '.');
         if (dot <= 0 || dot == len(target) - 1) return false;
         inj := new(Injection);
         inj.path = target[0:dot]; inj.name = target[dot + 1:]; inj.value = spec[eq + 1:];
@@ -133,20 +138,20 @@ func error(b *Build, file string, msg string) {
 }
 
 func ValidModulePath(path string) bool {
-    if (path == "" || path[0] == '/' || util.IndexByte(path, '\\') >= 0) return false;
-    parts := util.Split(path, '/');
+    if (path == "" || path[0] == '/' || strings.IndexByte(path, '\\') >= 0) return false;
+    parts := strings.Split(path, "/");
     for (_, p := range parts) {
         if (p == "" || p == "." || p == "..") return false;
         for (i := 0; i < len(p); i++) {
             c := p[i];
-            if (!(util.IsLetter(c) || util.IsDigit(c) || c == '.' || c == '_' || c == '-' || c == '~')) return false;
+            if (!(unicode.IsLetter(c) || unicode.IsDigit(c) || c == '.' || c == '_' || c == '-' || c == '~')) return false;
         }
     }
     return true;
 }
 
 func pathPrefix(path string, base string) bool {
-    return util.HasPrefix(path, base) && (len(path) == len(base) || path[len(base)] == '/');
+    return strings.HasPrefix(path, base) && (len(path) == len(base) || path[len(base)] == '/');
 }
 
 func words(line string) []string {
@@ -192,7 +197,7 @@ func (b *Build) FindModule(location string) *ast.Module {
             b.modules[root] = mod;
             text, rok := readFile(b, manifest);
             block := 0;
-            lines := util.Split(rok ? text : "", '\n');
+            lines := strings.Split(rok ? text : "", "\n");
             for (_, line := range lines) {
                 part := words(line);
                 n := len(part);
@@ -231,7 +236,7 @@ func (b *Build) FindModule(location string) *ast.Module {
             if (block != 0) error(b, manifest, "unterminated directive block");
             return mod;
         }
-        next := util.Dir(root);
+        next := filepath.Dir(root);
         if (next == root) return zero(*ast.Module);
         root = next;
     }
@@ -250,7 +255,7 @@ func (b *Build) StandardSource() string {
     if (ok) { b.stdRoot = o; return o; }
     exe := Executable();
     if (exe != "") {
-        candidate := util.Dir(util.Dir(exe)) + "/src";
+        candidate := filepath.Dir(filepath.Dir(exe)) + "/src";
         // A development binary outside an installed layout falls back to the
         // installed standard library next to the system `ocean` command.
         if (!util.IsDir(candidate)) {
@@ -276,9 +281,9 @@ func download(b *Build, module string, version string) string {
     dest := moduleCache() + "/" + module + "@" + (version == "" ? "latest" : version);
     if (util.IsDir(dest)) { r, _ := util.Realpath(dest); return r; }
     if (b.recover) return "";  // editor analysis never downloads
-    base := util.Dir(dest);
+    base := filepath.Dir(dest);
     if (!util.MkdirAll(base)) { error(b, base, "cannot create module cache"); return ""; }
-    tmp := base + "/.download-" + util.Itoa(util.Pid());
+    tmp := base + "/.download-" + strconv.Itoa(util.Pid());
     util.RemoveAll(tmp);
     util.Stderr("ocean: downloading " + module + " " + (version == "" ? "latest" : version) + "\n");
     args := []string{"git", "clone", "--quiet", "--depth", "1"};
@@ -325,9 +330,9 @@ func resolveImport(b *Build, from *ast.Package, path string) *ast.Package {
         }
         name := matched;
         if (name == "") {
-            slash := util.IndexByte(path, '/');
-            if (slash < 0 || util.IndexByte(path[0:slash], '.') < 0) { error(b, from.dir, "package not found: " + path); return zero(*ast.Package); }
-            parts := util.Split(path, '/');
+            slash := strings.IndexByte(path, '/');
+            if (slash < 0 || strings.IndexByte(path[0:slash], '.') < 0) { error(b, from.dir, "package not found: " + path); return zero(*ast.Package); }
+            parts := strings.Split(path, "/");
             if (len(parts) > 3) name = parts[0] + "/" + parts[1] + "/" + parts[2];
             else name = path;
         }
@@ -360,7 +365,7 @@ func resolveImport(b *Build, from *ast.Package, path string) *ast.Package {
     return loadDirectory(b, resolved);
 }
 
-func IsTestFile(name string) bool { return util.HasSuffix(name, "_test.oc"); }
+func IsTestFile(name string) bool { return strings.HasSuffix(name, "_test.oc"); }
 
 func TargetSource(name string) bool {
     n := len(name);
@@ -375,8 +380,8 @@ func TargetSource(name string) bool {
 
 func validPackageName(s string) bool {
     if (s == "") return false;
-    if (!(util.IsLetter(s[0]) || s[0] == '_')) return false;
-    for (i := 0; i < len(s); i++) { if (!(util.IsLetter(s[i]) || util.IsDigit(s[i]) || s[i] == '_')) return false; }
+    if (!(unicode.IsLetter(s[0]) || s[0] == '_')) return false;
+    for (i := 0; i < len(s); i++) { if (!(unicode.IsLetter(s[i]) || unicode.IsDigit(s[i]) || s[i] == '_')) return false; }
     return true;
 }
 
@@ -415,7 +420,7 @@ func loadDirectory(b *Build, location string) *ast.Package {
         entries, ok := util.ListDir(location);
         if (!ok) { error(b, location, "cannot read package directory"); p.loading = false; b.order.append(p); return p; }
         for (_, e := range entries) {
-            if (len(e) < 4 || !util.HasSuffix(e, ".oc")) continue;
+            if (len(e) < 4 || !strings.HasSuffix(e, ".oc")) continue;
             if (!TargetSource(e)) continue;
             if (IsTestFile(e) ? !target : external) continue;
             path := location + "/" + e;
@@ -424,8 +429,8 @@ func loadDirectory(b *Build, location string) *ast.Package {
         }
     }
     for (_, o := range b.overlays) {
-        if (util.Dir(o.path) != location || !util.HasSuffix(o.path, ".oc")) continue;
-        if (!TargetSource(util.Base(o.path))) continue;
+        if (filepath.Dir(o.path) != location || !strings.HasSuffix(o.path, ".oc")) continue;
+        if (!TargetSource(filepath.Base(o.path))) continue;
         if (IsTestFile(o.path) ? !target : external) continue;
         dup := false;
         for (_, n := range names) { if (n == o.path) dup = true; }
@@ -435,9 +440,9 @@ func loadDirectory(b *Build, location string) *ast.Package {
         // Ordinary sources first so the package name comes from them.
         ordinary := make([]string); tests := make([]string);
         for (_, n := range names) { if (IsTestFile(n)) tests.append(n); else ordinary.append(n); }
-        util.SortStrings(&ordinary); util.SortStrings(&tests);
+        sort.Strings(&ordinary); sort.Strings(&tests);
         names = ordinary + tests;
-    } else util.SortStrings(&names);
+    } else sort.Strings(&names);
     if (len(names) == 0 && !external) error(b, location, "directory contains no Ocean source files");
     for (_, path := range names) {
         text, ok := readFile(b, path);
@@ -467,7 +472,7 @@ func loadDirectory(b *Build, location string) *ast.Package {
                 internal, iok := b.byDir[location];
                 if (iok) baseName = internal.name;
             }
-            isExternal := len(file.name) > 5 && util.HasSuffix(file.name, "_test") && (baseName == "" || file.name != baseName);
+            isExternal := len(file.name) > 5 && strings.HasSuffix(file.name, "_test") && (baseName == "" || file.name != baseName);
             if (isExternal != external) continue;
         }
         p.files.append(src);
@@ -483,7 +488,7 @@ func loadDirectory(b *Build, location string) *ast.Package {
         sorted := make([]*ast.Source);
         paths := make([]string);
         for (_, f := range p.files) paths.append(f.abs);
-        util.SortStrings(&paths);
+        sort.Strings(&paths);
         for (_, path := range paths) { for (_, f := range p.files) { if (f.abs == path) sorted.append(f); } }
         p.files = sorted;
     }
@@ -501,7 +506,7 @@ func loadDirectory(b *Build, location string) *ast.Package {
             if (alias == "") {
                 alias = imported.name;
                 if (!NilModule(imported.module) && imported.dir == imported.module.root) {
-                    slash := util.LastIndexByte(imp.text, '/');
+                    slash := strings.LastIndexByte(imp.text, '/');
                     alias = slash >= 0 ? imp.text[slash + 1:] : imp.text;
                 }
             }
@@ -530,8 +535,8 @@ func canonicalLocation(b *Build, location string) string {
     path, ok := util.Realpath(location);
     if (!ok) { error(b, location, "location does not exist"); return ""; }
     if (!util.IsDir(path)) {
-        if (!util.HasSuffix(path, ".oc")) { error(b, location, "expected an Ocean file or package directory"); return ""; }
-        path = util.Dir(path);
+        if (!strings.HasSuffix(path, ".oc")) { error(b, location, "expected an Ocean file or package directory"); return ""; }
+        path = filepath.Dir(path);
     }
     return path;
 }
@@ -556,10 +561,10 @@ func finish(b *Build) {
 func (b *Build) HasTestSources(location string) bool {
     path, ok := util.Realpath(location);
     if (!ok) return false;
-    if (!util.IsDir(path)) path = util.Dir(path);
+    if (!util.IsDir(path)) path = filepath.Dir(path);
     entries, _ := util.ListDir(path);
     for (_, e := range entries) { if (IsTestFile(e) && TargetSource(e)) return true; }
-    for (_, o := range b.overlays) { if (util.Dir(o.path) == path && IsTestFile(util.Base(o.path)) && TargetSource(util.Base(o.path))) return true; }
+    for (_, o := range b.overlays) { if (filepath.Dir(o.path) == path && IsTestFile(filepath.Base(o.path)) && TargetSource(filepath.Base(o.path))) return true; }
     return false;
 }
 
@@ -590,7 +595,7 @@ func (b *Build) LoadTestPackage(location string, harnessDirectory string) bool {
         for (_, src := range targets[k].files) {
             if (!src.test || ast.Nil(src.file)) continue;
             for (_, d := range src.file.list) {
-                if (d.kind != ast.NK.Func || !ast.Nil(d.a) || !util.HasPrefix(d.name, "Test")) continue;
+                if (d.kind != ast.NK.Func || !ast.Nil(d.a) || !strings.HasPrefix(d.name, "Test")) continue;
                 if (d.flag || len(d.list3) > 0 || len(d.list) != 1 || len(d.list2) > 0) {
                     error(b, src.abs, d.name + " must have signature func " + d.name + "(t *testing.T)");
                     continue;
@@ -615,7 +620,7 @@ func (b *Build) LoadTestPackage(location string, harnessDirectory string) bool {
 func (b *Build) PackageTestPath(location string) string {
     path, ok := util.Realpath(location);
     if (!ok) return location;
-    if (!util.IsDir(path)) path = util.Dir(path);
+    if (!util.IsDir(path)) path = filepath.Dir(path);
     m := b.FindModule(path);
     if (!NilModule(m) && m.path != "") return m.path + path[len(m.root):];
     return path;

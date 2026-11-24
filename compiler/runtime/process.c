@@ -14,6 +14,7 @@
 #include <shellapi.h>
 #include <wchar.h>
 #else
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -118,39 +119,94 @@ static HANDLE inherited(HANDLE original) {
     if (!original || original == INVALID_HANDLE_VALUE || !DuplicateHandle(GetCurrentProcess(), original, GetCurrentProcess(), &result, 0, TRUE, DUPLICATE_SAME_ACCESS)) return INVALID_HANDLE_VALUE;
     return result;
 }
-int32_t ocean_process_run(OceanProcess *p) {
-    p->exit_code = -1; p->output = NULL; p->output_size = 0; p->error = NULL;
+static volatile LONG64 temp_sequence;
+static wchar_t *put_hex(wchar_t *p, unsigned long long v) {
+    static const wchar_t hex[] = L"0123456789abcdef";
+    for (int shift = 60; shift >= 0; shift -= 4) *p++ = hex[(v >> shift) & 15];
+    return p;
+}
+/* Atomically creates an inheritable, exclusive, delete-on-close temporary file,
+ * supporting long paths via the \\?\ prefix without a reopen race. */
+static HANDLE temp_file(const wchar_t *prefix) {
+    wchar_t base[32768], full[32768], path[32768];
+    DWORD bn = GetTempPathW(32768, base);
+    if (!bn || bn >= 32768) return INVALID_HANDLE_VALUE;
+    DWORD fn = GetFullPathNameW(base, 32768, full, NULL);
+    if (!fn || fn >= 32768) return INVALID_HANDLE_VALUE;
+    size_t pos = 0;
+    if (wcsncmp(full, L"\\\\?\\", 4) == 0) {
+        if (fn >= 32700) return INVALID_HANDLE_VALUE;
+        memcpy(path, full, fn * sizeof(wchar_t)); pos = fn;
+    } else if (full[0] == L'\\' && full[1] == L'\\') {
+        if (fn + 6 >= 32700) return INVALID_HANDLE_VALUE;
+        memcpy(path, L"\\\\?\\UNC\\", 8 * sizeof(wchar_t));
+        memcpy(path + 8, full + 2, (fn - 2) * sizeof(wchar_t)); pos = fn + 6;
+    } else {
+        if (fn + 4 >= 32700) return INVALID_HANDLE_VALUE;
+        memcpy(path, L"\\\\?\\", 4 * sizeof(wchar_t));
+        memcpy(path + 4, full, fn * sizeof(wchar_t)); pos = fn + 4;
+    }
+    if (pos && path[pos - 1] != L'\\') path[pos++] = L'\\';
+    size_t plen = wcslen(prefix);
+    if (pos + plen + 64 >= 32768) return INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES security = {sizeof(security), NULL, TRUE};
+    unsigned long long pid = (unsigned long long)GetCurrentProcessId();
+    for (int attempt = 0; attempt < 64; attempt++) {
+        LARGE_INTEGER counter = {0}; QueryPerformanceCounter(&counter);
+        unsigned long long seq = (unsigned long long)InterlockedIncrement64(&temp_sequence);
+        wchar_t *at = path + pos;
+        memcpy(at, prefix, plen * sizeof(wchar_t)); at += plen;
+        *at++ = L'-'; at = put_hex(at, pid);
+        *at++ = L'-'; at = put_hex(at, (unsigned long long)counter.QuadPart);
+        *at++ = L'-'; at = put_hex(at, seq);
+        memcpy(at, L".tmp", 5 * sizeof(wchar_t));
+        HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, &security, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+        if (file != INVALID_HANDLE_VALUE) return file;
+        DWORD err = GetLastError();
+        if (err != ERROR_FILE_EXISTS && err != ERROR_ALREADY_EXISTS) return INVALID_HANDLE_VALUE;
+    }
+    return INVALID_HANDLE_VALUE;
+}
+/* Writes input to an inheritable, delete-on-close temporary file positioned at
+ * its start, for use as a child's standard input. */
+static HANDLE input_file(const char *input, int64_t size) {
+    HANDLE file = temp_file(L"oci");
+    if (file == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+    for (int64_t done = 0; done < size; ) {
+        DWORD chunk = size - done > 1 << 30 ? 1 << 30 : (DWORD)(size - done), written = 0;
+        if (!WriteFile(file, input + done, chunk, &written, NULL) || !written) { CloseHandle(file); return INVALID_HANDLE_VALUE; }
+        done += written;
+    }
+    LARGE_INTEGER zero = {0};
+    if (!SetFilePointerEx(file, zero, NULL, FILE_BEGIN)) { CloseHandle(file); return INVALID_HANDLE_VALUE; }
+    return file;
+}
+/* Starts p with the given standard-input and capture handles (either may be
+ * INVALID_HANDLE_VALUE to inherit). Returns the process handle or NULL. */
+static HANDLE spawn(OceanProcess *p, HANDLE input, HANDLE capture) {
     char *resolved = ocean_process_lookpath(p->path);
-    if (!resolved) return fail(p, "exec: executable not found");
+    if (!resolved) { fail(p, "exec: executable not found"); return NULL; }
     wchar_t *application = wide(resolved), *line = command_line(p->argv);
     wchar_t *directory = p->directory && *p->directory ? wide(p->directory) : NULL;
     free(resolved);
-    if (!application || !line || (p->directory && *p->directory && !directory)) { free(application); free(line); free(directory); return fail(p, "exec: invalid UTF-8 or allocation failed"); }
+    if (!application || !line || (p->directory && *p->directory && !directory)) { free(application); free(line); free(directory); fail(p, "exec: invalid UTF-8 or allocation failed"); return NULL; }
     wchar_t *environment = NULL;
     if (p->environment) {
         size_t count = 2; for (size_t i = 0; p->environment[i]; i++) count += strlen(p->environment[i]) + 1;
         environment = calloc(count, sizeof(*environment));
-        if (!environment) { free(application); free(line); free(directory); return fail(p, "exec: allocation failed"); }
+        if (!environment) { free(application); free(line); free(directory); fail(p, "exec: allocation failed"); return NULL; }
         size_t total = 0; while (p->environment[total]) total++;
         wchar_t **entries = calloc(total ? total : 1, sizeof(*entries));
-        if (!entries) { free(application); free(line); free(directory); free(environment); return fail(p, "exec: allocation failed"); }
+        if (!entries) { free(application); free(line); free(directory); free(environment); fail(p, "exec: allocation failed"); return NULL; }
         int valid = 1;
         for (size_t i = 0; i < total; i++) if (!(entries[i] = wide(p->environment[i]))) valid = 0;
-        if (!valid) { for (size_t i = 0; i < total; i++) free(entries[i]); free(entries); free(application); free(line); free(directory); free(environment); return fail(p, "exec: invalid environment"); }
+        if (!valid) { for (size_t i = 0; i < total; i++) free(entries[i]); free(entries); free(application); free(line); free(directory); free(environment); fail(p, "exec: invalid environment"); return NULL; }
         qsort(entries, total, sizeof(*entries), compare_env);
         wchar_t *at = environment;
         for (size_t i = 0; i < total; i++) { size_t n = wcslen(entries[i])+1; memcpy(at,entries[i],n*sizeof(*at)); at += n; free(entries[i]); }
         free(entries);
     }
-    HANDLE capture = INVALID_HANDLE_VALUE;
-    if (p->capture) {
-        wchar_t base[32768], path[32768];
-        if (!GetTempPathW(32768, base) || !GetTempFileNameW(base, L"ocx", 0, path)) { free(application); free(line); free(directory); free(environment); return fail(p, "exec: cannot create output file"); }
-        SECURITY_ATTRIBUTES security = {sizeof(security), NULL, TRUE};
-        capture = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &security, OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
-        if (capture == INVALID_HANDLE_VALUE) { DeleteFileW(path); free(application); free(line); free(directory); free(environment); return fail(p, "exec: cannot open output file"); }
-    }
-    HANDLE handles[3] = {inherited(GetStdHandle(STD_INPUT_HANDLE)), p->capture ? capture : inherited(GetStdHandle(STD_OUTPUT_HANDLE)), p->combined ? capture : inherited(GetStdHandle(STD_ERROR_HANDLE))};
+    HANDLE handles[3] = {input != INVALID_HANDLE_VALUE ? input : inherited(GetStdHandle(STD_INPUT_HANDLE)), p->capture ? capture : inherited(GetStdHandle(STD_OUTPUT_HANDLE)), p->combined ? capture : inherited(GetStdHandle(STD_ERROR_HANDLE))};
     STARTUPINFOEXW startup = {0}; startup.StartupInfo.cb = sizeof(startup);
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = handles[0]; startup.StartupInfo.hStdOutput = handles[1]; startup.StartupInfo.hStdError = handles[2];
@@ -163,15 +219,28 @@ int32_t ocean_process_run(OceanProcess *p) {
     PROCESS_INFORMATION process = {0};
     int created = configured && CreateProcessW(application, line, NULL, NULL, TRUE, CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT, environment, directory, &startup.StartupInfo, &process);
     if (initialized) DeleteProcThreadAttributeList(startup.lpAttributeList); free(startup.lpAttributeList);
-    for (int i = 0; i < 3; i++) if (handles[i] != INVALID_HANDLE_VALUE && handles[i] != capture) CloseHandle(handles[i]);
+    for (int i = 0; i < 3; i++) if (handles[i] != INVALID_HANDLE_VALUE && handles[i] != capture && handles[i] != input) CloseHandle(handles[i]);
     free(application); free(line); free(directory); free(environment);
-    if (!created) { if (capture != INVALID_HANDLE_VALUE) CloseHandle(capture); return fail(p, "exec: executable could not be started"); }
+    if (!created) { fail(p, "exec: executable could not be started"); return NULL; }
     CloseHandle(process.hThread);
+    return process.hProcess;
+}
+int32_t ocean_process_run_input(OceanProcess *p, const char *input, int64_t input_size, int64_t has_input) {
+    p->exit_code = -1; p->output = NULL; p->output_size = 0; p->error = NULL;
+    HANDLE capture = INVALID_HANDLE_VALUE, stdin_file = INVALID_HANDLE_VALUE;
+    if (p->capture) {
+        capture = temp_file(L"ocx");
+        if (capture == INVALID_HANDLE_VALUE) return fail(p, "exec: cannot create output file");
+    }
+    if (has_input && (stdin_file = input_file(input, input_size)) == INVALID_HANDLE_VALUE) { if (capture != INVALID_HANDLE_VALUE) CloseHandle(capture); return fail(p, "exec: cannot create input file"); }
+    HANDLE child = spawn(p, stdin_file, capture);
+    if (stdin_file != INVALID_HANDLE_VALUE) CloseHandle(stdin_file);
+    if (!child) { if (capture != INVALID_HANDLE_VALUE) CloseHandle(capture); return 1; }
     DWORD code = 0;
     DWORD waiting;
-    do { waiting = WaitForSingleObject(process.hProcess, 20); if (interrupted) TerminateProcess(process.hProcess, 130); } while (waiting == WAIT_TIMEOUT);
-    int waited = waiting == WAIT_OBJECT_0 && GetExitCodeProcess(process.hProcess, &code);
-    CloseHandle(process.hProcess); p->exit_code = waited ? (int64_t)code : -1;
+    do { waiting = WaitForSingleObject(child, 20); if (interrupted) TerminateProcess(child, 130); } while (waiting == WAIT_TIMEOUT);
+    int waited = waiting == WAIT_OBJECT_0 && GetExitCodeProcess(child, &code);
+    CloseHandle(child); p->exit_code = waited ? (int64_t)code : -1;
     int read_ok = 1;
     if (capture != INVALID_HANDLE_VALUE) {
         LARGE_INTEGER zero = {0}; read_ok = SetFilePointerEx(capture, zero, NULL, FILE_BEGIN) != 0;
@@ -183,6 +252,32 @@ int32_t ocean_process_run(OceanProcess *p) {
     if (!read_ok) return fail(p, "exec: output read failed");
     return code ? fail(p, "exec: process exited unsuccessfully") : 0;
 }
+/* Starts p without capture; *handle receives the process handle for wait/kill. */
+int32_t ocean_process_start(OceanProcess *p, const char *input, int64_t input_size, int64_t has_input, int64_t *handle, int64_t *pid) {
+    p->exit_code = -1; p->output = NULL; p->output_size = 0; p->error = NULL; *handle = 0; *pid = -1;
+    HANDLE stdin_file = INVALID_HANDLE_VALUE;
+    if (has_input && (stdin_file = input_file(input, input_size)) == INVALID_HANDLE_VALUE) return fail(p, "exec: cannot create input file");
+    p->capture = 0; p->combined = 0;
+    HANDLE child = spawn(p, stdin_file, INVALID_HANDLE_VALUE);
+    if (stdin_file != INVALID_HANDLE_VALUE) CloseHandle(stdin_file);
+    if (!child) return 1;
+    *handle = (int64_t)(intptr_t)child; *pid = (int64_t)GetProcessId(child);
+    return 0;
+}
+/* Returns 1 when the process has exited (releasing the handle), 0 while it
+ * runs (only without block), or -1 on failure. */
+int32_t ocean_process_wait(int64_t handle, int64_t block, int64_t *exit_code, int64_t *signal_number) {
+    HANDLE child = (HANDLE)(intptr_t)handle; *exit_code = -1; *signal_number = 0;
+    DWORD waiting = WaitForSingleObject(child, block ? INFINITE : 0);
+    if (waiting == WAIT_TIMEOUT) return 0;
+    DWORD code = 0;
+    int waited = waiting == WAIT_OBJECT_0 && GetExitCodeProcess(child, &code);
+    CloseHandle(child);
+    if (!waited) return -1;
+    *exit_code = (int64_t)code; return 1;
+}
+int32_t ocean_process_kill(int64_t handle) { return TerminateProcess((HANDLE)(intptr_t)handle, 1) ? 0 : -1; }
+int32_t ocean_process_run(OceanProcess *p) { return ocean_process_run_input(p, NULL, 0, 0); }
 #else
 char *ocean_process_argument(int64_t index) { (void)index; return NULL; }
 char *ocean_process_lookpath(const char *name) {
@@ -213,15 +308,51 @@ static int add_directory(posix_spawn_file_actions_t *actions, const char *direct
     return posix_spawn_file_actions_addchdir_np(actions, directory);
 #endif
 }
-int32_t ocean_process_run(OceanProcess *p) {
-    p->exit_code = -1; p->output = NULL; p->output_size = 0; p->error = NULL;
+/* Creates an unlinked, close-on-exec temporary file descriptor >= 3 so it
+ * cannot leak to concurrently spawned children or collide with fds 0..2. */
+static int temp_fd(void) {
+    const char *dir = getenv("TMPDIR");
+    if (!dir || !*dir) dir = "/tmp";
+    size_t n = strlen(dir);
+    while (n > 1 && dir[n - 1] == '/') n--;
+    char *path = malloc(n + 16);
+    if (!path) return -1;
+    memcpy(path, dir, n);
+    memcpy(path + n, "/ocean-XXXXXX", 14);
+    int fd = mkostemp(path, O_CLOEXEC);
+    if (fd >= 0) unlink(path);
+    free(path);
+    if (fd < 0) return -1;
+    if (fd < 3) {
+        int moved = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+        close(fd);
+        if (moved < 0) return -1;
+        fd = moved;
+    }
+    return fd;
+}
+/* A rewound temporary file holding input, for a child's standard input. */
+static int input_file(const char *input, int64_t size) {
+    int fd = temp_fd();
+    if (fd < 0) return -1;
+    for (int64_t done = 0; done < size; ) {
+        ssize_t w = write(fd, input + done, (size_t)(size - done));
+        if (w < 0) { if (errno == EINTR) continue; close(fd); return -1; }
+        if (w == 0) { close(fd); return -1; }
+        done += w;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) { close(fd); return -1; }
+    return fd;
+}
+/* Starts p with optional standard-input and capture fds (>= 3); returns the pid or -1. */
+static pid_t spawn(OceanProcess *p, int input, int capture) {
     posix_spawn_file_actions_t actions;
-    if (posix_spawn_file_actions_init(&actions)) return fail(p, "exec: cannot initialize spawn actions");
-    FILE *file = p->capture ? tmpfile() : NULL;
-    int failed = p->capture && !file;
-    if (!failed && file) {
-        failed = posix_spawn_file_actions_adddup2(&actions, fileno(file), 1);
-        if (!failed && p->combined) failed = posix_spawn_file_actions_adddup2(&actions, fileno(file), 2);
+    if (posix_spawn_file_actions_init(&actions)) { fail(p, "exec: cannot initialize spawn actions"); return -1; }
+    int failed = 0;
+    if (input >= 0) failed = posix_spawn_file_actions_adddup2(&actions, input, 0);
+    if (!failed && capture >= 0) {
+        failed = posix_spawn_file_actions_adddup2(&actions, capture, 1);
+        if (!failed && p->combined) failed = posix_spawn_file_actions_adddup2(&actions, capture, 2);
     }
     if (!failed && p->directory && *p->directory) failed = add_directory(&actions, p->directory);
 #ifdef __APPLE__
@@ -232,13 +363,59 @@ int32_t ocean_process_run(OceanProcess *p) {
     pid_t child = -1;
     if (!failed) failed = posix_spawnp(&child, p->path, &actions, NULL, (char *const *)p->argv, env);
     posix_spawn_file_actions_destroy(&actions);
-    if (failed) { if (file) fclose(file); return fail(p, "exec: executable could not be started"); }
+    if (failed) { fail(p, "exec: executable could not be started"); return -1; }
+    return child;
+}
+int32_t ocean_process_run_input(OceanProcess *p, const char *input, int64_t input_size, int64_t has_input) {
+    p->exit_code = -1; p->output = NULL; p->output_size = 0; p->error = NULL;
+    int file = p->capture ? temp_fd() : -1;
+    if (p->capture && file < 0) return fail(p, "exec: executable could not be started");
+    int stdin_file = has_input ? input_file(input, input_size) : -1;
+    if (has_input && stdin_file < 0) { if (file >= 0) close(file); return fail(p, "exec: cannot create input file"); }
+    pid_t child = spawn(p, stdin_file, file);
+    if (stdin_file >= 0) close(stdin_file);
+    if (child < 0) { if (file >= 0) close(file); return 1; }
     int status;
-    while (waitpid(child, &status, 0) < 0) { if (errno != EINTR) { if (file) fclose(file); return fail(p, "exec: wait failed"); } if (interrupted) kill(child, SIGTERM); }
+    while (waitpid(child, &status, 0) < 0) { if (errno != EINTR) { if (file >= 0) close(file); return fail(p, "exec: wait failed"); } if (interrupted) kill(child, SIGTERM); }
     p->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     int read_ok = 1;
-    if (file) { rewind(file); char buffer[8192]; size_t n; while ((n = fread(buffer, 1, sizeof(buffer), file))) if (!append(p, buffer, n)) { read_ok = 0; break; } if (ferror(file)) read_ok = 0; fclose(file); }
+    if (file >= 0) {
+        if (lseek(file, 0, SEEK_SET) < 0) read_ok = 0;
+        char buffer[8192];
+        while (read_ok) {
+            ssize_t n = read(file, buffer, sizeof(buffer));
+            if (n < 0) { if (errno == EINTR) continue; read_ok = 0; break; }
+            if (n == 0) break;
+            if (!append(p, buffer, (size_t)n)) read_ok = 0;
+        }
+        close(file);
+    }
     if (!read_ok) return fail(p, "exec: output read failed");
     return p->exit_code ? fail(p, "exec: process exited unsuccessfully") : 0;
 }
+/* Starts p without capture; *handle receives the pid for wait/kill. */
+int32_t ocean_process_start(OceanProcess *p, const char *input, int64_t input_size, int64_t has_input, int64_t *handle, int64_t *pid) {
+    p->exit_code = -1; p->output = NULL; p->output_size = 0; p->error = NULL; *handle = 0; *pid = -1;
+    int stdin_file = has_input ? input_file(input, input_size) : -1;
+    if (has_input && stdin_file < 0) return fail(p, "exec: cannot create input file");
+    p->capture = 0; p->combined = 0;
+    pid_t child = spawn(p, stdin_file, -1);
+    if (stdin_file >= 0) close(stdin_file);
+    if (child < 0) return 1;
+    *handle = child; *pid = child;
+    return 0;
+}
+/* Returns 1 when the process has exited (reaping it), 0 while it runs (only
+ * without block), or -1 on failure. A signal exit reports exit code -1. */
+int32_t ocean_process_wait(int64_t handle, int64_t block, int64_t *exit_code, int64_t *signal_number) {
+    *exit_code = -1; *signal_number = 0;
+    int status; pid_t result;
+    while ((result = waitpid((pid_t)handle, &status, block ? 0 : WNOHANG)) < 0) if (errno != EINTR) return -1;
+    if (result == 0) return 0;
+    if (WIFEXITED(status)) *exit_code = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status)) *signal_number = WTERMSIG(status);
+    return 1;
+}
+int32_t ocean_process_kill(int64_t handle) { return kill((pid_t)handle, SIGKILL) ? -1 : 0; }
+int32_t ocean_process_run(OceanProcess *p) { return ocean_process_run_input(p, NULL, 0, 0); }
 #endif

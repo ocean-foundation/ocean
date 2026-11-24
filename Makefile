@@ -16,7 +16,7 @@ LDFLAGS := -X $(PKG).version=$(VERSION) -X $(PKG).commit=$(COMMIT) \
 	-X $(PKG).commitDate=$(COMMIT_DATE) -X $(PKG).commitYear=$(COMMIT_YEAR) \
 	-X $(PKG).buildDate=$(BUILD_DATE)
 
-.PHONY: all test selfhost clean runtime
+.PHONY: all test selfhost clean runtime crosscheck
 all: runtime
 	mkdir -p "$(dir $(OUT))"
 	"$(OCEAN)" build -ldflags "$(LDFLAGS)" -o "$(OUT)" .
@@ -34,6 +34,22 @@ test: all
 selfhost: all
 	mkdir -p "$(dir $(STAGE2))"
 	"$(OUT)" build -ldflags "$(LDFLAGS)" -o "$(STAGE2)" .
+
+# Compile the compiler (and any CROSSCHECK_DIRS) for every native target
+# without that machine: OCEAN_CROSS_TARGET emits the target's IR and asm,
+# then clang assembles it. Linking still needs the target's SDK/sysroot.
+CROSS_TARGETS ?= x86_64-linux aarch64-linux riscv64-linux x86_64-macos aarch64-macos x86_64-windows aarch64-windows
+CROSSCHECK_DIRS ?= .
+crosscheck: all
+	mkdir -p build/cross
+	@set -e; for dir in $(CROSSCHECK_DIRS); do for t in $(CROSS_TARGETS); do \
+		name=build/cross/$$(echo $$dir | tr '/.' '__')-$$t; \
+		OCEAN_CROSS_TARGET=$$t OCEAN_BUILD_CACHE=off "$(OUT)" build --emit-llvm -o $$name.ll $$dir; \
+		triple=$$(sed -n 's/^target triple = "\(.*\)"/\1/p' $$name.ll); \
+		clang --target=$$triple -c -w -O1 -x ir $$name.ll -o $$name.o; \
+		echo "ok   $$dir $$t"; \
+	done; done
+	@echo "OCOS=js OCARCH=wasm"; OCOS=js OCARCH=wasm OCEAN_BUILD_CACHE=off "$(OUT)" build --emit-llvm -o build/cross/wasm.ll . && clang --target=wasm32-unknown-unknown -c -w -O1 -x ir build/cross/wasm.ll -o build/cross/wasm.o && echo "ok   . wasm"
 
 clean:
 	rm -rf build

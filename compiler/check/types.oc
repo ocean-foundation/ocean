@@ -1,6 +1,7 @@
 package check;
 import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "strconv";
 
 // Builtin type singletons.
 tInvalid: *ast.Type;
@@ -158,13 +159,13 @@ func sameMethods(a *ast.Type, b *ast.Type) bool {
 }
 
 func intName(t *ast.Type) string {
-    if (t.varw) return (t.signed ? "varint(" : "varuint(") + util.Itoa(t.bits) + ")";
+    if (t.varw) return (t.signed ? "varint(" : "varuint(") + strconv.Itoa(t.bits) + ")";
     if (t.signed) {
         if (t.bits == 64) return "int";
-        return "i" + util.Itoa(t.bits);
+        return "i" + strconv.Itoa(t.bits);
     }
     if (t.bits == 64) return "uint";
-    return "u" + util.Itoa(t.bits);
+    return "u" + strconv.Itoa(t.bits);
 }
 
 func argsString(args []*ast.Type) string {
@@ -205,11 +206,11 @@ func TypeString(t *ast.Type) string {
     case ast.TK.Array:
         if (t.len == -2) return "array<" + TypeString(t.elem) + ">";
         if (t.len == -1) return "[n]" + TypeString(t.elem);
-        return "[" + util.Itoa(t.len) + "]" + TypeString(t.elem);
+        return "[" + strconv.Itoa(t.len) + "]" + TypeString(t.elem);
     case ast.TK.Dyn: return (t.isMixed ? "mixed []" : "[]") + TypeString(t.elem);
     case ast.TK.Buffer:
         if (nilT(t.elem)) return "buffer";
-        if (t.len > 0) return "buffer<" + TypeString(t.elem) + ", " + util.Itoa(t.len) + ">";
+        if (t.len > 0) return "buffer<" + TypeString(t.elem) + ", " + strconv.Itoa(t.len) + ">";
         if (t.len == -1) return "buffer<" + TypeString(t.elem) + ", n>";
         return "buffer<" + TypeString(t.elem) + ">";
     case ast.TK.Map: return "map[" + TypeString(t.key) + "]" + TypeString(t.elem);
@@ -247,16 +248,16 @@ func TypeKey(t *ast.Type) string {
     if (t.key2 != "") return t.key2;
     k := "";
     switch (t.kind) {
-    case ast.TK.Int: k = (t.varw ? "w" : "") + (t.signed ? "i" : "u") + util.Itoa(t.bits);
-    case ast.TK.Float: k = "f" + util.Itoa(t.bits);
+    case ast.TK.Int: k = (t.varw ? "w" : "") + (t.signed ? "i" : "u") + strconv.Itoa(t.bits);
+    case ast.TK.Float: k = "f" + strconv.Itoa(t.bits);
     case ast.TK.Bool: k = "b";
     case ast.TK.String: k = "s";
     case ast.TK.Void: k = "v";
     case ast.TK.Null: k = "null";
     case ast.TK.Ptr: k = "P" + TypeKey(t.elem);
-    case ast.TK.Array: k = "A" + util.Itoa(t.len) + "_" + TypeKey(t.elem);
+    case ast.TK.Array: k = "A" + strconv.Itoa(t.len) + "_" + TypeKey(t.elem);
     case ast.TK.Dyn: k = (t.isMixed ? "X" : "D") + TypeKey(t.elem);
-    case ast.TK.Buffer: k = nilT(t.elem) ? "Bfam" : "B" + util.Itoa(t.len) + "_" + TypeKey(t.elem);
+    case ast.TK.Buffer: k = nilT(t.elem) ? "Bfam" : "B" + strconv.Itoa(t.len) + "_" + TypeKey(t.elem);
     case ast.TK.Map: k = "M" + TypeKey(t.key) + "_" + TypeKey(t.elem);
     case ast.TK.Func, ast.TK.Tuple:
         k = t.kind == ast.TK.Func ? "F(" : "T(";
@@ -265,7 +266,7 @@ func TypeKey(t *ast.Type) string {
         for (_, r := range t.results) k += TypeKey(r) + ",";
         k += ";";
     case ast.TK.Struct, ast.TK.Enum, ast.TK.Named, ast.TK.Param, ast.TK.Family:
-        k = "N" + util.Itoa(t.sym.id) + t.sym.name;
+        k = "N" + strconv.Itoa(t.sym.id) + t.sym.name;
         if (len(t.args) > 0) { k += "<"; for (_, a := range t.args) k += TypeKey(a) + ","; k += ">"; }
     case ast.TK.Interface:
         if (nilS(t.sym)) {
@@ -277,7 +278,7 @@ func TypeKey(t *ast.Type) string {
                 k += "}";
             }
         } else {
-            k = "N" + util.Itoa(t.sym.id) + t.sym.name;
+            k = "N" + strconv.Itoa(t.sym.id) + t.sym.name;
             if (len(t.args) > 0) { k += "<"; for (_, a := range t.args) k += TypeKey(a) + ","; k += ">"; }
         }
     case ast.TK.Union:

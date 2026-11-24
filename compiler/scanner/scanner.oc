@@ -1,6 +1,7 @@
 package scanner;
 import "github.com/ocean-foundation/ocean/compiler/diag";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "unicode";
 
 enum Kind {
     EOF, Ident, Int, Float, Str, Blank, AsmBody,
@@ -183,7 +184,7 @@ func hexVal(c i8) int {
     return 99;
 }
 func isDigitBase(c i8, hex bool) bool { return (c >= '0' && c <= '9') || (hex && hexVal(c) < 16); }
-func isAlnum(c i8) bool { return util.IsLetter(c) || c == '_' || util.IsDigit(c); }
+func isAlnum(c i8) bool { return unicode.IsLetter(c) || c == '_' || unicode.IsDigit(c); }
 
 // scanNum reads between minn and maxn digits of base starting at the current char.
 // The scanner is left on the last digit. Returns -1 after reporting an error.
@@ -304,8 +305,8 @@ func scanNumber(s *Scanner) {
     if (base == 10 && (charAt(s, at) == 'e' || charAt(s, at) == 'E')) {
         floating = true; at++;
         if (charAt(s, at) == '+' || charAt(s, at) == '-') at++;
-        if (!util.IsDigit(charAt(s, at))) { numberError(s); return; }
-        for (util.IsDigit(charAt(s, at))) at++;
+        if (!unicode.IsDigit(charAt(s, at))) { numberError(s); return; }
+        for (unicode.IsDigit(charAt(s, at))) at++;
     }
     if (isAlnum(charAt(s, at))) { numberError(s); return; }
     // Magnitude limit: 8388608 bits.
@@ -463,7 +464,7 @@ func next(s *Scanner) {
         return;
     }
     if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { advance(s); return; }
-    if (util.IsDigit(c)) { scanNumber(s); return; }
+    if (unicode.IsDigit(c)) { scanNumber(s); return; }
     v, n := DecodeUTF8(s.src, s.pos);
     if (n == 0 || !IsIdentStart(v)) {
         errHere(s, "Unexpected or invalid character or UTF-8 encoding in identifier");

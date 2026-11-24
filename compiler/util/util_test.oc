@@ -1,34 +1,13 @@
 package util;
+import "os";
+import "strings";
 import "testing";
 
-func TestItoa(t *testing.T) {
-    if (Itoa(0) != "0") t.Error("0");
-    if (Itoa(-45) != "-45") t.Error("-45 got ", Itoa(-45));
-    if (Itoa(-9223372036854775807 - 1) != "-9223372036854775808") t.Error("min");
-    if (Utoa(18446744073709551615->uint) != "18446744073709551615") t.Error("umax");
+func TestFormatting(t *testing.T) {
     if (Hex(255->uint, 4) != "00ff") t.Error("hex");
-}
-
-func TestStrings(t *testing.T) {
-    if (!HasPrefix("hello", "he") || HasPrefix("he", "hello")) t.Error("prefix");
-    if (!HasSuffix("file_test.oc", "_test.oc")) t.Error("suffix");
-    if (Index("abcabc", "ca") != 2 || Index("abc", "x") != -1) t.Error("index");
-    parts := Split("a/b//c", '/');
-    if (len(parts) != 4 || parts[3] != "c" || parts[2] != "") t.Error("split");
-    if (JoinList(parts, ",") != "a,b,,c") t.Error("join");
-    if (Trim("  x y \n") != "x y") t.Error("trim");
-    if (Replace("aXbXc", "X", "--") != "a--b--c") t.Error("replace");
-    n, ok := Atoi("-42");
-    if (!ok || n != -42) t.Error("atoi");
-    _, bad := Atoi("4x");
-    if (bad) t.Error("atoi bad");
-    if (Quote("a\"\n") != "\"a\\\"\\n\"") t.Error("quote ", Quote("a\"\n"));
-}
-
-func TestSort(t *testing.T) {
-    a := []string{"pear", "apple", "fig", "banana", "Apple"};
-    SortStrings(&a);
-    if (JoinList(a, " ") != "Apple apple banana fig pear") t.Error("sort ", JoinList(a, " "));
+    if (FormatFixed(1.005, 2) != "1.01" && FormatFixed(1.005, 2) != "1.00") t.Error("fixed ", FormatFixed(1.005, 2));
+    if (FormatFixed(-2.5, 0) != "-3" || FormatFixed(0.25, 1) != "0.3") t.Error("fixed rounding");
+    if (PadLeft("é", 3) != "  é" || PadRight("ab", 3) != "ab ") t.Error("padding");
 }
 
 func TestBuf(t *testing.T) {
@@ -67,7 +46,7 @@ func TestFiles(t *testing.T) {
 func TestProcess(t *testing.T) {
     if (Windows()) {
         st, out := RunCapture([]string{"cmd.exe", "/d", "/c", "echo hi"}.array());
-        if (st.Failed || st.Code != 0 || Trim(out) != "hi") t.Error("capture ", st.Code, " ", out);
+        if (st.Failed || st.Code != 0 || strings.TrimSpace(out) != "hi") t.Error("capture ", st.Code, " ", out);
         return;
     }
     st, out := RunCapture([]string{"sh", "-c", "echo hi; echo err >&2; exit 3"}.array());
@@ -77,8 +56,7 @@ func TestProcess(t *testing.T) {
 }
 
 func TestHost(t *testing.T) {
-    if (HostOS() != "linux" && HostOS() != "macos" && HostOS() != "windows") t.Error("host OS");
-    if (HostArch() != "x86_64" && HostArch() != "aarch64" && HostArch() != "riscv64") t.Error("host architecture");
+    if (Windows() != (os.OS() == "windows") || MacOS() != (os.OS() == "macos")) t.Error("host OS");
     if (!IsRegular(Executable())) t.Error("executable path ", Executable());
     first := MonoSeconds();
     second := MonoSeconds();

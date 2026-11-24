@@ -6,13 +6,17 @@ import "github.com/ocean-foundation/ocean/compiler/loader";
 import "github.com/ocean-foundation/ocean/compiler/parser";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "path" as filepath;
+import "strconv";
+import "strings";
+import "unicode";
 
 struct Item { label string; kind int; detail string; edit string; }
 
 struct Items { list []*Item; seen map[string]bool; prefix string; }
 
 func add(items *Items, label string, kind int, detail string) {
-    if (!util.HasPrefix(label, items.prefix) || label == "" || label == "_") return;
+    if (!strings.HasPrefix(label, items.prefix) || label == "" || label == "_") return;
     _, dup := items.seen[label];
     if (dup) return;
     items.seen[label] = true;
@@ -21,7 +25,7 @@ func add(items *Items, label string, kind int, detail string) {
     items.list.append(it);
 }
 
-func identByte(c i8) bool { return util.IsLetter(c) || util.IsDigit(c) || c == '_' || ((c -> int) & 255) >= 128; }
+func identByte(c i8) bool { return unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' || ((c -> int) & 255) >= 128; }
 
 // receiverStart scans back over a receiver expression ending at end.
 func receiverStart(text string, end int) int {
@@ -95,7 +99,7 @@ func memberItems(a *Analysis, items *Items, text string, dot int, off int) {
     if (rs >= dot) return;
     recvText := text[rs:dot];
     // a package qualifier
-    if (util.IndexByte(recvText, '.') < 0 && util.IndexByte(recvText, '(') < 0 && util.IndexByte(recvText, '<') < 0) {
+    if (strings.IndexByte(recvText, '.') < 0 && strings.IndexByte(recvText, '(') < 0 && strings.IndexByte(recvText, '<') < 0) {
         s := a.checker.LookupAt(a.src, off, recvText);
         if (!ast.NilSym(s) && s.kind == ast.SK.Package) {
             for (_, m := range s.importPkg.syms) { if (m.exported) add(items, m.name, kindOf(m), detailOf(a, m)); }
@@ -206,7 +210,7 @@ func headerName(path string) string {
     i += 7;
     for (i < len(text) && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\r')) i++;
     s := i;
-    for (i < len(text) && (util.IsLetter(text[i]) || util.IsDigit(text[i]) || text[i] == '_')) i++;
+    for (i < len(text) && (unicode.IsLetter(text[i]) || unicode.IsDigit(text[i]) || text[i] == '_')) i++;
     return text[s:i];
 }
 
@@ -217,7 +221,7 @@ func candidateDir(out *[]*Candidate, dir string, importPath string, depth int, b
     if (!ok) return;
     name := "";
     for (_, n := range names) {
-        if (!util.HasSuffix(n, ".oc") || util.HasSuffix(n, "_test.oc")) continue;
+        if (!strings.HasSuffix(n, ".oc") || strings.HasSuffix(n, "_test.oc")) continue;
         name = headerName(dir + "/" + n);
         if (name != "") break;
     }
@@ -240,7 +244,7 @@ func candidates(a *Analysis) []*Candidate {
     b := a.build;
     std := b.StandardSource();
     if (std != "" && util.IsDir(std)) candidateDir(&out, std, "", 0, &budget, false);
-    m := b.FindModule(util.Dir(a.doc.path));
+    m := b.FindModule(filepath.Dir(a.doc.path));
     if ((m -> int) != 0 && m.path != "") {
         candidateDir(&out, m.root, m.path, 0, &budget, true);
         for (name, r := range m.replaces) {
@@ -274,14 +278,14 @@ func packageItems(a *Analysis, items *Items) {
     imported: map[string]bool;
     for (_, imp := range a.src.importNodes) imported[imp.text] = true;
     if (!ast.Nil(a.src.file)) { for (_, imp := range a.src.file.list2) imported[imp.text] = true; }
-    selfDir := util.Dir(a.doc.path);
+    selfDir := filepath.Dir(a.doc.path);
     at := packageClauseEnd(a);
     line := 1; lstart := 0;
     for (i := 0; i < at && i < len(a.doc.text); i++) { if (a.doc.text[i] == '\n') { line++; lstart = i + 1; } }
-    pos := "{\"line\":" + util.Itoa(line - 1) + ",\"character\":" + util.Itoa(utf16Col(a.doc.text, line, at - lstart + 1)) + "}";
+    pos := "{\"line\":" + strconv.Itoa(line - 1) + ",\"character\":" + strconv.Itoa(utf16Col(a.doc.text, line, at - lstart + 1)) + "}";
     for (_, cand := range candidates(a)) {
         _, done := imported[cand.path];
-        if (done || !util.HasPrefix(cand.name, items.prefix)) continue;
+        if (done || !strings.HasPrefix(cand.name, items.prefix)) continue;
         _, taken := items.seen[cand.name];
         if (taken) continue;
         rd, _ := util.Realpath(cand.dir);

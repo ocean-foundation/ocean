@@ -349,7 +349,7 @@ func paramList(p *Parser, allowVariadic bool, what string) []*ast.Node {
         if (is(p, scanner.Kind.Ident) && (peek(p, 1) == scanner.Kind.Comma || peek(p, 1) == scanner.Kind.RParen)) {
             e.bare = true; e.name = tok(p).text; e.nameNode = node(p, ast.NK.Ident); e.nameNode.name = e.name;
             finish(p, e.nameNode); next(p);
-        } else if ((is(p, scanner.Kind.Ident) || is(p, scanner.Kind.Blank)) && namedParamFollows(p)) {
+        } else if ((is(p, scanner.Kind.Ident) || is(p, scanner.Kind.Blank)) && namedParamFollows(p) && !unnamedMapParam(p)) {
             e.name = tok(p).text; e.nameNode = node(p, ast.NK.Ident); e.nameNode.name = e.name; next(p);
             anyNamed = true;
             if (ellipsis(p)) { skipEllipsis(p); e.variadic = true; }
@@ -399,6 +399,19 @@ func paramList(p *Parser, allowVariadic bool, what string) []*ast.Node {
         out.append(n);
     }
     return out;
+}
+
+// unnamedMapParam reports whether 'map[K]V' at the cursor is an entire
+// unnamed parameter type rather than a parameter named map, as in ocean-c.
+func unnamedMapParam(p *Parser) bool {
+    if (!is(p, scanner.Kind.Ident) || tok(p).text != "map" || peek(p, 1) != scanner.Kind.LBrack) return false;
+    m := save(p);
+    p.trial++;
+    constraint(p);
+    ok := !p.failed && (is(p, scanner.Kind.Comma) || is(p, scanner.Kind.RParen));
+    p.trial--;
+    restore(p, m);
+    return ok;
 }
 
 func namedParamFollows(p *Parser) bool {

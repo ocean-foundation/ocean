@@ -1,5 +1,7 @@
 package util;
 
+import "strconv";
+
 // Buf is an amortized byte builder. Strings in Ocean are immutable, so large
 // outputs (LLVM IR, reports) are accumulated here and converted once.
 struct Buf { bytes []i8; }
@@ -8,7 +10,7 @@ func NewBuf() *Buf { return new(Buf); }
 
 func (b *Buf) Add(s string) *Buf { b.bytes.append(s...); return b; }
 func (b *Buf) Addc(c i8) *Buf { b.bytes.append(c); return b; }
-func (b *Buf) AddInt(n int) *Buf { b.bytes.append(Itoa(n)...); return b; }
+func (b *Buf) AddInt(n int) *Buf { b.bytes.append(strconv.Itoa(n)...); return b; }
 func (b *Buf) AddBuf(o *Buf) *Buf { b.bytes.append(o.bytes...); return b; }
 func (b *Buf) Line(s string) *Buf { b.bytes.append(s...); b.bytes.append('\n'); return b; }
 func (b *Buf) Len() int { return len(b.bytes); }

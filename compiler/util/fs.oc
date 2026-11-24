@@ -1,7 +1,13 @@
 package util;
 
-// Filesystem policy in Ocean; native ABI calls live in native.oc.
-extern buffer<i8> getenv(buffer<i8> name);
+import "os";
+import "path" as filepath;
+import "strings";
+
+// The compiler's file-system conventions over the standard library: canonical
+// paths use '/' on every host, and operations report success as a bool (or a
+// value with a bool). Descriptor I/O used with child processes stays on the
+// native bridges in native.oc.
 extern void free(*void p);
 extern int strlen(buffer<i8> s);
 
@@ -15,28 +21,11 @@ func FromC(p buffer<i8>) string {
     return out -> string;
 }
 
-func Getenv(name string) (string, bool) {
-    c := CStr(name);
-    p := extern.getenv(c.data);
-    if ((p -> int) == 0) return "", false;
-    return FromC(p), true;
-}
+func Getenv(name string) (string, bool) { return os.LookupEnv(name); }
 
 func ReadFile(path string) (string, bool) {
-    c := CStr(path);
-    fd := native_open((c.data)->int, ReadFlags(), 0);
-    if (fd < 0) return "", false;
-    out := make([]i8);
-    chunk := make([]i8);
-    for (i := 0; i < 65536; i++) chunk.append(0);
-    for (;;) {
-        n := native_read((fd)->int, (chunk.data)->int, (65536)->int);
-        if (n < 0) { native_close((fd)->int); return "", false; }
-        if (n == 0) break;
-        out.append(chunk[0:n]...);
-    }
-    native_close((fd)->int);
-    return out -> string, true;
+    text := os.ReadFile(path);
+    return text.unwrapOrZero(), !text.hasError();
 }
 
 func WriteFd(fd int, s string) bool {
@@ -64,18 +53,17 @@ func WriteBytesFd(fd int, b *[]i8) bool {
 func Stdout(s string) { WriteFd(1->i32, s); }
 func Stderr(s string) { WriteFd(2->i32, s); }
 
-// WriteFile writes s to path (create/truncate) with the given mode bits.
-func WriteFileMode(path string, s string, mode int) bool {
-    c := CStr(path);
-    fd := native_open((c.data)->int, WriteFlags(), (mode->u32)->int);
-    if (fd < 0) return false;
-    ok := WriteFd(fd, s);
-    if (native_close((fd)->int) != 0) ok = false;
-    return ok;
-}
-func WriteFile(path string, s string) bool { return WriteFileMode(path, s, 438); }
+func WriteFile(path string, s string) bool { return !os.WriteFile(path, s).hasError(); }
 
-// OpenTrunc opens path for writing (create/truncate); -1 on failure.
+// WriteFileMode writes s to path and then sets its permission bits.
+func WriteFileMode(path string, s string, mode int) bool {
+    return WriteFile(path, s) && !os.Chmod(path, mode).hasError();
+}
+
+func WriteBufFile(path string, b *Buf) bool { return WriteFile(path, b.String()); }
+
+// OpenTrunc opens path for writing (create/truncate) as a descriptor that can
+// be passed to a child process; -1 on failure.
 func OpenTrunc(path string) int {
     c := CStr(path);
     return native_open((c.data)->int, WriteFlags(), (438->u32)->int) -> int;
@@ -83,227 +71,97 @@ func OpenTrunc(path string) int {
 func WriteString(fd int, s string) bool { return WriteFd(fd->i32, s); }
 func Close(fd int) bool { return native_close((fd->i32)->int) == 0; }
 
-func WriteBufFile(path string, b *Buf) bool {
-    c := CStr(path);
-    fd := native_open((c.data)->int, WriteFlags(), (438->u32)->int);
-    if (fd < 0) return false;
-    ok := WriteBytesFd(fd, &b.bytes);
-    if (native_close((fd)->int) != 0) ok = false;
-    return ok;
-}
-
-// statMode returns st_mode or -1.
 func addr(b buffer<i8>) int { return b -> int; }
 func BufAt(n int) buffer<i8> { p := n -> (*void); b := p -> (buffer<i8>); return b; }
-func statMode(path string, follow bool) int {
-    c := CStr(path);
-    st: buffer<i8, 256>;
-    r := follow ? native_stat((c.data)->int, (st)->int) : native_lstat((c.data)->int, (st)->int);
-    if (r != 0) return -1;
-    if (MacOS()) return (*((addr(st) + 4) -> (*u16))) -> int;
-    if (Windows()) return (*((addr(st) + 6) -> (*u16))) -> int;
-    offset := HostArch() == "x86_64" ? 24 : 16;
-    return (*((addr(st) + offset) -> (*u32))) -> int;
-}
 
+// StatMode returns the mode bits of path (following links), or -1.
+func StatMode(path string) int {
+    info := os.Stat(path);
+    return info.hasError() ? -1 : info.unwrap().Mode;
+}
 func StatSize(path string) int {
-    c := CStr(path);
-    st: buffer<i8, 256>;
-    if (native_stat((c.data)->int, (st)->int) != 0) return -1;
-    return *((addr(st) + (Windows() ? 24 : (MacOS() ? 96 : 48))) -> (*int));
+    info := os.Stat(path);
+    return info.hasError() ? -1 : info.unwrap().Size;
 }
-
 func StatMtime(path string) int {
-    c := CStr(path);
-    st: buffer<i8, 256>;
-    if (native_stat((c.data)->int, (st)->int) != 0) return -1;
-    if (Windows()) return *((addr(st) + 40) -> (*int)) * 1000000000;
-    offset := MacOS() ? 48 : 88;
-    sec := *((addr(st) + offset) -> (*int));
-    nsec := *((addr(st) + offset + 8) -> (*int));
-    return sec * 1000000000 + nsec;
+    info := os.Stat(path);
+    return info.hasError() ? -1 : info.unwrap().ModTime;
 }
 
-func Exists(path string) bool { return statMode(path, true) >= 0; }
-func IsDir(path string) bool { m := statMode(path, true); return m >= 0 && (m & 61440) == 16384; }
-func IsRegular(path string) bool { m := statMode(path, true); return m >= 0 && (m & 61440) == 32768; }
-func StatMode(path string) int { return statMode(path, true); }
-func IsSymlink(path string) bool { if (Windows()) { c := CStr(path); flags := WinAttributes(c.data->int); return flags != -1 && (flags & 1024) != 0; } m := statMode(path, false); return m >= 0 && (m & 61440) == 40960; }
-func IsExecutable(path string) bool { c := CStr(path); return IsRegular(path) && native_access((c.data)->int, Windows() ? 0 : 1) == 0; }
+func Exists(path string) bool { return os.Exists(path); }
+func IsDir(path string) bool { return os.IsDir(path); }
+func IsRegular(path string) bool {
+    info := os.Stat(path);
+    return !info.hasError() && info.unwrap().IsRegular();
+}
+func IsSymlink(path string) bool {
+    info := os.Lstat(path);
+    return !info.hasError() && info.unwrap().IsSymlink();
+}
+// IsExecutable reports a regular file with an execute bit (any regular file on Windows).
+func IsExecutable(path string) bool {
+    info := os.Stat(path);
+    if (info.hasError() || !info.unwrap().IsRegular()) return false;
+    return Windows() || (info.unwrap().Mode & 73) != 0;
+}
 
 // ListDir returns the entry names of a directory (excluding . and ..), sorted.
 func ListDir(path string) ([]string, bool) {
-    out := make([]string);
-    if (Windows()) return windowsListDir(path);
-    c := CStr(path);
-    d := (native_opendir((c.data)->int) -> (*void));
-    if ((d -> int) == 0) return out, false;
-    for (;;) {
-        e := (native_readdir((d)->int) -> (buffer<i8>));
-        if ((e -> int) == 0) break;
-        name := FromC(BufAt((e -> int) + (MacOS() ? 21 : 19)));
-        if (name == "." || name == "..") continue;
-        out.append(name);
-    }
-    native_closedir((d)->int);
-    SortStrings(&out);
-    return out, true;
+    names := os.ListDir(path);
+    return names.unwrapOrZero(), !names.hasError();
 }
 
-func Mkdir(path string) bool { c := CStr(path); return native_mkdir((c.data)->int, (511->u32)->int) == 0; }
-func MkdirAll(path string) bool {
-    if (IsDir(path)) return true;
-    parent := Dir(path);
-    if (parent != path && parent != "" && !IsDir(parent)) { if (!MkdirAll(parent)) return false; }
-    return Mkdir(path) || IsDir(path);
-}
-func Remove(path string) bool { c := CStr(path); if (Windows() && IsSymlink(path) && IsDir(path)) return WinRemoveDir(c.data->int) != 0; return native_unlink((c.data)->int) == 0; }
-func Rmdir(path string) bool { c := CStr(path); return native_rmdir((c.data)->int) == 0; }
-func Rename(from string, to string) bool { a := CStr(from); b := CStr(to); if (Windows()) return WinMove(a.data->int, b.data->int, 9) != 0; return native_rename((a.data)->int, (b.data)->int) == 0; }
-func Chmod(path string, mode int) bool { c := CStr(path); return native_chmod((c.data)->int, (mode->u32)->int) == 0; }
+func Mkdir(path string) bool { return !os.Mkdir(path).hasError(); }
+func MkdirAll(path string) bool { return !os.MkdirAll(path).hasError(); }
+func Remove(path string) bool { return !os.Remove(path).hasError(); }
+func Rmdir(path string) bool { return IsDir(path) && Remove(path); }
+func Rename(from string, to string) bool { return !os.Rename(from, to).hasError(); }
+func Chmod(path string, mode int) bool { return !os.Chmod(path, mode).hasError(); }
+func RemoveAll(path string) bool { return !os.RemoveAll(path).hasError(); }
 
-func RemoveAll(path string) bool {
-    if (IsSymlink(path) || !IsDir(path)) return Remove(path);
-    names, _ := ListDir(path);
-    for (_, n := range names) RemoveAll(path + "/" + n);
-    return Rmdir(path);
-}
-
-func Getcwd() string {
-    b := make([]i8);
-    for (i := 0; i < 4096; i++) b.append(0);
-    p := (native_getcwd((b.data)->int, (4096)->int) -> (buffer<i8>));
-    return NormalizePath(FromC(p));
-}
+func Getcwd() string { return NormalizePath(os.Getwd().unwrapOrZero()); }
 
 func Realpath(path string) (string, bool) {
-    if (Windows() && !Exists(path)) return "", false;
-    c := CStr(path);
-    p := (Windows() ? WinFullPath(0, c.data->int, 0) : native_realpath(c.data->int, 0)) -> (buffer<i8>);
-    if ((p -> int) == 0) return "", false;
-    s := FromC(p);
-    extern.free(p -> (*void));
-    return NormalizePath(s), true;
+    resolved := os.Realpath(path);
+    if (resolved.hasError()) return "", false;
+    return NormalizePath(resolved.unwrap()), true;
 }
 
-func TempBase() string {
-    for (_, name := range []string{"TMPDIR", "TEMP", "TMP"}) {
-        t, ok := Getenv(name);
-        if (ok && t != "") return NormalizePath(t);
-    }
-    return Windows() ? Getcwd() : "/tmp";
-}
+func TempBase() string { return NormalizePath(os.TempDir()); }
 
-tempCounter: int;
-func tempName(prefix string) string {
-    tempCounter++;
-    sec, ns := RealNow();
-    return JoinPath(TempBase(), prefix + Itoa(Pid()) + "-" + Itoa(sec) + "-" + Itoa(ns) + "-" + Itoa(tempCounter));
-}
 func MakeTempDir(prefix string) (string, bool) {
-    for (i := 0; i < 100; i++) {
-        path := tempName(prefix);
-        c := CStr(path);
-        if (native_mkdir(c.data->int, 448) == 0) return path, true;
-    }
-    return "", false;
+    dir := os.MkdirTemp(prefix);
+    if (dir.hasError()) return "", false;
+    return NormalizePath(dir.unwrap()), true;
 }
 func MakeTempFile(prefix string) (string, bool) {
-    for (i := 0; i < 100; i++) {
-        path := tempName(prefix);
-        c := CStr(path);
-        exclusive := Windows() ? 1024 : (MacOS() ? 2048 : 128);
-        fd := native_open(c.data->int, WriteFlags() | exclusive, 384);
-        if (fd >= 0) { Close(fd); return path, true; }
-    }
-    return "", false;
+    file := os.CreateTemp(prefix);
+    if (file.hasError()) return "", false;
+    return NormalizePath(file.unwrap()), true;
 }
 
 func ReadFlags() int { return Windows() ? 32768 : 0; }
 func WriteFlags() int { return Windows() ? 33537 : (MacOS() ? 1537 : 577); }
 
-func windowsListDir(path string) ([]string, bool) {
-    out := make([]string);
-    pattern := CStr(JoinPath(path, "*"));
-    data: buffer<i8, 320>;
-    handle := WinFindFirst(pattern.data->int, data->int);
-    if (handle == -1) return out, false;
-    for (;;) {
-        name := FromC(BufAt((data->int) + 44));
-        if (name != "." && name != "..") out.append(name);
-        if (WinFindNext(handle, data->int) == 0) break;
-    }
-    WinFindClose(handle);
-    SortStrings(&out);
-    return out, true;
-}
-
 func IsTerminal(fd int) bool { return native_isatty((fd->i32)->int) != 0; }
-func Pid() int { return native_getpid() -> int; }
+func Pid() int { return os.Getpid(); }
 
 // Path helpers. Canonical internal paths use forward slashes.
-func NormalizePath(path string) string { return Windows() ? Replace(path, "\\", "/") : path; }
-func IsAbs(path string) bool {
-    path = NormalizePath(path);
-    return len(path) > 0 && (path[0] == '/' || (Windows() && len(path) >= 3 && path[1] == ':' && path[2] == '/'));
-}
-func pathRoot(path string) string {
-    if (Windows() && len(path) >= 3 && path[1] == ':' && path[2] == '/') return path[0:3];
-    if (Windows() && HasPrefix(path, "//")) {
-        server := IndexByte(path[2:], '/');
-        if (server >= 0) {
-            share := IndexByte(path[server + 3:], '/');
-            if (share < 0) return path;
-            return path[:server + 3 + share];
-        }
-    }
-    return HasPrefix(path, "/") ? "/" : "";
-}
-func Dir(path string) string {
-    path = NormalizePath(path);
-    root := pathRoot(path);
-    if (path == root) return root;
-    i := LastIndexByte(path, '/');
-    if (i < 0) return ".";
-    if (i < len(root)) return root;
-    return path[0:i];
-}
-func Base(path string) string {
-    path = NormalizePath(path);
-    for (len(path) > 1 && path[len(path) - 1] == '/') path = path[0:len(path) - 1];
-    i := LastIndexByte(path, '/');
-    if (i < 0) return path;
-    return path[i + 1:];
-}
+func NormalizePath(path string) string { return filepath.ToSlash(path); }
+func IsAbs(path string) bool { return filepath.IsAbs(path); }
+func Dir(path string) string { return filepath.Dir(path); }
+func Base(path string) string { return filepath.Base(path); }
+
+// JoinPath appends b to a without cleaning, unless b is already absolute.
 func JoinPath(a string, b string) string {
     a = NormalizePath(a); b = NormalizePath(b);
     if (a == "" || a == ".") return b;
     if (IsAbs(b)) return b;
-    if (HasSuffix(a, "/")) return a + b;
+    if (strings.HasSuffix(a, "/")) return a + b;
     return a + "/" + b;
 }
 
-// Clean normalizes a path lexically (., .., duplicate slashes).
-func Clean(path string) string {
-    if (path == "") return ".";
-    path = NormalizePath(path);
-    root := pathRoot(path);
-    abs := root != "";
-    parts := Split(path[len(root):], '/');
-    out := make([]string);
-    for (_, p := range parts) {
-        if (p == "" || p == ".") continue;
-        if (p == "..") {
-            if (len(out) > 0 && out[len(out) - 1] != "..") { out.pop(); continue; }
-            if (abs) continue;
-        }
-        out.append(p);
-    }
-    s := JoinList(out, "/");
-    if (abs) return s == "" ? root : JoinPath(root, s);
-    if (s == "") return ".";
-    return s;
-}
+func Clean(path string) string { return filepath.Clean(path); }
 
 func Abs(path string) string {
     if (IsAbs(path)) return Clean(path);
@@ -315,7 +173,7 @@ func Rel(base string, path string) string {
     b := Clean(base); p := Clean(path);
     if (p == b) return ".";
     if (b == "/") return p[1:];
-    if (HasPrefix(p, b + "/")) return p[len(b) + 1:];
+    if (strings.HasPrefix(p, b + "/")) return p[len(b) + 1:];
     return p;
 }
 
