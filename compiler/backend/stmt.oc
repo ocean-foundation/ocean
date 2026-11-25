@@ -3,7 +3,6 @@ import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/check";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 import "github.com/ocean-foundation/ocean/compiler/util";
-import "os";
 import "strings";
 
 func genBlock(g *Gen, n *ast.Node) {
@@ -690,32 +689,9 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
 
 // ---- inline assembly ----
 
-// The target defaults to the host. OCEAN_CROSS_TARGET=<arch>-<os> (x86_64,
-// aarch64 or riscv64; linux, macos or windows) emits IR for another native
-// target, so its asm and ABI choices can be checked without that machine.
-func crossTarget() (string, string) {
-    t, ok := util.Getenv("OCEAN_CROSS_TARGET");
-    if (!ok || t == "") return "", "";
-    i := strings.IndexByte(t, '-');
-    if (i < 0) return "", "";
-    return t[:i], t[i + 1:];
-}
-func hostArch() string { a, _ := crossTarget(); return a != "" ? a : os.Arch(); }
-func hostPlatform() string { _, o := crossTarget(); return o != "" ? o : os.OS(); }
-func targetWindows() bool { return hostPlatform() == "windows"; }
-
-// targetTriple is the LLVM triple for a cross target ("" for the host).
-func targetTriple() string {
-    a, o := crossTarget();
-    if (a == "") return "";
-    if (o == "macos") return (a == "aarch64" ? "arm64" : a) + "-apple-macosx11.0.0";
-    if (o == "windows") return a + "-w64-windows-gnu";
-    return a + (a == "riscv64" ? "-unknown-linux-gnu" : "-unknown-linux-gnu");
-}
-
 func genAsm(g *Gen, n *ast.Node) {
     if (g.wasm) { if (n.name != "wasm") return; }
-    else if (n.name != hostArch() || (n.text != "" && n.text != hostPlatform())) return;
+    else if (n.name != util.BuildTarget().arch || (n.text != "" && n.text != util.BuildTarget().system)) return;
     x86 := n.name == "x86_64";
     s := n.text2;
     hash := n.name != "aarch64";

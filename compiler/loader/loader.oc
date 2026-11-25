@@ -371,8 +371,7 @@ func TargetSource(name string) bool {
     n := len(name);
     if (n < 3) return true;
     n -= IsTestFile(name) ? 8 : 3;
-    arch, _ := util.Getenv("OCARCH");
-    wasm := arch == "wasm";
+    wasm := util.BuildTarget().Wasm();
     if (n >= 7 && name[n - 7:n] == "_native") return !wasm;
     if (n >= 5 && name[n - 5:n] == "_wasm") return wasm;
     return true;

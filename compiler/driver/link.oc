@@ -65,27 +65,83 @@ func runtimeSources(p *Program, dir string) []string {
     return files;
 }
 
-func clangRun(args []string) bool {
-    // pkg-config supplies SDK/Homebrew/MinGW include and library directories.
-    if (args[0] == "clang") {
-        if (util.Windows()) args.append("-D_longjmp=longjmp", "-D__USE_MINGW_SETJMP_NON_SEH");
-        for (_, arg := range args) {
-            if (strings.HasSuffix(arg, "ocean_ffi.c")) { flags, ok := packageFlags("libffi", "--cflags"); if (ok) args.append(flags...); break; }
+// clangArgs applies the same target and sysroot to IR, runtime C, and linking.
+func clangArgs(options []string) []string {
+    args := clangTargetArgs(util.BuildTarget());
+    args.append(options...);
+    return args;
+}
+
+func clangTargetArgs(target util.Target) []string {
+    root := managedTargetRoot(target);
+    args := make([]string);
+    if (root != "") {
+        path := targetPath(root, target);
+        sdk, _ := util.ReadFile(path + "/sdk");
+        args = managedClangArgs(root, target, path, sdk);
+    } else {
+        clang, _ := util.Getenv("OCEAN_CLANG");
+        args.append(clang == "" ? "clang" : clang);
+        triple := target.Triple();
+        if (triple != "") args.append("--target=" + triple);
+        sysroot, _ := util.Getenv("OCEAN_SYSROOT");
+        if (sysroot != "" && !target.Wasm()) args.append("--sysroot=" + sysroot);
+    }
+    if (target.system == "windows") args.append("-D_longjmp=longjmp", "-D__USE_MINGW_SETJMP_NON_SEH");
+    return args;
+}
+
+func ffiCompileFlags(target util.Target) []string {
+    flags, ok := targetPackageFlags(target, "libffi", "--cflags");
+    if (ok) return flags;
+    if (target.system == "macos") return []string{"-iwithsysroot", "/usr/include/ffi"};
+    return make([]string);
+}
+
+func clangRun(p *Program, args []string) bool {
+    target := util.BuildTarget();
+    for (_, arg := range args) {
+        if (strings.HasSuffix(arg, "/ocean_ffi.c")) {
+            args.append(ffiCompileFlags(target)...);
+            break;
         }
     }
     st, out := util.RunCapture(args.array());
-    if (st.Failed || st.Code != 0) {
-        util.Stderr(out);
-        util.Stderr("backend error: clang failed to compile or link LLVM IR\n");
+    if (!st.Failed && st.Code == 0) return true;
+    if (out != "") util.Stderr(out);
+    util.Stderr("backend error: " + args[0] + " failed for " + target.system + "/" + target.arch + "\n");
+    if (args[0] == "llvm-ar" || strings.HasSuffix(args[0], "/llvm-ar" + os.ExeSuffix())) {
+        util.Stderr("Install LLVM and put llvm-ar on PATH to create Windows library archives.\n");
         return false;
     }
-    return true;
+    if (target.explicit && managedTargetRoot(target) == "")
+        util.Stderr("Install managed components with ocean target " + target.Name() + ".\n");
+    util.Stderr("Install Clang with support for the target and put it on PATH, or set OCEAN_CLANG to its executable.\n");
+    if (target.Wasm()) {
+        util.Stderr("Install LLD for WebAssembly and make wasm-ld available to Clang.\n");
+        return false;
+    }
+    if (target.system == "linux")
+        util.Stderr("Install a Linux linker, libc headers, startup objects and runtime libraries for " + target.arch + ". Set OCEAN_SYSROOT if the target files are in a separate sysroot.\n");
+    else if (target.system == "macos")
+        util.Stderr("Install the Xcode Command Line Tools on macOS, or provide a macOS SDK via OCEAN_SYSROOT and a Mach-O linker.\n");
+    else if (target.system == "windows")
+        util.Stderr("Install a MinGW-w64 toolchain for " + target.arch + ", such as LLVM-MinGW, and point OCEAN_CLANG to its Clang.\n");
+    if (p.usesFFI) util.Stderr("Install libffi headers and libraries for the target.\n");
+    if (p.usesCurl) util.Stderr("Install libcurl development libraries for the target.\n");
+    if (!target.IsHost() && (p.usesFFI || p.usesCurl))
+        util.Stderr("For target pkg-config files, set PKG_CONFIG_LIBDIR and, for a separate sysroot, PKG_CONFIG_SYSROOT_DIR.\n");
+    return false;
 }
 
 // compileProgram produces an executable or relocatable object at output.
 // With a build cache the compiled program object is cached (independent of
 // static linking) and the final link always runs.
 func compileProgram(p *Program, ir string, output string, staticLink bool) bool {
+    target := util.BuildTarget();
+    clang, _ := util.Getenv("OCEAN_CLANG");
+    sysroot, _ := util.Getenv("OCEAN_SYSROOT");
+    if (target.explicit || clang != "" || sysroot != "") return compileUncached(p, ir, output, staticLink);
     root := cacheRoot();
     if (p.isLibrary) {
         key := cacheKey(p, ir, staticLink);
@@ -94,7 +150,7 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
         cacheStore(key, output);
         return true;
     }
-    if (root == "" || targetWasm()) return compileUncached(p, ir, output, staticLink);
+    if (root == "") return compileUncached(p, ir, output, staticLink);
     key := cacheKey(p, ir, false) + ".o";
     dir, ok := util.MakeTempDir("ocean-build-");
     if (!ok) { util.Stderr("ocean: cannot create temporary directory\n"); return false; }
@@ -108,25 +164,25 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
         all.append(runtimeSources(p, dir)...);
         for (i, f := range all) {
             o := dir + "/part" + strconv.Itoa(i) + ".o";
-            cargs := []string{"clang", optLevel(), "-w", "-Wno-override-module", "-c"};
+            cargs := clangArgs([]string{optLevel(), "-w", "-Wno-override-module", "-c"});
             if (strings.HasSuffix(f, ".ll")) cargs.append("-x", "ir"); else cargs.append("-x", "c");
             cargs.append(f, "-o", o);
-            if (!clangRun(cargs)) { util.RemoveAll(dir); return false; }
+            if (!clangRun(p, cargs)) { util.RemoveAll(dir); return false; }
             parts.append(o);
         }
         if (len(parts) == 1) util.Rename(parts[0], obj);
         else {
             rargs := objectLinkArgs(obj);
             rargs.append(parts...);
-            if (!clangRun(rargs)) { util.RemoveAll(dir); return false; }
+            if (!clangRun(p, rargs)) { util.RemoveAll(dir); return false; }
         }
         cacheStore(key, obj);
     }
     staged := output + ".ocean-tmp" + (p.isLibrary ? "" : os.ExeSuffix());
     if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
-    args := []string{"clang", obj, "-o", staged};
-    if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
-    ok2 := clangRun(args);
+    args := clangArgs([]string{obj, "-o", staged});
+    if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); util.Remove(staged); return false; }
+    ok2 := clangRun(p, args);
     util.RemoveAll(dir);
     if (!ok2) { util.Remove(staged); return false; }
     if (!util.Rename(staged, output)) { util.Stderr("could not save output: " + util.OutputError(output, true) + "\n"); util.Remove(staged); return false; }
@@ -135,23 +191,37 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
 
 // appendLinkFlags adds the system libraries and static flags of a final link.
 func appendLinkFlags(p *Program, args *[]string, staticLink bool) bool {
-    if (p.checker.UsesThreads() && !util.Windows()) (*args).append("-pthread");
-    if (util.Windows()) {
+    target := util.BuildTarget();
+    windows := target.system == "windows";
+    if (p.checker.UsesThreads() && !windows) (*args).append("-pthread");
+    if (windows) {
         (*args).append("-Wl,--stack,8388608");
         if (usesPackage(p, "os/exec")) (*args).append("-lshell32");
     }
-    if (p.usesFFI) {
-        flags, ok := packageFlags("libffi", "--libs");
+    if (!appendDependencyLinkFlags(target, args, p.usesFFI, p.usesCurl, staticLink)) return false;
+    if (staticLink) (*args).append("-static");
+    return true;
+}
+
+func appendDependencyLinkFlags(target util.Target, args *[]string, ffi bool, curl bool, staticLink bool) bool {
+    if (ffi) {
+        flags, ok := targetPackageFlags(target, "libffi", "--libs");
         if (ok) (*args).append(flags...); else (*args).append("-lffi");
     }
-    if (p.usesCurl && !targetWasm()) {
+    if (curl && !target.Wasm()) {
         if (staticLink) {
-            flags, fok := staticCurlFlags();
-            if (!fok) { util.Stderr("backend error: static HTTP linking requires pkg-config and libcurl's static development dependencies\n"); return false; }
+            flags, fok := targetPackageFlags(target, "libcurl", "--static", "--libs");
+            if (!fok) { util.Stderr("backend error: static HTTP linking requires pkg-config and the target libcurl static development dependencies (set PKG_CONFIG_LIBDIR for cross builds)\n"); return false; }
             (*args).append(flags...);
-        } else (*args).append("-lcurl");
+        } else {
+            flags := []string{"-lcurl"};
+            if (!target.IsHost()) {
+                targetFlags, ok := targetPackageFlags(target, "libcurl", "--libs");
+                if (ok && len(targetFlags) > 0) flags = targetFlags;
+            }
+            (*args).append(flags...);
+        }
     }
-    if (staticLink) (*args).append("-static");
     return true;
 }
 
@@ -165,11 +235,11 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
         util.RemoveAll(dir); return false;
     }
     rts := runtimeSources(p, dir);
-    staged := output + ".ocean-tmp" + (p.isLibrary || targetWasm() ? "" : os.ExeSuffix());
+    staged := output + ".ocean-tmp" + (p.isLibrary ? "" : util.BuildTarget().ExeSuffix());
     if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
-    args := []string{"clang", optLevel(), "-w", "-Wno-override-module"};
+    args := clangArgs([]string{optLevel(), "-w", "-Wno-override-module"});
     if (targetWasm()) {
-        args = []string{"clang", "-O1", "-w", "-Wno-override-module"};
+        args = clangArgs([]string{"-O1", "-w", "-Wno-override-module"});
         args.append(wasmCompileFlags(dir)...);
         if (!p.isLibrary) args.append("-nostdlib", "-Wl,--no-entry", "-Wl,--export=main", "-Wl,--allow-undefined", "-Wl,--gc-sections");
     }
@@ -180,23 +250,29 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
         all.append(rts...);
         for (i, f := range all) {
             obj := dir + "/part" + strconv.Itoa(i) + ".o";
-            cargs := []string{"clang", optLevel(), "-w", "-Wno-override-module", "-ffunction-sections", "-fdata-sections", "-DOC_LIBRARY", "-c"};
+            cargs := clangArgs([]string{optLevel(), "-w", "-Wno-override-module", "-ffunction-sections", "-fdata-sections", "-DOC_LIBRARY", "-c"});
             if (targetWasm()) cargs.append(wasmCompileFlags(dir)...);
             if (strings.HasSuffix(f, ".ll")) cargs.append("-x", "ir");
             else cargs.append("-x", "c");
             cargs.append(f, "-o", obj);
-            if (!clangRun(cargs)) { util.RemoveAll(dir); return false; }
+            if (!clangRun(p, cargs)) { util.RemoveAll(dir); util.Remove(staged); return false; }
             objs.append(obj);
+        }
+        // llvm-ar expects an absent path or a valid archive.
+        if (util.BuildTarget().system == "windows" && !util.Remove(staged)) {
+            util.Stderr("could not remove staged archive: " + util.OutputError(staged, true) + "\n");
+            util.RemoveAll(dir);
+            return false;
         }
         largs := objectLinkArgs(staged);
         largs.append(objs...);
-        if (!clangRun(largs)) { util.RemoveAll(dir); return false; }
+        if (!clangRun(p, largs)) { util.RemoveAll(dir); util.Remove(staged); return false; }
     } else {
         args.append("-x", "ir", irPath, "-x", "c");
         args.append(rts...);
         args.append("-o", staged);
-        if (!targetWasm() && !appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
-        if (!clangRun(args)) { util.RemoveAll(dir); util.Remove(staged); return false; }
+        if (!targetWasm() && !appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); util.Remove(staged); return false; }
+        if (!clangRun(p, args)) { util.RemoveAll(dir); util.Remove(staged); return false; }
     }
     util.RemoveAll(dir);
     if (!util.Rename(staged, output)) { util.Stderr("could not save output: " + util.OutputError(output, true) + "\n"); util.Remove(staged); return false; }
@@ -208,19 +284,17 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
 // inline asm: the program IR is emitted untouched (no llvm-link round trip,
 // which re-prints wide constants in decimal), yet clang can build it alone.
 func selfContainedIR(p *Program, ir string) (string, bool) {
-    if (targetWasm()) return ir, true; // the wasm runtime is linked by ocean build
-    cross, _ := util.Getenv("OCEAN_CROSS_TARGET");
-    if (cross != "") return ir, true;   // the host-built runtime does not apply
+    if (util.BuildTarget().explicit) return ir, true; // selected targets emit program IR only
     dir, ok := util.MakeTempDir("ocean-ir-");
-    if (!ok) return ir, true;
+    if (!ok) { util.Stderr("ocean: cannot create temporary directory for runtime IR\n"); return "", false; }
     out: util.Buf;
     out.Add(ir);
     if (!strings.HasSuffix(ir, "\n")) out.Add("\n");
     for (i, f := range runtimeSources(p, dir)) {
         asmPath := dir + "/rt" + strconv.Itoa(i) + ".s";
-        if (!clangRun([]string{"clang", optLevel(), "-w", "-S", "-g0", "-fno-asynchronous-unwind-tables", "-x", "c", f, "-o", asmPath})) { util.RemoveAll(dir); return ir, true; }
+        if (!clangRun(p, clangArgs([]string{optLevel(), "-w", "-S", "-g0", "-fno-asynchronous-unwind-tables", "-x", "c", f, "-o", asmPath}))) { util.RemoveAll(dir); return "", false; }
         text, rok := util.ReadFile(asmPath);
-        if (!rok) { util.RemoveAll(dir); return ir, true; }
+        if (!rok) { util.Stderr("ocean: could not read runtime assembly\n"); util.RemoveAll(dir); return "", false; }
         start := 0;
         for (k := 0; k <= len(text); k++) {
             if (k < len(text) && text[k] != '\n') continue;
@@ -263,7 +337,8 @@ func emitAndLink(p *Program, o *BuildOptions) int {
     if (!ok) return 1;
     if (o.emit) {
         out := o.output == "" ? "a.ll" : o.output;
-        full, _ := selfContainedIR(p, ir);
+        full, emitted := selfContainedIR(p, ir);
+        if (!emitted) return 1;
         if (!util.WriteFile(out, full)) { util.Stderr("ocean: could not save IR\n"); return 1; }
         return 0;
     }
@@ -283,7 +358,7 @@ func emitAndLink(p *Program, o *BuildOptions) int {
     out := o.output;
     if (out == "") {
         if (p.isLibrary) out = p.name + ".o";
-        else { b := filepath.Base(p.dir); out = (b == "" ? "main" : b) + os.ExeSuffix(); }
+        else { b := filepath.Base(p.dir); out = (b == "" ? "main" : b) + util.BuildTarget().ExeSuffix(); }
     }
     for (_, pk := range p.checker.Packages()) {
         for (_, src := range pk.files) {
@@ -304,39 +379,37 @@ func unusedAst(p *ast.Package) bool { return (p -> int) == 0; }
 func Generate(p *Program) (string, bool) { return generate(p); }
 func NewDiagsQuiet() *diag.List { d := newDiags(); return d; }
 
-// staticCurlFlags discovers libcurl's full static dependency closure.
-func staticCurlFlags() ([]string, bool) {
-    argv: [4]string = {"pkg-config", "--static", "--libs", "libcurl"};
-    st, out := util.RunCapture(argv);
-    out2 := make([]string);
-    if (st.Code != 0 || st.Signal != 0) return out2, false;
-    cur := "";
-    for (i := 0; i <= len(out); i++) {
-        if (i == len(out) || out[i] == ' ' || out[i] == '\n' || out[i] == '\t') { if (cur != "") out2.append(cur); cur = ""; }
-        else cur += out[i];
-    }
-    return out2, len(out2) > 0;
-}
-
 func labelChar(ch i8) bool { return unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' || ch == '.' || ch == '$'; }
 
-// COFF libraries are indexed archives. Darwin relocatable links must retain
-// private externals referenced by other cached objects.
-// wasmCompileFlags select wasm32 and the freestanding runtime headers in dir.
+// wasmCompileFlags selects the freestanding runtime headers in dir.
 func wasmCompileFlags(dir string) []string {
-    return []string{"--target=wasm32-unknown-unknown", "-I" + dir, "-D__thread=", "-ffunction-sections", "-fdata-sections"};
+    return []string{"-I" + dir, "-D__thread=", "-ffunction-sections", "-fdata-sections"};
 }
 
+// COFF libraries are indexed archives. Mach-O relocatable links must retain
+// private externals referenced by other cached objects.
 func objectLinkArgs(output string) []string {
-    if (targetWasm()) return []string{"clang", "--target=wasm32-unknown-unknown", "-r", "-nostdlib", "-o", output};
-    if (util.Windows()) return []string{"llvm-ar", "rcs", output};
-    args := []string{"clang", "-r", "-nostdlib", "-o", output};
-    if (util.MacOS()) args.append("-Wl,-keep_private_externs");
+    target := util.BuildTarget();
+    if (target.system == "windows") {
+        return []string{targetTool(managedTargetRoot(target), "llvm-ar"), "rcs", output};
+    }
+    args := clangArgs([]string{"-r", "-nostdlib", "-o", output});
+    if (target.system == "macos") args.append("-Wl,-keep_private_externs");
     return args;
 }
 
-func packageFlags(packageName string, option string) ([]string, bool) {
-    st, text := util.RunCapture([]string{"pkg-config", option, packageName}.array());
+func targetPackageFlags(target util.Target, packageName string, options ...string) ([]string, bool) {
+    // Managed bundles supply target headers and libraries directly to Clang.
+    // Static curl still needs pkg-config to describe its dependency closure.
+    if (managedTargetRoot(target) != "" && options[0] != "--static") return make([]string), false;
+    if (!target.IsHost()) {
+        libdir, _ := util.Getenv("PKG_CONFIG_LIBDIR");
+        if (libdir == "") return make([]string), false;
+    }
+    args := []string{"pkg-config"};
+    args.append(options...);
+    args.append(packageName);
+    st, text := util.RunCapture(args.array());
     out := make([]string);
     if (st.Failed || st.Code != 0) return out, false;
     word := ""; quote: i8 = 0; escaped := false;

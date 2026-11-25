@@ -1,0 +1,58 @@
+package util;
+
+import "os";
+
+struct Target {
+    system string;
+    arch string;
+    explicit bool;
+}
+
+func BuildTarget() Target {
+    system, _ := Getenv("OCOS");
+    arch, _ := Getenv("OCARCH");
+    if (system == "" && arch == "") return HostTarget();
+    return Target{system: system, arch: arch, explicit: true};
+}
+
+func (t Target) IsHost() bool { return t.system == os.OS() && t.arch == os.Arch(); }
+func (t Target) Wasm() bool { return t.system == "js" && t.arch == "wasm"; }
+
+func (t Target) Supported() bool {
+    if (!t.explicit) return true;
+    for (_, known := range KnownTargets()) {
+        if (t.system == known.system && t.arch == known.arch) return true;
+    }
+    return false;
+}
+
+func (t Target) Triple() string {
+    if (!t.explicit) return "";
+    if (t.Wasm()) return "wasm32-unknown-unknown";
+    if (t.system == "macos") return (t.arch == "aarch64" ? "arm64" : t.arch) + "-apple-macosx11.0.0";
+    if (t.system == "windows") return t.arch + "-w64-windows-gnu";
+    return t.arch + "-unknown-linux-gnu";
+}
+
+func (t Target) ExeSuffix() string {
+    if (t.system == "windows") return ".exe";
+    if (t.Wasm()) return ".wasm";
+    return "";
+}
+
+func (t Target) Name() string { return t.arch + "-" + t.system; }
+
+func KnownTargets() []Target {
+    return []Target{
+        Target{system: "linux", arch: "x86_64", explicit: true},
+        Target{system: "linux", arch: "aarch64", explicit: true},
+        Target{system: "linux", arch: "riscv64", explicit: true},
+        Target{system: "macos", arch: "x86_64", explicit: true},
+        Target{system: "macos", arch: "aarch64", explicit: true},
+        Target{system: "windows", arch: "x86_64", explicit: true},
+        Target{system: "windows", arch: "aarch64", explicit: true},
+        Target{system: "js", arch: "wasm", explicit: true},
+    };
+}
+
+func HostTarget() Target { return Target{system: os.OS(), arch: os.Arch()}; }

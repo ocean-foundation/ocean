@@ -576,7 +576,6 @@ func testOne(args []string, shared bool) int {
     prog := Frontend(location, true, dir + "/harness", diags);
     failed := prog.fatal || !prog.ok;
     overwrite := false;
-    if (!failed && targetWasm()) { util.Stderr("ocean test requires a native target\n"); failed = true; }
     if (!failed) {
         for (_, pk := range prog.checker.Packages()) {
             for (_, src := range pk.files) {
@@ -657,6 +656,8 @@ func addLocation(list *[]string, path string) bool {
 }
 
 func testMain(args []string) int {
+    if (!(len(args) == 3 && (args[2] == "--help" || args[2] == "-h")) &&
+        (!validateTarget() || !requireHostTarget("test"))) return 1;
     if (len(args) > 2 && args[2] == "--internal-test-package") return testOne(args[3:], true);
     rest := args[2:];
     flags := make([]string);

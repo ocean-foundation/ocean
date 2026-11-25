@@ -6,6 +6,7 @@ commit: string = "unknown";
 commitDate: string = "unknown";
 commitYear: string = "2026";
 buildDate: string = "unknown";
+bundleVersion: string = "";
 
 func Version() string { return version; }
 func Commit() string { return commit; }
