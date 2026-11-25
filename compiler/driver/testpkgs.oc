@@ -228,7 +228,10 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
             }
             if (!p.exited) {
                 done, st := util.WaitNoHang(p.pid);
-                if (done) { p.exited = true; p.status = st.Code; }
+                if (done) {
+                    util.KillGroup(p.pid, 9);
+                    p.exited = true; p.status = st.Code;
+                }
             }
             if (p.exited && p.out < 0 && p.errs < 0) {
                 if (p.buffer != "") packageLine(p, p.buffer);

@@ -113,8 +113,10 @@ func TestEmptyReplaceAndSumVerification(t *testing.T) {
     root := writeTree(t, []string{
         "bad/ocean.mod", "module m\nreplace example.com/dep => \"\"\n",
         "bad/main.oc", "package main; import \"example.com/dep\"; func main() {}",
-        "cache/example.com/dep@v1.0.0/ocean.mod", "module example.com/dep\n",
-        "cache/example.com/dep@v1.0.0/dep.oc", "package dep; func X() int { return 7; }",
+        "cache/example.com/dep@v1.0.0/ocean.mod", "module example.com/dep\nrequire example.com/leaf v2.0.0\n",
+        "cache/example.com/dep@v1.0.0/dep.oc", "package dep; import \"example.com/leaf\"; func X() int { return leaf.X(); }",
+        "cache/example.com/leaf@v2.0.0/ocean.mod", "module example.com/leaf\n",
+        "cache/example.com/leaf@v2.0.0/leaf.oc", "package leaf; func X() int { return 7; }",
         "app/ocean.mod", "module example.com/app\nrequire example.com/dep v1.0.0\n",
         "app/main.oc", "package main; import \"example.com/dep\"; func main() {}"});
     // 1. Empty replace target must be rejected at manifest parse time without panic.
@@ -128,16 +130,25 @@ func TestEmptyReplaceAndSumVerification(t *testing.T) {
     dNoSum := quiet();
     if (NewBuild(dNoSum).LoadPackage(root + "/app")) t.Error("missing ocean.sum must fail");
 
-    // 3. Valid ocean.sum passes verification.
+    // 3. The project must pin both modules. The dependency has no ocean.sum.
     digest, hok := util.HashDir(root + "/cache/example.com/dep@v1.0.0");
     if (!hok) t.Fatal("hash failed");
     e: SumEntry; e.module = "example.com/dep"; e.version = "v1.0.0"; e.hash = digest;
     if (!WriteSum(root + "/app", []SumEntry{e})) t.Fatal("write sum failed");
+    dMissingLeaf := quiet();
+    if (NewBuild(dMissingLeaf).LoadPackage(root + "/app")) t.Error("missing transitive checksum must fail");
+    if (len(dMissingLeaf.items) == 0 || !strings.Contains(dMissingLeaf.items[0].message, "example.com/leaf@v2.0.0")) {
+        t.Error("expected the missing transitive checksum error");
+    }
+    leafDigest, leafOK := util.HashDir(root + "/cache/example.com/leaf@v2.0.0");
+    if (!leafOK) t.Fatal("leaf hash failed");
+    leaf := SumEntry{module: "example.com/leaf", version: "v2.0.0", hash: leafDigest};
+    if (!WriteSum(root + "/app", []SumEntry{e, leaf})) t.Fatal("write transitive sum failed");
     dOk := quiet();
     if (!NewBuild(dOk).LoadPackage(root + "/app")) t.Fatal("verified load failed: ", dOk.items[0].message);
 
-    // 4. Tampering cached file causes checksum mismatch failure.
-    util.WriteFile(root + "/cache/example.com/dep@v1.0.0/dep.oc", "package dep; func X() int { return 999; }");
+    // 4. Tampering with a transitive dependency causes a checksum mismatch.
+    util.WriteFile(root + "/cache/example.com/leaf@v2.0.0/leaf.oc", "package leaf; func X() int { return 999; }");
     dTamper := quiet();
     if (NewBuild(dTamper).LoadPackage(root + "/app")) t.Error("tampered cache should fail");
     if (len(dTamper.items) == 0 || !strings.Contains(dTamper.items[0].message, "checksum mismatch")) {

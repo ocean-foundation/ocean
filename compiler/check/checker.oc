@@ -113,6 +113,7 @@ func declare(c *Checker, sym *ast.Symbol, at *ast.Node) {
     if (!nilS(old)) { err(c, at, "duplicate declaration: " + sym.name); return; }
     c.scope.Insert(sym);
     if (!nilF(c.fn)) {
+        sym.scope = c.scope;
         sym.depth = c.fn.level;
         c.fn.locals.append(sym);
     }

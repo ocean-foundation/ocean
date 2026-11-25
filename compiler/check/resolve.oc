@@ -107,9 +107,6 @@ func resolveStruct(c *Checker, s *ast.Symbol) {
         if (f.bits > 0) checkBitfield(c, fd, f);
         s.fields.append(f);
     }
-    for (_, f := range s.fields) {
-        if (!f.valueParam && directSelfArrayCycle(c, f.ty, s)) { err(c, n, "recursive array-value layouts are unsupported; use explicit pointers for recursive ownership"); f.ty = tInvalid; break; }
-    }
     // Field dimensions may use value parameters: struct M(n int) { data [n]int; }
     needs := false;
     for (_, f := range s.fields) { if (!f.valueParam && f.ty.kind == ast.TK.Array && f.ty.len == -1) needs = true; }
@@ -613,44 +610,6 @@ func parseLayoutDim(text string) (int, bool) {
     return v, true;
 }
 
-// directSelfArrayCycle detects a direct struct field holding s via Dyn/Map/Array/Buffer.
-func directSelfArrayCycle(c *Checker, t *ast.Type, s *ast.Symbol) bool {
-    seen: map[int]bool;
-    return directSelfArrayWalk(c, t, s, &seen);
-}
-
-func directSelfArrayWalk(c *Checker, t *ast.Type, s *ast.Symbol, seen *map[int]bool) bool {
-    if (nilT(t)) return false;
-    switch (t.kind) {
-    case ast.TK.Struct:
-        if (t.sym == s) return true;
-        if (nilS(t.sym) || t.sym.state != 2) return false;
-        sv, sok := (*seen)[t.sym.id];
-        if (sok && sv) return false;
-        (*seen)[t.sym.id] = true;
-        for (_, f := range c.FieldsOf(t)) { if (!f.valueParam && directSelfArrayWalk(c, f.ty, s, seen)) return true; }
-        return false;
-    case ast.TK.Enum:
-        if (nilS(t.sym) || t.sym.state != 2) return false;
-        sv, sok := (*seen)[t.sym.id];
-        if (sok && sv) return false;
-        (*seen)[t.sym.id] = true;
-        for (_, v := range c.VariantsOf(t)) {
-            for (_, pt := range v.types) { if (directSelfArrayWalk(c, pt, s, seen)) return true; }
-            for (_, pf := range v.fields) { if (directSelfArrayWalk(c, pf.ty, s, seen)) return true; }
-            if (!nilT(v.fixedType) && directSelfArrayWalk(c, v.fixedType, s, seen)) return true;
-        }
-        return false;
-    case ast.TK.Tuple:
-        for (_, r := range t.results) { if (directSelfArrayWalk(c, r, s, seen)) return true; }
-        return false;
-    case ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer: return !nilT(t.elem) && directSelfArrayWalk(c, t.elem, s, seen);
-    case ast.TK.Map: return directSelfArrayWalk(c, t.key, s, seen) || directSelfArrayWalk(c, t.elem, s, seen);
-    case ast.TK.Named: return !nilS(t.sym) && t.sym.state == 2 && directSelfArrayWalk(c, Underlying(t), s, seen);
-    }
-    return false;
-}
-
 // checkValueCycles runs 3-color DFS across Struct, Enum, Tuple, Array, Buffer,
 // and Named type declarations, breaking any detected value cycle with tInvalid.
 func checkValueCycles(c *Checker, syms []*ast.Symbol) {
@@ -659,11 +618,11 @@ func checkValueCycles(c *Checker, syms []*ast.Symbol) {
     done: map[string]bool;
     for (_, s := range syms) {
         if (s.kind != ast.SK.Struct && s.kind != ast.SK.Enum && s.kind != ast.SK.TypeDef && s.kind != ast.SK.Alias) continue;
-        checkSymValueCycle(c, s, &colors, &active, &done, false);
+        checkSymValueCycle(c, s, &colors, &active, &done);
     }
 }
 
-func checkSymValueCycle(c *Checker, s *ast.Symbol, colors *map[int]int, active *map[string]bool, done *map[string]bool, inStruct bool) bool {
+func checkSymValueCycle(c *Checker, s *ast.Symbol, colors *map[int]int, active *map[string]bool, done *map[string]bool) bool {
     if (nilS(s)) return false;
     col, cok := (*colors)[s.id];
     if (cok && col == 2) return false;
@@ -674,34 +633,34 @@ func checkSymValueCycle(c *Checker, s *ast.Symbol, colors *map[int]int, active *
     case ast.SK.Struct:
         for (_, f := range s.fields) {
             if (f.valueParam) continue;
-            if (checkTypeValueCycle(c, f.node, f.ty, colors, active, done, true)) {
-                err(c, s.node, "recursive array-value layouts are unsupported; use explicit pointers for recursive ownership");
+            if (checkTypeValueCycle(c, f.node, f.ty, colors, active, done)) {
+                err(c, s.node, "cyclic type declaration");
                 f.ty = tInvalid;
             }
         }
     case ast.SK.Enum:
         for (_, v := range s.variants) {
             for (i, pt := range v.types) {
-                if (checkTypeValueCycle(c, v.node, pt, colors, active, done, inStruct)) {
-                    err(c, v.node, inStruct ? "recursive array-value layouts are unsupported; use explicit pointers for recursive ownership" : "cyclic type declaration");
+                if (checkTypeValueCycle(c, v.node, pt, colors, active, done)) {
+                    err(c, v.node, "cyclic type declaration");
                     v.types[i] = tInvalid;
                 }
             }
             for (i, pf := range v.fields) {
-                if (checkTypeValueCycle(c, pf.node, pf.ty, colors, active, done, inStruct)) {
-                    err(c, pf.node, inStruct ? "recursive array-value layouts are unsupported; use explicit pointers for recursive ownership" : "cyclic type declaration");
+                if (checkTypeValueCycle(c, pf.node, pf.ty, colors, active, done)) {
+                    err(c, pf.node, "cyclic type declaration");
                     v.fields[i].ty = tInvalid;
                 }
             }
-            if (!nilT(v.fixedType) && checkTypeValueCycle(c, v.node, v.fixedType, colors, active, done, inStruct)) {
-                err(c, v.node, inStruct ? "recursive array-value layouts are unsupported; use explicit pointers for recursive ownership" : "cyclic type declaration");
+            if (!nilT(v.fixedType) && checkTypeValueCycle(c, v.node, v.fixedType, colors, active, done)) {
+                err(c, v.node, "cyclic type declaration");
                 v.fixedType = tInvalid;
             }
         }
     case ast.SK.TypeDef, ast.SK.Alias:
         if (!nilT(s.ty) && s.ty.kind != ast.TK.Family) {
-            if (checkTypeValueCycle(c, s.node, s.ty, colors, active, done, inStruct)) {
-                err(c, s.node, inStruct ? "recursive array-value layouts are unsupported; use explicit pointers for recursive ownership" : "cyclic type declaration");
+            if (checkTypeValueCycle(c, s.node, s.ty, colors, active, done)) {
+                err(c, s.node, "cyclic type declaration");
                 s.ty = tInvalid;
             }
         }
@@ -710,32 +669,28 @@ func checkSymValueCycle(c *Checker, s *ast.Symbol, colors *map[int]int, active *
     return false;
 }
 
-func checkTypeValueCycle(c *Checker, at *ast.Node, t *ast.Type, colors *map[int]int, active *map[string]bool, done *map[string]bool, inStruct bool) bool {
+func checkTypeValueCycle(c *Checker, at *ast.Node, t *ast.Type, colors *map[int]int, active *map[string]bool, done *map[string]bool) bool {
     if (nilT(t)) return false;
     switch (t.kind) {
     case ast.TK.Invalid, ast.TK.Void, ast.TK.Bool, ast.TK.Int, ast.TK.Float, ast.TK.String, ast.TK.Null, ast.TK.Ptr, ast.TK.Func, ast.TK.Interface, ast.TK.Param, ast.TK.Family, ast.TK.UntypedInt, ast.TK.UntypedFloat, ast.TK.Union:
         return false;
-    case ast.TK.Dyn:
-        if (!inStruct) return false;
-        return !nilT(t.elem) && checkTypeValueCycle(c, at, t.elem, colors, active, done, true);
-    case ast.TK.Map:
-        if (!inStruct) return false;
-        return checkTypeValueCycle(c, at, t.key, colors, active, done, true) || checkTypeValueCycle(c, at, t.elem, colors, active, done, true);
+    case ast.TK.Dyn, ast.TK.Map:
+        // Their payloads are stored separately and can be empty.
+        return false;
     case ast.TK.Array, ast.TK.Buffer:
-        if (!inStruct && t.kind == ast.TK.Array && t.len < 0) return false;
-        if (!inStruct && t.kind == ast.TK.Buffer && t.len <= 0) return false;
-        return !nilT(t.elem) && checkTypeValueCycle(c, at, t.elem, colors, active, done, inStruct);
+        if ((t.kind == ast.TK.Array && t.len < 0) || (t.kind == ast.TK.Buffer && t.len <= 0)) return false;
+        return !nilT(t.elem) && checkTypeValueCycle(c, at, t.elem, colors, active, done);
     case ast.TK.Tuple:
         for (_, r := range t.results) {
-            if (checkTypeValueCycle(c, at, r, colors, active, done, inStruct)) return true;
+            if (checkTypeValueCycle(c, at, r, colors, active, done)) return true;
         }
         return false;
     case ast.TK.Named:
         if (nilS(t.sym)) return false;
-        return checkSymValueCycle(c, t.sym, colors, active, done, inStruct);
+        return checkSymValueCycle(c, t.sym, colors, active, done);
     case ast.TK.Struct:
         if (nilS(t.sym)) return false;
-        if (len(t.args) == 0) return checkSymValueCycle(c, t.sym, colors, active, done, true);
+        if (len(t.args) == 0) return checkSymValueCycle(c, t.sym, colors, active, done);
         k := TypeKey(t);
         dv, dok := (*done)[k];
         if (dok && dv) return false;
@@ -744,14 +699,14 @@ func checkTypeValueCycle(c *Checker, at *ast.Node, t *ast.Type, colors *map[int]
         (*active)[k] = true;
         cyc := false;
         for (_, f := range c.FieldsOf(t)) {
-            if (!f.valueParam && checkTypeValueCycle(c, at, f.ty, colors, active, done, true)) { f.ty = tInvalid; cyc = true; break; }
+            if (!f.valueParam && checkTypeValueCycle(c, at, f.ty, colors, active, done)) { f.ty = tInvalid; cyc = true; break; }
         }
         (*active)[k] = false;
         (*done)[k] = true;
         return cyc;
     case ast.TK.Enum:
         if (nilS(t.sym)) return false;
-        if (len(t.args) == 0) return checkSymValueCycle(c, t.sym, colors, active, done, inStruct);
+        if (len(t.args) == 0) return checkSymValueCycle(c, t.sym, colors, active, done);
         k := TypeKey(t);
         dv, dok := (*done)[k];
         if (dok && dv) return false;
@@ -760,11 +715,11 @@ func checkTypeValueCycle(c *Checker, at *ast.Node, t *ast.Type, colors *map[int]
         (*active)[k] = true;
         cyc := false;
         for (_, v := range c.VariantsOf(t)) {
-            for (i, pt := range v.types) { if (checkTypeValueCycle(c, at, pt, colors, active, done, inStruct)) { v.types[i] = tInvalid; cyc = true; break; } }
+            for (i, pt := range v.types) { if (checkTypeValueCycle(c, at, pt, colors, active, done)) { v.types[i] = tInvalid; cyc = true; break; } }
             if (cyc) break;
-            for (i, pf := range v.fields) { if (checkTypeValueCycle(c, at, pf.ty, colors, active, done, inStruct)) { v.fields[i].ty = tInvalid; cyc = true; break; } }
+            for (i, pf := range v.fields) { if (checkTypeValueCycle(c, at, pf.ty, colors, active, done)) { v.fields[i].ty = tInvalid; cyc = true; break; } }
             if (cyc) break;
-            if (!nilT(v.fixedType) && checkTypeValueCycle(c, at, v.fixedType, colors, active, done, inStruct)) { v.fixedType = tInvalid; cyc = true; break; }
+            if (!nilT(v.fixedType) && checkTypeValueCycle(c, at, v.fixedType, colors, active, done)) { v.fixedType = tInvalid; cyc = true; break; }
         }
         (*active)[k] = false;
         (*done)[k] = true;

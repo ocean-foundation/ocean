@@ -103,7 +103,7 @@ func emitDesc(g *Gen, t *ast.Type) {
         if (u.signed) flags = flags | 1;
         if (u.varw) flags = flags | 4;
     case ast.TK.Float: bits = u.bits;
-    case ast.TK.Ptr: if (u.elem.kind != ast.TK.Void) elem = desc(g, u.elem);
+    // A raw pointer descriptor needs its identity and methods, not the pointee layout.
     case ast.TK.Dyn:
         elem = desc(g, u.elem);
         if (u.isMixed) flags = flags | 8;

@@ -54,7 +54,7 @@ __thread int64_t oc_in_defer;
 
 #define FORWARD_BIT ((int64_t)1 << 40)
 
-static void oc_trace(const char *header, int64_t site, OcFrame *from);
+static void oc_trace(const char *header, size_t length, int64_t site, OcFrame *from);
 void oc_panic(OcArr *msg, int64_t site);
 
 /* ---------------- memory ---------------- */
@@ -143,7 +143,9 @@ void oc_trap(void) { __builtin_trap(); }
 #define ARR_HDR 32
 static OcArr *arr_make(int64_t len, int64_t cap, int64_t es) {
     if (len < 0 || cap < 0 || es < 0) __builtin_trap();
-    size_t total = checked_add(ARR_HDR, checked_add(checked_mul((size_t)cap, (size_t)es), 1));
+    size_t payload = 0;
+    if (cap && es) payload = checked_mul(checked_i64_size(cap), checked_i64_size(es));
+    size_t total = checked_add(ARR_HDR, checked_add(payload, 1));
     OcArr *a = oc_alloc_size(total);
     a->len = len; a->cap = cap;
     a->data = (char *)a + ARR_HDR;
@@ -212,8 +214,6 @@ int64_t oc_arr_cap(OcArr *a) { return a ? (a->cap < 0 ? a->len : a->cap) : 0; }
 /* ---------------- bounds and fatal errors ---------------- */
 static void put_bytes(const char *s, size_t n) { while (n) { ssize_t w = write(2, s, n); if (w <= 0) return; s += w; n -= (size_t)w; } }
 static void put(const char *s) { put_bytes(s, strlen(s)); }
-/* Length of the current panic header (messages may contain NUL bytes). */
-static __thread size_t header_length = (size_t)-1;
 static void die(void);
 static void putn(int64_t v) { char b[32]; snprintf(b, sizeof b, "%lld", (long long)v); put(b); }
 static const OcSite *site_of(int64_t id) {
@@ -239,8 +239,8 @@ static void put_snippet(int64_t id) {
 }
 /* Print a diagnostic whose innermost location is 'site', then the call trace
  * from frame 'from' outward. The innermost frame reports 'site'. */
-static void oc_trace(const char *header, int64_t site, OcFrame *from) {
-    if (header_length != (size_t)-1) put_bytes(header, header_length); else put(header);
+static void oc_trace(const char *header, size_t length, int64_t site, OcFrame *from) {
+    if (length != SIZE_MAX) put_bytes(header, length); else put(header);
     put("\n  --> "); put_site(site); put("\n");
     put_snippet(site);
     put("Call trace (most recent call first):\n");
@@ -252,8 +252,7 @@ static void oc_trace(const char *header, int64_t site, OcFrame *from) {
     }
 }
 static void fatal(const char *header, int64_t site) {
-    header_length = (size_t)-1;
-    oc_trace(header, site, oc_top);
+    oc_trace(header, SIZE_MAX, site, oc_top);
     die();
 }
 void oc_bounds(int64_t index, int64_t length, int64_t site) {
@@ -468,6 +467,7 @@ static int wide_byte(const OcType *t, const void *p, int64_t idx, int neg) {
 }
 static int wide_equal(const OcType *ta, const void *a, const OcType *tb, const void *b) {
     int neg_a = wide_is_neg(ta, a), neg_b = wide_is_neg(tb, b);
+    if (neg_a != neg_b) return 0;
     int64_t na = (ta->bits + 7) / 8, nb = (tb->bits + 7) / 8, n = na > nb ? na : nb;
     for (int64_t i = 0; i < n; i++) {
         if (wide_byte(ta, a, i, neg_a) != wide_byte(tb, b, i, neg_b)) return 0;
@@ -583,7 +583,7 @@ static uint64_t hash_number(const OcType *t, const void *p) {
             int top = wide_byte(t, p, used - 1, neg);
             int prev = wide_byte(t, p, used - 2, neg);
             if (neg && top == 0xff && (prev & 0x80)) used--;
-            else if (!neg && top == 0x00 && (!(t->flags & F_SIGNED) || !(prev & 0x80))) used--;
+            else if (!neg && top == 0x00) used--;
             else break;
         }
         uint64_t h = 1469598103934665603ULL ^ (uint64_t)(neg ? 1 : 0);
@@ -1294,6 +1294,7 @@ typedef struct OcPanic {
     struct OcPanic *outer;
     OcArr *msg;
     char *header;
+    size_t header_length;
     OcFrame *deferFrame;
     int recovered, active, returnPanic;
 } OcPanic;
@@ -1333,13 +1334,13 @@ static void die(void) {
     exit(1);
 }
 
-static char *msg_text(OcArr *msg) {
+static char *msg_text(OcArr *msg, size_t *length) {
     int64_t n = alen(msg);
     char *s = xmalloc(checked_add(checked_i64_size(n), 8));
     memcpy(s, "Panic: ", 7);
     if (n) memcpy(s + 7, msg->data, (size_t)n);
     s[7 + n] = 0;
-    header_length = (size_t)n + 7;
+    *length = (size_t)n + 7;
     return s;
 }
 
@@ -1352,9 +1353,9 @@ static int recovery_possible(OcFrame *f) {
     return 0;
 }
 static void unwind(OcArr *msg, int64_t site, OcFrame *start, OcFrame *traceFrom) {
-    char *header = msg_text(msg);
     OcPanic p = {0};
-    p.outer = panicking; p.msg = msg; p.header = header; p.deferFrame = start; p.active = 1;
+    p.header = msg_text(msg, &p.header_length);
+    p.outer = panicking; p.msg = msg; p.deferFrame = start; p.active = 1;
     panicking = &p;
     for (OcFrame *f = start; f; f = f->prev) {
         oc_top = f;
@@ -1379,12 +1380,16 @@ static void unwind(OcArr *msg, int64_t site, OcFrame *start, OcFrame *traceFrom)
         /* the panic continues past this frame: release what it owns */
         if (f->locals && (p.recovered || recovery_possible(f->prev))) drop_locals(f);
     }
-    oc_trace(header, site, traceFrom);
+    oc_trace(p.header, p.header_length, site, traceFrom);
     die();
 }
 void oc_panic(OcArr *msg, int64_t site) {
     OcFrame *f = oc_top;
     unwind(msg, site, f, f);
+}
+_Noreturn void oc_panic_sync_closed(void) {
+    oc_panic(oc_str_c("synchronization object is closed"), oc_top ? oc_top->site : 0);
+    abort();
 }
 void oc_panic_div_zero(int64_t site) { oc_panic(oc_str_c("integer division by zero"), site); }
 void oc_panic_neg_shift(int64_t site) { oc_panic(oc_str_c("negative shift count"), site); }
@@ -1566,6 +1571,7 @@ extern void ocean_runtime_thread_invoke(void *code, void *environment);
 extern void ocean_runtime_thread_return(void);
 extern int ocean_runtime_can_cancel(void);
 extern void ocean_runtime_closure_init(void);
+extern _Noreturn void oc_panic_sync_closed(void);
 
 typedef struct Thread Thread;
 struct Thread {
@@ -1822,10 +1828,11 @@ static void shutdown_threads(void) {
     main_thread.done = 1;
     broadcast(&changed);
     returning = 1;
+    size_t bucket = 0;
     for (;;) {
         int64_t next_worker = -1;
-        for (size_t b = 0; b < nbuckets; b++) {
-            for (Thread *t = buckets[b]; t; t = t->next) {
+        for (; bucket < nbuckets; bucket++) {
+            for (Thread *t = buckets[bucket]; t; t = t->next) {
                 if (!is_current_os_thread(t)) { next_worker = t->id; break; }
             }
             if (next_worker >= 0) break;
@@ -1855,7 +1862,7 @@ static void shutdown_threads(void) {
 }
 
 // Both public synchronization types contain a single zero-initialized word.
-// Lazy publication uses a C atomic CAS; all subsequent accesses are native.
+#define SYNC_CLOSED UINTPTR_MAX
 typedef struct Sync Sync;
 static Sync *sync_head;
 struct Sync {
@@ -1865,44 +1872,7 @@ struct Sync {
     int locked;
     int64_t count, waiters;
 };
-static Sync *synchronizer(void *slot) {
-    _Atomic(uintptr_t) *location = slot;
-    uintptr_t present = atomic_load_explicit(location, memory_order_acquire);
-    if (present) return (Sync *)present;
-    Sync *value = calloc(1, sizeof(*value));
-    if (!value) abort();
-    lock_init(&value->gate); cond_init(&value->changed);
-    uintptr_t empty = 0;
-    if (!atomic_compare_exchange_strong_explicit(location, &empty, (uintptr_t)value, memory_order_acq_rel, memory_order_acquire)) {
-#if defined(_WIN32)
-        DeleteCriticalSection(&value->gate);
-#else
-        checked(pthread_mutex_destroy(&value->gate)); checked(pthread_cond_destroy(&value->changed));
-#endif
-        free(value); return (Sync *)empty;
-    }
-    lock(&registry);
-    value->prev = NULL;
-    value->next = sync_head;
-    if (sync_head) sync_head->prev = value;
-    sync_head = value;
-    unlock(&registry);
-    return value;
-}
-static void destroy_sync_slot(void *slot) {
-    if (!slot) return;
-    ensure();
-    _Atomic(uintptr_t) *location = slot;
-    uintptr_t present = atomic_exchange_explicit(location, 0, memory_order_acq_rel);
-    if (!present) return;
-    Sync *s = (Sync *)present;
-    lock(&registry);
-    if (s->prev) s->prev->next = s->next;
-    else if (sync_head == s) sync_head = s->next;
-    if (s->next) s->next->prev = s->prev;
-    s->prev = NULL;
-    s->next = NULL;
-    unlock(&registry);
+static void free_sync(Sync *s) {
 #if defined(_WIN32)
     DeleteCriticalSection(&s->gate);
 #else
@@ -1910,6 +1880,50 @@ static void destroy_sync_slot(void *slot) {
     checked(pthread_cond_destroy(&s->changed));
 #endif
     free(s);
+}
+static Sync *synchronizer(void *slot) {
+    _Atomic(uintptr_t) *location = slot;
+    uintptr_t present = atomic_load_explicit(location, memory_order_acquire);
+    if (present == SYNC_CLOSED) oc_panic_sync_closed();
+    if (present) return (Sync *)present;
+
+    lock(&registry);
+    present = atomic_load_explicit(location, memory_order_relaxed);
+    if (present == SYNC_CLOSED) {
+        unlock(&registry);
+        oc_panic_sync_closed();
+    }
+    if (!present) {
+        Sync *value = calloc(1, sizeof(*value));
+        if (!value) abort();
+        lock_init(&value->gate);
+        cond_init(&value->changed);
+        value->next = sync_head;
+        if (sync_head) sync_head->prev = value;
+        sync_head = value;
+        present = (uintptr_t)value;
+        atomic_store_explicit(location, present, memory_order_release);
+    }
+    unlock(&registry);
+    return (Sync *)present;
+}
+static void destroy_sync_slot(void *slot) {
+    if (!slot) return;
+    ensure();
+    _Atomic(uintptr_t) *location = slot;
+    lock(&registry);
+    uintptr_t present = atomic_exchange_explicit(location, SYNC_CLOSED, memory_order_acq_rel);
+    if (!present || present == SYNC_CLOSED) {
+        unlock(&registry);
+        if (present == SYNC_CLOSED) oc_panic_sync_closed();
+        return;
+    }
+    Sync *s = (Sync *)present;
+    if (s->prev) s->prev->next = s->next;
+    else sync_head = s->next;
+    if (s->next) s->next->prev = s->prev;
+    unlock(&registry);
+    free_sync(s);
 }
 void ocean_threads_mutex_lock(void *slot) {
     ensure();
@@ -1965,13 +1979,9 @@ void ocean_threads_group_close(void *slot) { destroy_sync_slot(slot); }
 
 static void cleanup_sync(void) {
     while (sync_head) {
-        Sync *s = sync_head; sync_head = s->next;
-#if defined(_WIN32)
-        DeleteCriticalSection(&s->gate);
-#else
-        checked(pthread_mutex_destroy(&s->gate)); checked(pthread_cond_destroy(&s->changed));
-#endif
-        free(s);
+        Sync *s = sync_head;
+        sync_head = s->next;
+        free_sync(s);
     }
 }
 
@@ -2828,25 +2838,59 @@ int vsnprintf(char *out, size_t size, const char *f, va_list args) {
         while (*f == '-' || *f == '+' || *f == ' ' || *f == '#' || *f == '0') f++;
         if (*f == '*') { (void)va_arg(args, int); f++; }
         else while (*f >= '0' && *f <= '9') f++;
+        int precision = -1;
         if (*f == '.') {
             f++;
-            if (*f == '*') { (void)va_arg(args, int); f++; }
-            else while (*f >= '0' && *f <= '9') f++;
+            if (*f == '*') { precision = va_arg(args, int); f++; }
+            else {
+                precision = 0;
+                while (*f >= '0' && *f <= '9') {
+                    int digit = *f++ - '0';
+                    precision = precision > (INT32_MAX - digit) / 10 ? INT32_MAX : precision * 10 + digit;
+                }
+            }
         }
-        int longs = 0;
-        if (*f == 'h') { f++; if (*f == 'h') f++; }
-        else if (*f == 'j' || *f == 't') { longs = 2; f++; }
-        else { while (*f == 'l' || *f == 'z') { longs++; f++; } }
+        enum { DEFAULT, CHAR, SHORT, LONG, LONG_LONG, INTMAX, SIZE, PTRDIFF } length = DEFAULT;
+        if (*f == 'h') { length = SHORT; f++; if (*f == 'h') { length = CHAR; f++; } }
+        else if (*f == 'l') { length = LONG; f++; if (*f == 'l') { length = LONG_LONG; f++; } }
+        else if (*f == 'j') { length = INTMAX; f++; }
+        else if (*f == 'z') { length = SIZE; f++; }
+        else if (*f == 't') { length = PTRDIFF; f++; }
         if (*f == '%') { put_char(out, size, &len, '%'); continue; }
-        if (*f == 's') { const char *s = va_arg(args, const char *); if (!s) s = "(null)"; while (*s) put_char(out, size, &len, *s++); continue; }
+        if (*f == 's') {
+            const char *s = va_arg(args, const char *);
+            if (!s) s = "(null)";
+            for (size_t i = 0; (precision < 0 || i < (size_t)precision) && s[i]; i++)
+                put_char(out, size, &len, s[i]);
+            continue;
+        }
         if (*f == 'c') { put_char(out, size, &len, (char)va_arg(args, int)); continue; }
         if (*f == 'd' || *f == 'i' || *f == 'u' || *f == 'x' || *f == 'X' || *f == 'o' || *f == 'p') {
             unsigned long long v; int neg = 0;
             if (*f == 'p') v = (uintptr_t)va_arg(args, void *);
             else if (*f == 'd' || *f == 'i') {
-                long long s = longs >= 2 ? va_arg(args, long long) : longs == 1 ? va_arg(args, long) : va_arg(args, int);
+                long long s;
+                switch (length) {
+                case CHAR: s = (signed char)va_arg(args, int); break;
+                case SHORT: s = (short)va_arg(args, int); break;
+                case LONG: s = va_arg(args, long); break;
+                case LONG_LONG: s = va_arg(args, long long); break;
+                case INTMAX: s = va_arg(args, intmax_t); break;
+                case SIZE: case PTRDIFF: s = va_arg(args, ptrdiff_t); break;
+                default: s = va_arg(args, int); break;
+                }
                 if (s < 0) { neg = 1; v = 0ull - (unsigned long long)s; } else v = (unsigned long long)s;
-            } else v = longs >= 2 ? va_arg(args, unsigned long long) : longs == 1 ? va_arg(args, unsigned long) : va_arg(args, unsigned);
+            } else {
+                switch (length) {
+                case CHAR: v = (unsigned char)va_arg(args, int); break;
+                case SHORT: v = (unsigned short)va_arg(args, int); break;
+                case LONG: v = va_arg(args, unsigned long); break;
+                case LONG_LONG: v = va_arg(args, unsigned long long); break;
+                case INTMAX: v = va_arg(args, uintmax_t); break;
+                case SIZE: case PTRDIFF: v = va_arg(args, size_t); break;
+                default: v = va_arg(args, unsigned); break;
+                }
+            }
             unsigned base = (*f == 'x' || *f == 'X' || *f == 'p') ? 16 : (*f == 'o' ? 8 : 10);
             const char *digits_hex = *f == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
             char digits[24]; int k = 0;

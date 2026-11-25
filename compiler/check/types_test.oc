@@ -1,0 +1,22 @@
+package check;
+import "testing";
+
+enum TreePayload { nodes([]RecursiveTree), empty }
+struct RecursiveTree { payload TreePayload; children []RecursiveTree; value int; }
+
+func TestRecursiveDynamicOwnership(t *testing.T) {
+    leaf := RecursiveTree{payload: TreePayload.empty, value: 3};
+    tree := RecursiveTree{payload: TreePayload.nodes([]RecursiveTree{leaf}), children: []RecursiveTree{leaf}};
+    copy := tree;
+    copy.children[0].value = 9;
+    if (tree.children[0].value != 3) t.Error("recursive value copy shared its children");
+}
+
+struct ExpandingChain<T> { next *ExpandingChain<[]T>; value T; }
+
+func TestExpandingGenericPointer(t *testing.T) {
+    leaf := ExpandingChain<[]int>{value: []int{7}};
+    chain := ExpandingChain<int>{next: &leaf, value: 2};
+    boxed: any = chain;
+    if (chain.next.value[0] != 7 || boxed == null) t.Error("expanding pointer instance");
+}

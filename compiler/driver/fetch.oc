@@ -1,6 +1,9 @@
 package driver;
+import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/loader";
 import "github.com/ocean-foundation/ocean/compiler/util";
+import "path" as filepath;
+import "sort";
 import "strings";
 
 func fetchUsage() string {
@@ -25,19 +28,7 @@ func fetchMain(args []string) int {
     }
     if (b.Errors() > 0) return 1;
     if (argc == 2) {
-        if (len(mod.requires) == 0) return 0;
-        for (name, ver := range mod.requires) {
-            rep, replaced := mod.replaces[name];
-            if (replaced) {
-                if (len(rep) > 0 && (rep[0] == '.' || rep[0] == '/')) continue;
-                rver, ok := mod.replaceVersions[name];
-                _, _, errMsg := loader.FetchModule(mod.root, rep, ok ? rver : "");
-                if (errMsg != "") { util.Stderr("ocean fetch: " + errMsg + "\n"); return 1; }
-                continue;
-            }
-            _, _, errMsg := loader.FetchModule(mod.root, name, ver);
-            if (errMsg != "") { util.Stderr("ocean fetch: " + errMsg + "\n"); return 1; }
-        }
+        if (!fetchDependencies(b, mod.root, mod)) return 1;
         return 0;
     }
     spec := args[2];
@@ -57,11 +48,12 @@ func fetchMain(args []string) int {
     existingVer, alreadyDeclared := mod.requires[modURL];
     targetVer := hasVer ? ver : (alreadyDeclared ? existingVer : "latest");
     if (targetVer == "") targetVer = "latest";
-    _, _, errMsg := loader.FetchModule(mod.root, modURL, targetVer);
+    dependency, errMsg := fetchRequirement(b, mod.root, mod, modURL, targetVer);
     if (errMsg != "") {
         util.Stderr("ocean fetch: " + errMsg + "\n");
         return 1;
     }
+    if (!fetchDependencies(b, mod.root, dependency)) return 1;
     if (!alreadyDeclared || hasVer) {
         if (!upsertOceanModRequire(mod.root, modURL, targetVer)) {
             util.Stderr("ocean fetch: could not update ocean.mod\n");
@@ -69,6 +61,60 @@ func fetchMain(args []string) int {
         }
     }
     return 0;
+}
+
+// Walk module manifests without writing into the dependency cache. Importers'
+// manifests choose versions; the requesting project's ocean.sum pins the bytes.
+func fetchDependencies(b *loader.Build, root string, first *ast.Module) bool {
+    visited: map[string]bool;
+    pending := []*ast.Module{first};
+    // An explicit fetch has already selected the only direct dependency to walk.
+    visited[root] = first.root != root;
+    for (i := 0; i < len(pending); i++) {
+        mod := pending[i];
+        done, _ := visited[mod.root];
+        if (done) continue;
+        visited[mod.root] = true;
+        names := make([]string);
+        for (name, _ := range mod.requires) names.append(name);
+        sort.Strings(&names);
+        for (_, name := range names) {
+            version, _ := mod.requires[name];
+            dependency, errMsg := fetchRequirement(b, root, mod, name, version);
+            if (errMsg != "") {
+                util.Stderr("ocean fetch: " + mod.path + " requires " + name + ": " + errMsg + "\n");
+                return false;
+            }
+            pending.append(dependency);
+        }
+    }
+    return true;
+}
+
+func fetchRequirement(b *loader.Build, root string, mod *ast.Module, name string, version string) (*ast.Module, string) {
+    path := "";
+    rep, replaced := mod.replaces[name];
+    if (replaced && len(rep) > 0 && (rep[0] == '.' || rep[0] == '/')) {
+        location := rep[0] == '/' ? rep : filepath.Join(mod.root, rep);
+        resolved, ok := util.Realpath(location);
+        if (!ok) return zero(*ast.Module), "cannot resolve local replacement: " + rep;
+        path = resolved;
+    } else {
+        target := name;
+        if (replaced) {
+            target = rep;
+            version, _ = mod.replaceVersions[name];
+        }
+        cached, _, errMsg := loader.FetchModule(root, target, version);
+        if (errMsg != "") return zero(*ast.Module), errMsg;
+        path = cached;
+    }
+    errors := b.Errors();
+    dep := b.FindModule(path);
+    if (loader.NilModule(dep) || dep.root != path) return zero(*ast.Module), "module root must contain ocean.mod: " + path;
+    if (b.Errors() > errors) return zero(*ast.Module), "invalid ocean.mod: " + path;
+    if (!replaced && dep.path != name) return zero(*ast.Module), "module declares " + dep.path + ", expected " + name;
+    return dep, "";
 }
 
 func modWordsSimple(line string) []string {
@@ -94,6 +140,9 @@ func modWordsSimple(line string) []string {
 }
 
 func upsertOceanModRequire(modRoot string, modURL string, version string) bool {
+    fd := loader.LockModuleManifest(modRoot);
+    if (fd < 0) return false;
+    defer util.Close(fd);
     path := modRoot + "/ocean.mod";
     text, ok := util.ReadFile(path);
     if (!ok) return false;

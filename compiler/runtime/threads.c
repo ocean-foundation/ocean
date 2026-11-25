@@ -99,6 +99,7 @@ extern void ocean_runtime_thread_invoke(void *code, void *environment);
 extern void ocean_runtime_thread_return(void);
 extern int ocean_runtime_can_cancel(void);
 extern void ocean_runtime_closure_init(void);
+extern _Noreturn void oc_panic_sync_closed(void);
 
 typedef struct Thread Thread;
 struct Thread {
@@ -355,10 +356,11 @@ static void shutdown_threads(void) {
     main_thread.done = 1;
     broadcast(&changed);
     returning = 1;
+    size_t bucket = 0;
     for (;;) {
         int64_t next_worker = -1;
-        for (size_t b = 0; b < nbuckets; b++) {
-            for (Thread *t = buckets[b]; t; t = t->next) {
+        for (; bucket < nbuckets; bucket++) {
+            for (Thread *t = buckets[bucket]; t; t = t->next) {
                 if (!is_current_os_thread(t)) { next_worker = t->id; break; }
             }
             if (next_worker >= 0) break;
@@ -388,7 +390,7 @@ static void shutdown_threads(void) {
 }
 
 // Both public synchronization types contain a single zero-initialized word.
-// Lazy publication uses a C atomic CAS; all subsequent accesses are native.
+#define SYNC_CLOSED UINTPTR_MAX
 typedef struct Sync Sync;
 static Sync *sync_head;
 struct Sync {
@@ -398,44 +400,7 @@ struct Sync {
     int locked;
     int64_t count, waiters;
 };
-static Sync *synchronizer(void *slot) {
-    _Atomic(uintptr_t) *location = slot;
-    uintptr_t present = atomic_load_explicit(location, memory_order_acquire);
-    if (present) return (Sync *)present;
-    Sync *value = calloc(1, sizeof(*value));
-    if (!value) abort();
-    lock_init(&value->gate); cond_init(&value->changed);
-    uintptr_t empty = 0;
-    if (!atomic_compare_exchange_strong_explicit(location, &empty, (uintptr_t)value, memory_order_acq_rel, memory_order_acquire)) {
-#if defined(_WIN32)
-        DeleteCriticalSection(&value->gate);
-#else
-        checked(pthread_mutex_destroy(&value->gate)); checked(pthread_cond_destroy(&value->changed));
-#endif
-        free(value); return (Sync *)empty;
-    }
-    lock(&registry);
-    value->prev = NULL;
-    value->next = sync_head;
-    if (sync_head) sync_head->prev = value;
-    sync_head = value;
-    unlock(&registry);
-    return value;
-}
-static void destroy_sync_slot(void *slot) {
-    if (!slot) return;
-    ensure();
-    _Atomic(uintptr_t) *location = slot;
-    uintptr_t present = atomic_exchange_explicit(location, 0, memory_order_acq_rel);
-    if (!present) return;
-    Sync *s = (Sync *)present;
-    lock(&registry);
-    if (s->prev) s->prev->next = s->next;
-    else if (sync_head == s) sync_head = s->next;
-    if (s->next) s->next->prev = s->prev;
-    s->prev = NULL;
-    s->next = NULL;
-    unlock(&registry);
+static void free_sync(Sync *s) {
 #if defined(_WIN32)
     DeleteCriticalSection(&s->gate);
 #else
@@ -443,6 +408,50 @@ static void destroy_sync_slot(void *slot) {
     checked(pthread_cond_destroy(&s->changed));
 #endif
     free(s);
+}
+static Sync *synchronizer(void *slot) {
+    _Atomic(uintptr_t) *location = slot;
+    uintptr_t present = atomic_load_explicit(location, memory_order_acquire);
+    if (present == SYNC_CLOSED) oc_panic_sync_closed();
+    if (present) return (Sync *)present;
+
+    lock(&registry);
+    present = atomic_load_explicit(location, memory_order_relaxed);
+    if (present == SYNC_CLOSED) {
+        unlock(&registry);
+        oc_panic_sync_closed();
+    }
+    if (!present) {
+        Sync *value = calloc(1, sizeof(*value));
+        if (!value) abort();
+        lock_init(&value->gate);
+        cond_init(&value->changed);
+        value->next = sync_head;
+        if (sync_head) sync_head->prev = value;
+        sync_head = value;
+        present = (uintptr_t)value;
+        atomic_store_explicit(location, present, memory_order_release);
+    }
+    unlock(&registry);
+    return (Sync *)present;
+}
+static void destroy_sync_slot(void *slot) {
+    if (!slot) return;
+    ensure();
+    _Atomic(uintptr_t) *location = slot;
+    lock(&registry);
+    uintptr_t present = atomic_exchange_explicit(location, SYNC_CLOSED, memory_order_acq_rel);
+    if (!present || present == SYNC_CLOSED) {
+        unlock(&registry);
+        if (present == SYNC_CLOSED) oc_panic_sync_closed();
+        return;
+    }
+    Sync *s = (Sync *)present;
+    if (s->prev) s->prev->next = s->next;
+    else sync_head = s->next;
+    if (s->next) s->next->prev = s->prev;
+    unlock(&registry);
+    free_sync(s);
 }
 void ocean_threads_mutex_lock(void *slot) {
     ensure();
@@ -498,13 +507,9 @@ void ocean_threads_group_close(void *slot) { destroy_sync_slot(slot); }
 
 static void cleanup_sync(void) {
     while (sync_head) {
-        Sync *s = sync_head; sync_head = s->next;
-#if defined(_WIN32)
-        DeleteCriticalSection(&s->gate);
-#else
-        checked(pthread_mutex_destroy(&s->gate)); checked(pthread_cond_destroy(&s->changed));
-#endif
-        free(s);
+        Sync *s = sync_head;
+        sync_head = s->next;
+        free_sync(s);
     }
 }
 

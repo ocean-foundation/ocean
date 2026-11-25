@@ -24,6 +24,11 @@ func ModuleCacheDir() (string, bool) {
 
 func SumPath(modRoot string) string { return modRoot + "/ocean.sum"; }
 
+// A stable lock file protects module manifest updates across atomic renames.
+func LockModuleManifest(modRoot string) int {
+    return util.LockFile(modRoot + "/.ocean-manifest.lock");
+}
+
 func ReadSum(modRoot string) ([]SumEntry, bool) {
     entries := make([]SumEntry);
     if (modRoot == "") return entries, false;
@@ -120,50 +125,52 @@ func FetchModule(modRoot string, modPath string, version string) (string, string
     base := filepath.Dir(dest);
     if (!util.MkdirAll(base)) return "", "", "cannot create module cache directory: " + base;
 
-    entries, _ := ReadSum(modRoot);
+    stage := "";
+    digest := "";
     if (!util.IsDir(dest)) {
         tmp, tok := util.MakeTempDirIn(base, ".fetch-");
         if (!tok) return "", "", "cannot create staging directory in " + base;
+        stage = tmp;
+        defer util.RemoveAll(tmp);
         util.Stderr("ocean: fetching " + modPath + "@" + ver + "\n");
         prevPrompt, hadPrompt := util.Getenv("GIT_TERMINAL_PROMPT");
         util.Setenv("GIT_TERMINAL_PROMPT", "0");
-        args := []string{"git", "-c", "core.hooksPath=/dev/null", "clone", "--quiet", "--depth", "1"};
+        args := []string{"git", "-c", "core.hooksPath=/dev/null", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "clone", "--quiet", "--depth", "1"};
         if (ver != "latest") { args.append("--branch", ver); }
         args.append("--", "https://" + modPath, tmp);
         st := util.Run(args.array());
         if (hadPrompt) util.Setenv("GIT_TERMINAL_PROMPT", prevPrompt); else util.Unsetenv("GIT_TERMINAL_PROMPT");
-        if (st.Code != 0 || st.Failed) {
-            util.RemoveAll(tmp);
-            return "", "", "module download failed for " + modPath + "@" + ver;
-        }
-        if (!util.Exists(tmp + "/ocean.mod")) {
-            util.RemoveAll(tmp);
-            return "", "", "downloaded module has no ocean.mod: " + modPath;
-        }
-        digest, hok := util.HashDir(tmp);
-        if (!hok) {
-            util.RemoveAll(tmp);
-            return "", "", "cannot compute checksum for " + modPath;
-        }
-        if (modRoot != "") {
-            expected, found := findSumHash(entries, modPath, ver);
-            if (found && expected != digest) {
-                util.RemoveAll(tmp);
-                return "", "", "checksum mismatch with ocean.sum for " + modPath + "@" + ver;
-            }
-        }
-        if (!util.Rename(tmp, dest)) {
-            util.RemoveAll(tmp);
-            if (!util.IsDir(dest)) return "", "", "cannot install downloaded module: " + dest;
-        }
+        if (st.Code != 0 || st.Failed) return "", "", "module download failed for " + modPath + "@" + ver;
+        if (!util.Exists(tmp + "/ocean.mod")) return "", "", "downloaded module has no ocean.mod: " + modPath;
+        ok := false;
+        digest, ok = util.HashDir(tmp);
+        if (!ok) return "", "", "cannot compute checksum for " + modPath;
     }
-    digest, hok := util.HashDir(dest);
-    if (!hok) return "", "", "cannot compute checksum for " + modPath;
+
+    entries := make([]SumEntry);
     if (modRoot != "") {
-        expected, found := findSumHash(entries, modPath, ver);
-        if (found && expected != digest) {
-            return "", "", "checksum mismatch with ocean.sum for " + modPath + "@" + ver;
-        }
+        fd := LockModuleManifest(modRoot);
+        if (fd < 0) return "", "", "cannot lock module manifests in " + modRoot;
+        defer util.Close(fd);
+        read := false;
+        entries, read = ReadSum(modRoot);
+        if (!read && util.Exists(SumPath(modRoot))) return "", "", "cannot read ocean.sum in " + modRoot;
+    }
+    expected, pinned := findSumHash(entries, modPath, ver);
+    mismatch := "checksum mismatch with ocean.sum for " + modPath + "@" + ver;
+    installed := false;
+    if (stage != "" && !util.IsDir(dest)) {
+        if (pinned && expected != digest) return "", "", mismatch;
+        installed = util.Rename(stage, dest);
+        if (!installed && !util.IsDir(dest)) return "", "", "cannot install downloaded module: " + dest;
+    }
+    if (!installed) {
+        ok := false;
+        digest, ok = util.HashDir(dest);
+        if (!ok) return "", "", "cannot compute checksum for " + modPath;
+        if (pinned && expected != digest) return "", "", mismatch;
+    }
+    if (modRoot != "" && !pinned) {
         setSumEntry(&entries, modPath, ver, digest);
         if (!WriteSum(modRoot, entries)) return "", "", "cannot write ocean.sum in " + modRoot;
     }

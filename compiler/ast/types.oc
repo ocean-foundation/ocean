@@ -110,10 +110,10 @@ struct Symbol {
     decl *Node;             // global var: its VarDecl
     self *Type;             // type symbols: the declared (named) type
     local bool;             // declared in a function body
-    scope *Scope;           // resolution scope for local type declarations
+    scope *Scope;           // declaration scope for locals
     fixedVariant int;
     valueSyms []*Symbol;    // struct: value parameters visible to field dimensions
-    stackBuf bool;          // local var holding stack-allocated buffer
+    stackBufScope *Scope;   // scope owning the local buffer storage
 }
 
 struct Scope {

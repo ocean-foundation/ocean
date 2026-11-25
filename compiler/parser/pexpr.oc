@@ -254,14 +254,18 @@ func postfix1(p *Parser, n *ast.Node) *ast.Node {
                 st := indexOfNodeStart(p, n);
                 r := legacy.TypeRewrite(&p.toks, st, p.src.text, true);
                 if (r.ok) {
+                    if (st + r.consumed <= p.pos) return n;
+                    before := p.pos;
                     recordFix(p, st, r);
+                    if (p.pos <= before) return n;
+                    n = finish(p, n);
                     if (is(p, scanner.Kind.LBrace)) {
                         c := nodeAt(p, ast.NK.Composite, n);
                         c.a = n;
                         c.list = compositeBody(p);
-                        return finish(p, c);
+                        n = finish(p, c);
                     }
-                    return n;
+                    continue;
                 }
             }
             if (peek(p, 1) == scanner.Kind.RBrack) {

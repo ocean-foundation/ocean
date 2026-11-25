@@ -76,6 +76,12 @@ func hexVal(c i8) int {
     return -1;
 }
 
+func hasDrivePrefix(path string) bool {
+    if (len(path) < 2 || path[1] != ':') return false;
+    c := path[0];
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
 // uriPath converts a file:// URI to a resolved path ("" if invalid).
 func uriPath(uri string) string {
     if (!strings.HasPrefix(uri, "file://")) return "";
@@ -93,7 +99,7 @@ func uriPath(uri string) string {
         } else b.Addc(s[i]);
     }
     path := b.String();
-    if (len(path) >= 3 && path[0] == '/' && ((path[1] >= 'A' && path[1] <= 'Z') || (path[1] >= 'a' && path[1] <= 'z')) && path[2] == ':') {
+    if (util.Windows() && len(path) >= 3 && path[0] == '/' && hasDrivePrefix(path[1:])) {
         path = path[1:];
     }
     r, ok := util.Realpath(path);
@@ -107,6 +113,7 @@ func uriPath(uri string) string {
 func pathURI(path string) string {
     b: util.Buf;
     b.Add("file://");
+    if (hasDrivePrefix(path)) b.Addc('/');
     for (i := 0; i < len(path); i++) {
         c := path[i];
         u := (c -> int) & 255;
@@ -173,7 +180,7 @@ func Main() int {
             uri := td.Get("uri").Str();
             if (uri == "") continue;
             i := findDoc(s, uri);
-            changedDoc := zero(*Document);
+            refresh := false;
             if (method == "textDocument/didOpen") {
                 text := td.Get("text");
                 path := uriPath(uri);
@@ -181,12 +188,13 @@ func Main() int {
                     d := zero(*Document);
                     if (i < 0) { d = new(Document); d.uri = uri; s.docs.append(d); } else d = s.docs[i];
                     d.path = path; d.text = text.Str(); d.version = td.Get("version").Int(0);
-                    changedDoc = d;
+                    refresh = true;
                 }
             } else if (i >= 0 && method == "textDocument/didClose") {
                 d := s.docs[i];
                 publishEmpty(d);
                 s.docs.remove(i);
+                refresh = true;
             } else if (i >= 0 && method == "textDocument/didChange") {
                 d := s.docs[i];
                 v := td.Get("version").Int(d.version + 1);
@@ -197,12 +205,14 @@ func Main() int {
                         if (t.IsStr() && nilJ(ch.Get("range"))) d.text = t.Str();
                     }
                     d.version = v;
+                    refresh = true;
                 }
-                changedDoc = d;
             } else if (i >= 0 && method == "textDocument/didSave") {
-                changedDoc = s.docs[i];
+                refresh = true;
             }
-            if ((changedDoc -> int) != 0) publish(s, changedDoc);
+            if (refresh) {
+                for (_, d := range s.docs) publish(s, d);
+            }
             continue;
         }
         if (!nilJ(id)) replyError(id, -32601, "Method not found");

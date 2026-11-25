@@ -223,7 +223,7 @@ func Main(locations []string) int {
         recursive := strings.HasSuffix(location, "...") && (len(location) == 3 || location[len(location) - 4] == '/');
         if (recursive) {
             location = len(location) > 3 ? location[0:len(location) - 4] : "";
-            if (location == "" && len(original) > 4 && original[0] == '/') location = "/";
+            if (location == "" && len(original) == 4 && original[0] == '/') location = "/";
         }
         if (location == "") location = ".";
         path, ok := util.Realpath(location);

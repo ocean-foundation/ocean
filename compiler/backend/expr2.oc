@@ -171,6 +171,7 @@ struct LPath {
     fixedPtr string;
     keyVal V;
     keySlot string;
+    rawIndexAddr string;
     isMap bool;
     isBit bool;
     isIdx bool;
@@ -241,6 +242,7 @@ func resolveLPath(g *Gen, lp *LPath) string {
         return lp.fixedPtr;
     }
     if (lp.isBit) return lp.fixedPtr != "" ? lp.fixedPtr : resolveLPath(g, lp.parent);
+    if (lp.rawIndexAddr != "") return lp.rawIndexAddr;
     slot := lp.fixedPtr != "" ? lp.fixedPtr : resolveLPath(g, lp.parent);
     bt := typeOf(g, lp.node.a);
     u := under(bt);
@@ -250,7 +252,11 @@ func resolveLPath(g *Gen, lp *LPath) string {
         return r;
     }
     bv := load(g, bt, slot);
-    if (u.kind == ast.TK.Buffer || u.kind == ast.TK.Ptr) return gepDyn(g, bv.r, lp.keyVal.r, sizeOf(g, u.elem));
+    if (u.kind == ast.TK.Ptr) {
+        lp.rawIndexAddr = gepDyn(g, bv.r, lp.keyVal.r, sizeOf(g, u.elem));
+        return lp.rawIndexAddr;
+    }
+    if (u.kind == ast.TK.Buffer) return gepDyn(g, bv.r, lp.keyVal.r, sizeOf(g, u.elem));
     elem := u.kind == ast.TK.String ? check.TI8() : u.elem;
     length := collectionLen(g, bv);
     boundsCheck(g, lp.node, lp.keyVal.r, length);

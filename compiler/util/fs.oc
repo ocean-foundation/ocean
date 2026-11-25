@@ -150,6 +150,34 @@ func OpenTrunc(path string) int {
     c := CStr(path);
     return native_open((c.data)->int, WriteFlags(), (438->u32)->int) -> int;
 }
+// LockFile takes an exclusive process lock. Close the returned fd to release it.
+func LockFile(path string) int {
+    name := CStr(path);
+    flags := oWrOnly() | oCreat() | oNoFollow();
+    if (Windows()) flags = (flags & ~1) | 2 | 128; // O_RDWR | O_NOINHERIT
+    fd := native_open(name.data->int, flags, 420);
+    if (fd < 0) return -1;
+    ok := Windows() ? native_locking(fd) : lockFilePOSIX(fd);
+    if (!ok) { Close(fd); return -1; }
+    return fd;
+}
+
+struct LinuxFileLock { kind i16; whence i16; start i64; length i64; pid i32; }
+struct DarwinFileLock { start i64; length i64; pid i32; kind i16; whence i16; }
+
+func lockFilePOSIX(fd int) bool {
+    SetCloexec(fd);
+    linux: LinuxFileLock;
+    darwin: DarwinFileLock;
+    linux.kind = 1; darwin.kind = 3; // F_WRLCK
+    mac := MacOS();
+    arg := mac ? (&darwin)->int : (&linux)->int;
+    for (;;) {
+        if (native_fcntl(fd, mac ? 9 : 7, arg) == 0) return true; // F_SETLKW
+        if (native_errno() != 4) return false; // EINTR
+    }
+}
+
 func WriteString(fd int, s string) bool { return WriteFd(fd->i32, s); }
 func Close(fd int) bool { return native_close((fd->i32)->int) == 0; }
 

@@ -146,6 +146,10 @@ func stmt(c *Checker, n *ast.Node) {
     case ast.NK.Defer:
         c.fn.hasDefer = true;
         valueExpr(c, n.a);
+        call := n.a;
+        if (call.sem == ast.Sem.CallBuiltin && call.text == "delete" && len(call.list) == 2 && hasMovableIndex(call.list[0])) {
+            warn(c, call.list[0], "deferred delete captures a map slot that can become invalid if its container moves");
+        }
     case ast.NK.Labeled:
         _, dup := c.fn.labels[n.name];
         if (dup) err(c, n, "duplicate label: " + n.name);
@@ -201,21 +205,55 @@ func declareLocal(c *Checker, id *ast.Node, t *ast.Type) {
     declare(c, s, id);
 }
 
-func isStackBufferExpr(n *ast.Node) bool {
-    if (nilN(n)) return false;
+// hasMovableIndex detects lvalue paths into container storage that may relocate.
+func hasMovableIndex(n *ast.Node) bool {
     switch (n.kind) {
-    case ast.NK.Ident:
-        return !nilS(n.sym) && n.sym.stackBuf;
-    case ast.NK.Composite:
-        return !nilT(n.ty) && Underlying(n.ty).kind == ast.TK.Buffer;
-    case ast.NK.TBuffer:
-        return true;
-    case ast.NK.Zero:
-        return !nilT(n.ty) && Underlying(n.ty).kind == ast.TK.Buffer && Underlying(n.ty).len > 0;
-    case ast.NK.Ternary:
-        return isStackBufferExpr(n.b) || isStackBufferExpr(n.c);
+    case ast.NK.Index:
+        if (nilT(n.a.ty)) return false;
+        base := Underlying(n.a.ty);
+        if (base.kind == ast.TK.Dyn || base.kind == ast.TK.Map || (base.kind == ast.TK.Array && base.len < 0)) return true;
+        if (base.kind == ast.TK.Array) return hasMovableIndex(n.a);
+    case ast.NK.Member:
+        if (n.sem == ast.Sem.Field && !nilT(n.a.ty) && Underlying(n.a.ty).kind != ast.TK.Ptr) return hasMovableIndex(n.a);
     }
     return false;
+}
+
+func scopeContains(outer *ast.Scope, inner *ast.Scope) bool {
+    for (s := inner; !ast.NilScope(s); s = s.parent) {
+        if (s == outer) return true;
+    }
+    return false;
+}
+
+func stackBufferScope(c *Checker, n *ast.Node) *ast.Scope {
+    none := zero(*ast.Scope);
+    if (nilN(n) || nilT(n.ty) || Underlying(n.ty).kind != ast.TK.Buffer) return none;
+    switch (n.kind) {
+    case ast.NK.Ident:
+        if (!nilS(n.sym)) return n.sym.stackBufScope;
+    case ast.NK.Composite, ast.NK.TBuffer:
+        return c.scope;
+    case ast.NK.Zero:
+        if (Underlying(n.ty).len > 0) return c.scope;
+    case ast.NK.Cast, ast.NK.Assign:
+        value := n.kind == ast.NK.Cast ? n.a : n.b;
+        return stackBufferScope(c, value);
+    case ast.NK.Ternary:
+        left := stackBufferScope(c, n.b);
+        right := stackBufferScope(c, n.c);
+        if (ast.NilScope(left) || scopeContains(left, right)) return right;
+        return left;
+    }
+    return none;
+}
+
+func assignStackBuffer(c *Checker, target *ast.Node, storage *ast.Scope) {
+    if (target.kind != ast.NK.Ident || target.sem != ast.Sem.LocalVar || nilS(target.sym)) return;
+    if (!ast.NilScope(storage) && !scopeContains(storage, target.sym.scope)) {
+        warn(c, target, "buffer view assigned to an outer local can outlive its backing storage");
+    }
+    target.sym.stackBufScope = storage;
 }
 
 // localVar checks `names : [Type] [= values]`.
@@ -260,7 +298,7 @@ func localVar(c *Checker, n *ast.Node) {
             for (_, id := range names) {
                 declareLocal(c, id, t);
                 u := Underlying(t);
-                if (!nilS(id.sym) && u.kind == ast.TK.Buffer && (u.len > 0 || u.len == -1)) id.sym.stackBuf = true;
+                if (!nilS(id.sym) && u.kind == ast.TK.Buffer && (u.len > 0 || u.len == -1)) id.sym.stackBufScope = c.scope;
             }
             return;
         }
@@ -286,8 +324,8 @@ func localVar(c *Checker, n *ast.Node) {
         for (i, id := range names) {
             declareLocal(c, id, t);
             if (!nilS(id.sym)) {
-                if (u.kind == ast.TK.Buffer && u.len > 0 && i < len(values) && values[i].kind != ast.NK.Call && values[i].kind != ast.NK.Cast) id.sym.stackBuf = true;
-                else if (i < len(values) && isStackBufferExpr(values[i])) id.sym.stackBuf = true;
+                if (u.kind == ast.TK.Buffer && u.len > 0 && i < len(values) && values[i].kind != ast.NK.Call && values[i].kind != ast.NK.Cast) id.sym.stackBufScope = c.scope;
+                else if (i < len(values)) id.sym.stackBufScope = stackBufferScope(c, values[i]);
             }
         }
         return;
@@ -322,7 +360,7 @@ func localVar(c *Checker, n *ast.Node) {
     }
     for (i, id := range names) {
         declareLocal(c, id, types[i]);
-        if (!nilS(id.sym) && isStackBufferExpr(values[i])) id.sym.stackBuf = true;
+        if (!nilS(id.sym)) id.sym.stackBufScope = stackBufferScope(c, values[i]);
     }
 }
 
@@ -517,7 +555,7 @@ func returnStmt(c *Checker, n *ast.Node) {
     if (len(n.list) == 0) {
         if (len(results) > 0 && len(c.fn.named) == 0) err(c, n, "return count mismatch: Expected " + itoa(len(results)) + " return values, but got 0.");
         for (_, ns := range c.fn.named) {
-            if (ns.stackBuf) { warn(c, n, "returning stack-allocated buffer escapes its enclosing scope"); break; }
+            if (!ast.NilScope(ns.stackBufScope)) { warn(c, n, "returning stack-allocated buffer escapes its enclosing scope"); break; }
         }
         return;
     }
@@ -546,7 +584,7 @@ func returnStmt(c *Checker, n *ast.Node) {
     for (i, v := range n.list) {
         expr(c, v, results[i]);
         coerce(c, v, results[i], v);
-        if (isStackBufferExpr(v)) warn(c, v, "returning stack-allocated buffer escapes its enclosing scope");
+        if (!ast.NilScope(stackBufferScope(c, v))) warn(c, v, "returning stack-allocated buffer escapes its enclosing scope");
     }
 }
 
@@ -704,7 +742,7 @@ func checkGoto(c *Checker, g *ast.Node, label *ast.Node) {
 }
 
 // checkInstanceBitfields validates bitfields of generic struct instances whose
-// field types come from type arguments at all nesting depths.
+// field types come from type arguments. Pointees are checked when used.
 func checkInstanceBitfields(c *Checker, at *ast.Node, t *ast.Type) {
     if (nilT(t)) return;
     seen: map[string]bool;
@@ -722,7 +760,7 @@ func checkInstanceBitfieldsWalk(c *Checker, at *ast.Node, t *ast.Type, seen *map
     if (sok && sv) return false;
     (*seen)[k] = true;
     switch (t.kind) {
-    case ast.TK.Ptr, ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
+    case ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
         return !nilT(t.elem) && checkInstanceBitfieldsWalk(c, at, t.elem, seen);
     case ast.TK.Map:
         return checkInstanceBitfieldsWalk(c, at, t.key, seen) || checkInstanceBitfieldsWalk(c, at, t.elem, seen);

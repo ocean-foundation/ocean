@@ -22,6 +22,7 @@ struct Build {
     noModule map[string]bool;
     byDir map[string]*ast.Package;
     root *ast.Package;
+    sumRoot string;              // module whose ocean.sum verifies external dependencies
     errors int;
     recover bool;
     overlays []*Overlay;
@@ -333,7 +334,7 @@ func resolveImport(b *Build, from *ast.Package, path string) *ast.Package {
                 error(b, from.dir, "cannot locate module cache; set OCEAN_MOD_CACHE or HOME");
                 return zero(*ast.Package);
             }
-            resolvedRoot, verr := VerifyCachedModule(hasMod ? mod.root : "", replaced ? replacement : name, version, cacheDir);
+            resolvedRoot, verr := VerifyCachedModule(b.sumRoot, replaced ? replacement : name, version, cacheDir);
             if (verr != "") {
                 error(b, from.dir, verr);
                 return zero(*ast.Package);
@@ -534,11 +535,17 @@ func canonicalLocation(b *Build, location string) string {
 func (b *Build) LoadPackage(location string) bool {
     path := canonicalLocation(b, location);
     if (path == "") return false;
+    setSumRoot(b, path);
     b.root = loadDirectory(b, path);
     if (b.errors > 0 && !b.recover) return false;
     if (b.root.name == "") return false;
     finish(b);
     return b.errors == 0;
+}
+
+func setSumRoot(b *Build, path string) {
+    mod := b.FindModule(path);
+    b.sumRoot = NilModule(mod) ? "" : mod.root;
 }
 
 func finish(b *Build) {
@@ -563,6 +570,10 @@ struct TestFunc { name string; external bool; }
 func (b *Build) LoadTestPackage(location string, harnessDirectory string) bool {
     path := canonicalLocation(b, location);
     if (path == "") return false;
+    setSumRoot(b, path);
+    // The test driver resolves import paths to directories before loading them.
+    // A cached package under test still uses the invoking project's checksums.
+    if (!useTestProjectSum(b)) return false;
     b.testDirectory = path;
     b.harnessDirectory = harnessDirectory;
     internal := loadDirectory(b, path);
@@ -605,6 +616,24 @@ func (b *Build) LoadTestPackage(location string, harnessDirectory string) bool {
     return b.errors == 0;
 }
 
+func useTestProjectSum(b *Build) bool {
+    if (b.sumRoot == "") return true;
+    cacheDir, configured := ModuleCacheDir();
+    if (!configured) return true;
+    cache, ok := util.Realpath(cacheDir);
+    if (!ok || !pathPrefix(b.sumRoot, cache) || b.sumRoot == cache) return true;
+    project := b.FindModule(util.Getcwd());
+    if (NilModule(project) || project.root == b.sumRoot) return true;
+
+    spec := b.sumRoot[len(cache) + 1:];
+    at := strings.LastIndexByte(spec, '@');
+    if (at < 0) return true;
+    _, errMsg := VerifyCachedModule(project.root, spec[0:at], spec[at + 1:], cache);
+    if (errMsg != "") { error(b, b.sumRoot, errMsg); return false; }
+    b.sumRoot = project.root;
+    return true;
+}
+
 // PackageTestPath gives the module-qualified display path of a location.
 func (b *Build) PackageTestPath(location string) string {
     path, ok := util.Realpath(location);
@@ -620,6 +649,7 @@ func (b *Build) PackageTestLocation(location string) string {
     path, ok := util.Realpath(location);
     if (ok) return path;
     cwd := util.Getcwd();
+    setSumRoot(b, cwd);
     m := b.FindModule(cwd);
     if (!NilModule(m) && m.path != "" && pathPrefix(location, m.path)) {
         r, rok := util.Realpath(m.root + location[len(m.path):]);

@@ -49,7 +49,7 @@ __thread int64_t oc_in_defer;
 
 #define FORWARD_BIT ((int64_t)1 << 40)
 
-static void oc_trace(const char *header, int64_t site, OcFrame *from);
+static void oc_trace(const char *header, size_t length, int64_t site, OcFrame *from);
 void oc_panic(OcArr *msg, int64_t site);
 
 /* ---------------- memory ---------------- */
@@ -138,7 +138,9 @@ void oc_trap(void) { __builtin_trap(); }
 #define ARR_HDR 32
 static OcArr *arr_make(int64_t len, int64_t cap, int64_t es) {
     if (len < 0 || cap < 0 || es < 0) __builtin_trap();
-    size_t total = checked_add(ARR_HDR, checked_add(checked_mul((size_t)cap, (size_t)es), 1));
+    size_t payload = 0;
+    if (cap && es) payload = checked_mul(checked_i64_size(cap), checked_i64_size(es));
+    size_t total = checked_add(ARR_HDR, checked_add(payload, 1));
     OcArr *a = oc_alloc_size(total);
     a->len = len; a->cap = cap;
     a->data = (char *)a + ARR_HDR;
@@ -207,8 +209,6 @@ int64_t oc_arr_cap(OcArr *a) { return a ? (a->cap < 0 ? a->len : a->cap) : 0; }
 /* ---------------- bounds and fatal errors ---------------- */
 static void put_bytes(const char *s, size_t n) { while (n) { ssize_t w = write(2, s, n); if (w <= 0) return; s += w; n -= (size_t)w; } }
 static void put(const char *s) { put_bytes(s, strlen(s)); }
-/* Length of the current panic header (messages may contain NUL bytes). */
-static __thread size_t header_length = (size_t)-1;
 static void die(void);
 static void putn(int64_t v) { char b[32]; snprintf(b, sizeof b, "%lld", (long long)v); put(b); }
 static const OcSite *site_of(int64_t id) {
@@ -234,8 +234,8 @@ static void put_snippet(int64_t id) {
 }
 /* Print a diagnostic whose innermost location is 'site', then the call trace
  * from frame 'from' outward. The innermost frame reports 'site'. */
-static void oc_trace(const char *header, int64_t site, OcFrame *from) {
-    if (header_length != (size_t)-1) put_bytes(header, header_length); else put(header);
+static void oc_trace(const char *header, size_t length, int64_t site, OcFrame *from) {
+    if (length != SIZE_MAX) put_bytes(header, length); else put(header);
     put("\n  --> "); put_site(site); put("\n");
     put_snippet(site);
     put("Call trace (most recent call first):\n");
@@ -247,8 +247,7 @@ static void oc_trace(const char *header, int64_t site, OcFrame *from) {
     }
 }
 static void fatal(const char *header, int64_t site) {
-    header_length = (size_t)-1;
-    oc_trace(header, site, oc_top);
+    oc_trace(header, SIZE_MAX, site, oc_top);
     die();
 }
 void oc_bounds(int64_t index, int64_t length, int64_t site) {
@@ -463,6 +462,7 @@ static int wide_byte(const OcType *t, const void *p, int64_t idx, int neg) {
 }
 static int wide_equal(const OcType *ta, const void *a, const OcType *tb, const void *b) {
     int neg_a = wide_is_neg(ta, a), neg_b = wide_is_neg(tb, b);
+    if (neg_a != neg_b) return 0;
     int64_t na = (ta->bits + 7) / 8, nb = (tb->bits + 7) / 8, n = na > nb ? na : nb;
     for (int64_t i = 0; i < n; i++) {
         if (wide_byte(ta, a, i, neg_a) != wide_byte(tb, b, i, neg_b)) return 0;
@@ -578,7 +578,7 @@ static uint64_t hash_number(const OcType *t, const void *p) {
             int top = wide_byte(t, p, used - 1, neg);
             int prev = wide_byte(t, p, used - 2, neg);
             if (neg && top == 0xff && (prev & 0x80)) used--;
-            else if (!neg && top == 0x00 && (!(t->flags & F_SIGNED) || !(prev & 0x80))) used--;
+            else if (!neg && top == 0x00) used--;
             else break;
         }
         uint64_t h = 1469598103934665603ULL ^ (uint64_t)(neg ? 1 : 0);
@@ -1289,6 +1289,7 @@ typedef struct OcPanic {
     struct OcPanic *outer;
     OcArr *msg;
     char *header;
+    size_t header_length;
     OcFrame *deferFrame;
     int recovered, active, returnPanic;
 } OcPanic;
@@ -1328,13 +1329,13 @@ static void die(void) {
     exit(1);
 }
 
-static char *msg_text(OcArr *msg) {
+static char *msg_text(OcArr *msg, size_t *length) {
     int64_t n = alen(msg);
     char *s = xmalloc(checked_add(checked_i64_size(n), 8));
     memcpy(s, "Panic: ", 7);
     if (n) memcpy(s + 7, msg->data, (size_t)n);
     s[7 + n] = 0;
-    header_length = (size_t)n + 7;
+    *length = (size_t)n + 7;
     return s;
 }
 
@@ -1347,9 +1348,9 @@ static int recovery_possible(OcFrame *f) {
     return 0;
 }
 static void unwind(OcArr *msg, int64_t site, OcFrame *start, OcFrame *traceFrom) {
-    char *header = msg_text(msg);
     OcPanic p = {0};
-    p.outer = panicking; p.msg = msg; p.header = header; p.deferFrame = start; p.active = 1;
+    p.header = msg_text(msg, &p.header_length);
+    p.outer = panicking; p.msg = msg; p.deferFrame = start; p.active = 1;
     panicking = &p;
     for (OcFrame *f = start; f; f = f->prev) {
         oc_top = f;
@@ -1374,12 +1375,16 @@ static void unwind(OcArr *msg, int64_t site, OcFrame *start, OcFrame *traceFrom)
         /* the panic continues past this frame: release what it owns */
         if (f->locals && (p.recovered || recovery_possible(f->prev))) drop_locals(f);
     }
-    oc_trace(header, site, traceFrom);
+    oc_trace(p.header, p.header_length, site, traceFrom);
     die();
 }
 void oc_panic(OcArr *msg, int64_t site) {
     OcFrame *f = oc_top;
     unwind(msg, site, f, f);
+}
+_Noreturn void oc_panic_sync_closed(void) {
+    oc_panic(oc_str_c("synchronization object is closed"), oc_top ? oc_top->site : 0);
+    abort();
 }
 void oc_panic_div_zero(int64_t site) { oc_panic(oc_str_c("integer division by zero"), site); }
 void oc_panic_neg_shift(int64_t site) { oc_panic(oc_str_c("negative shift count"), site); }

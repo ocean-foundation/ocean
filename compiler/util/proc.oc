@@ -152,11 +152,17 @@ func RunCapture(argv array<string>) (Status, string) {
     fds: buffer<i32, 2>;
     if (native_pipe((fds)->int) != 0) { s: Status; s.Failed = true; s.Code = 1; return s, ""; }
     SetCloexec(fds[0] -> int);
-    SetCloexec(fds[1] -> int);
+    writer := fds[1] -> int;
+    if (writer <= 2) {
+        // dup2(fd, fd) would leave close-on-exec set on a redirected stream.
+        writer = native_fcntl(writer, MacOS() ? 67 : 1030, 3); // F_DUPFD_CLOEXEC
+        CloseFd(fds[1] -> int);
+        if (writer < 0) { CloseFd(fds[0] -> int); s: Status; s.Failed = true; s.Code = 1; return s, ""; }
+    } else SetCloexec(writer);
     r := NewRedirect();
-    r.stdoutFd = fds[1] -> int; r.stderrFd = fds[1] -> int;
+    r.stdoutFd = writer; r.stderrFd = writer;
     pid := spawn(argv, &r);
-    native_close((fds[1])->int);
+    CloseFd(writer);
     if (pid < 0) { native_close((fds[0])->int); s: Status; s.Failed = true; s.Code = 1; return s, ""; }
     text := readAll(fds[0]);
     native_close((fds[0])->int);

@@ -376,10 +376,10 @@ func ffiCapture(g *Gen, n *ast.Node) []V {
             if (boxedSlot != "" && g.trackTemps) emit(g, "call void @oc_drop(ptr " + boxedSlot + ", ptr " + desc(g, check.DynOf(anyT)) + ")");
             continue;
         }
-        bv := box(g, conv(g, genExpr(g, a), anyT));
+        bv := copyV(g, conv(g, genExpr(g, a), anyT));
         slot := tmp(g);
         emit(g, slot + " = call ptr @oc_arr_push(ptr " + extras + ", i64 16)");
-        emit(g, "store {ptr, ptr} " + bv.r + ", ptr " + slot);
+        store(g, anyT, slot, bv);
     }
     ex := tmp(g); emit(g, ex + " = load ptr, ptr " + extras);
     out.append(mkV(ex, check.DynOf(anyT)));

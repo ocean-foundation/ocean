@@ -190,25 +190,59 @@ int vsnprintf(char *out, size_t size, const char *f, va_list args) {
         while (*f == '-' || *f == '+' || *f == ' ' || *f == '#' || *f == '0') f++;
         if (*f == '*') { (void)va_arg(args, int); f++; }
         else while (*f >= '0' && *f <= '9') f++;
+        int precision = -1;
         if (*f == '.') {
             f++;
-            if (*f == '*') { (void)va_arg(args, int); f++; }
-            else while (*f >= '0' && *f <= '9') f++;
+            if (*f == '*') { precision = va_arg(args, int); f++; }
+            else {
+                precision = 0;
+                while (*f >= '0' && *f <= '9') {
+                    int digit = *f++ - '0';
+                    precision = precision > (INT32_MAX - digit) / 10 ? INT32_MAX : precision * 10 + digit;
+                }
+            }
         }
-        int longs = 0;
-        if (*f == 'h') { f++; if (*f == 'h') f++; }
-        else if (*f == 'j' || *f == 't') { longs = 2; f++; }
-        else { while (*f == 'l' || *f == 'z') { longs++; f++; } }
+        enum { DEFAULT, CHAR, SHORT, LONG, LONG_LONG, INTMAX, SIZE, PTRDIFF } length = DEFAULT;
+        if (*f == 'h') { length = SHORT; f++; if (*f == 'h') { length = CHAR; f++; } }
+        else if (*f == 'l') { length = LONG; f++; if (*f == 'l') { length = LONG_LONG; f++; } }
+        else if (*f == 'j') { length = INTMAX; f++; }
+        else if (*f == 'z') { length = SIZE; f++; }
+        else if (*f == 't') { length = PTRDIFF; f++; }
         if (*f == '%') { put_char(out, size, &len, '%'); continue; }
-        if (*f == 's') { const char *s = va_arg(args, const char *); if (!s) s = "(null)"; while (*s) put_char(out, size, &len, *s++); continue; }
+        if (*f == 's') {
+            const char *s = va_arg(args, const char *);
+            if (!s) s = "(null)";
+            for (size_t i = 0; (precision < 0 || i < (size_t)precision) && s[i]; i++)
+                put_char(out, size, &len, s[i]);
+            continue;
+        }
         if (*f == 'c') { put_char(out, size, &len, (char)va_arg(args, int)); continue; }
         if (*f == 'd' || *f == 'i' || *f == 'u' || *f == 'x' || *f == 'X' || *f == 'o' || *f == 'p') {
             unsigned long long v; int neg = 0;
             if (*f == 'p') v = (uintptr_t)va_arg(args, void *);
             else if (*f == 'd' || *f == 'i') {
-                long long s = longs >= 2 ? va_arg(args, long long) : longs == 1 ? va_arg(args, long) : va_arg(args, int);
+                long long s;
+                switch (length) {
+                case CHAR: s = (signed char)va_arg(args, int); break;
+                case SHORT: s = (short)va_arg(args, int); break;
+                case LONG: s = va_arg(args, long); break;
+                case LONG_LONG: s = va_arg(args, long long); break;
+                case INTMAX: s = va_arg(args, intmax_t); break;
+                case SIZE: case PTRDIFF: s = va_arg(args, ptrdiff_t); break;
+                default: s = va_arg(args, int); break;
+                }
                 if (s < 0) { neg = 1; v = 0ull - (unsigned long long)s; } else v = (unsigned long long)s;
-            } else v = longs >= 2 ? va_arg(args, unsigned long long) : longs == 1 ? va_arg(args, unsigned long) : va_arg(args, unsigned);
+            } else {
+                switch (length) {
+                case CHAR: v = (unsigned char)va_arg(args, int); break;
+                case SHORT: v = (unsigned short)va_arg(args, int); break;
+                case LONG: v = va_arg(args, unsigned long); break;
+                case LONG_LONG: v = va_arg(args, unsigned long long); break;
+                case INTMAX: v = va_arg(args, uintmax_t); break;
+                case SIZE: case PTRDIFF: v = va_arg(args, size_t); break;
+                default: v = va_arg(args, unsigned); break;
+                }
+            }
             unsigned base = (*f == 'x' || *f == 'X' || *f == 'p') ? 16 : (*f == 'o' ? 8 : 10);
             const char *digits_hex = *f == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
             char digits[24]; int k = 0;

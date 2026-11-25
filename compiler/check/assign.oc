@@ -238,7 +238,7 @@ func containsOwned(c *Checker, t *ast.Type, seen *map[string]bool) bool {
     case ast.TK.Tuple:
         for (_, r := range t.results) { if (containsOwned(c, r, seen)) return true; }
     case ast.TK.Struct:
-        for (_, f := range c.FieldsOf(t)) { if (!f.valueParam && containsOwned(c, f.ty, seen)) return true; }
+        for (_, f := range c.FieldsOf(t)) { if (containsOwned(c, f.ty, seen)) return true; }
     case ast.TK.Enum:
         for (_, v := range c.VariantsOf(t)) {
             for (_, pt := range v.types) { if (containsOwned(c, pt, seen)) return true; }

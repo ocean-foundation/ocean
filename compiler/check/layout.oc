@@ -301,7 +301,7 @@ func layoutReady(c *Checker, t *ast.Type, seen *map[string]bool) bool {
     if (sok && sv) return true;
     (*seen)[k] = true;
     switch (t.kind) {
-    case ast.TK.Ptr, ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
+    case ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
         return nilT(t.elem) || layoutReady(c, t.elem, seen);
     case ast.TK.Map:
         return layoutReady(c, t.key, seen) && layoutReady(c, t.elem, seen);
@@ -358,7 +358,7 @@ func checkLayoutWalk(c *Checker, at *ast.Node, t *ast.Type, seen *map[string]boo
         }
     }
     switch (t.kind) {
-    case ast.TK.Ptr, ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
+    case ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
         if (!nilT(t.elem) && checkLayoutWalk(c, at, t.elem, seen)) return true;
     case ast.TK.Map:
         if (checkLayoutWalk(c, at, t.key, seen)) return true;

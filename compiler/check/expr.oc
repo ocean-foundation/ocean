@@ -260,7 +260,11 @@ func memberExpr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
     if (t.kind == ast.TK.Invalid) return tInvalid;
     base := t;
     for (base.kind == ast.TK.Ptr && base.elem.kind == ast.TK.Ptr) base = base.elem;
-    if (base.kind == ast.TK.Ptr) base = base.elem;
+    if (base.kind == ast.TK.Ptr) {
+        base = base.elem;
+        c.CheckLayoutSize(n, base);
+        checkInstanceBitfields(c, n, base);
+    }
     if (base.kind == ast.TK.Null) { err(c, n, "null needs a typed pointer before member access"); return tInvalid; }
     b := Underlying(base);
     // builtin collection fields
@@ -370,6 +374,8 @@ func unaryExpr(c *Checker, n *ast.Node, expected *ast.Type) *ast.Type {
         if (t.kind == ast.TK.Invalid) return t;
         if (t.kind != ast.TK.Ptr) { err(c, n, "cannot dereference value"); return tInvalid; }
         if (t.elem.kind == ast.TK.Void) { err(c, n, "cast a void pointer to a concrete pointer type before dereferencing"); return tInvalid; }
+        c.CheckLayoutSize(n, t.elem);
+        checkInstanceBitfields(c, n, t.elem);
         return t.elem;
     case scanner.Kind.Amp:
         t := valueExpr(c, n.a);
@@ -584,7 +590,9 @@ func binaryTypes(c *Checker, n *ast.Node, op scanner.Kind, ta *ast.Type, tb *ast
 }
 
 func ptrArith(c *Checker, n *ast.Node, p *ast.Type) {
-    if (p.elem.kind == ast.TK.Void) err(c, n, "invalid pointer arithmetic operands");
+    if (p.elem.kind == ast.TK.Void) { err(c, n, "invalid pointer arithmetic operands"); return; }
+    c.CheckLayoutSize(n, p.elem);
+    checkInstanceBitfields(c, n, p.elem);
 }
 
 // collectionAdd types array/dynamic-array concatenation (§9.3.3).
@@ -827,6 +835,7 @@ func checkAddressable(c *Checker, n *ast.Node, mutable bool) bool {
         if (!nilT(at) && at.kind == ast.TK.Map) { err(c, n, "cannot take the address of a map entry"); return false; }
         if (!nilT(at) && Underlying(at).kind == ast.TK.String) { err(c, n, "cannot take a mutable address of an immutable struct parameter or field"); return false; }
         if (!nilT(at) && Underlying(at).kind == ast.TK.Array) return checkAddressable(c, n.a, mutable);
+        if (!nilT(at) && (Underlying(at).kind == ast.TK.Buffer || Underlying(at).kind == ast.TK.Ptr)) return true;
         if (n.a.kind == ast.NK.Member && n.a.sem == ast.Sem.Field && !nilT(n.a.a.ty)) {
             bt := n.a.a.ty;
             if (!nilT(bt) && bt.kind == ast.TK.Ptr) bt = bt.elem;

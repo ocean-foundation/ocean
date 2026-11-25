@@ -45,10 +45,8 @@ func useColor() bool {
     return util.IsTerminal(2);
 }
 
-func appendSanitized(b *util.Buf, s string, keepTab bool, maxBytes int) bool {
-    truncated := false;
-    limit := maxBytes > 0 && len(s) > maxBytes ? maxBytes : len(s);
-    if (maxBytes > 0 && len(s) > maxBytes) truncated = true;
+func appendSanitized(b *util.Buf, s string, keepTab bool) {
+    limit := len(s);
     i := 0;
     for (i < limit) {
         v := (s[i] -> int) & 255;
@@ -70,7 +68,6 @@ func appendSanitized(b *util.Buf, s string, keepTab bool, maxBytes int) bool {
         b.Addc(s[i]);
         i++;
     }
-    return truncated;
 }
 
 func (l *List) Format(d *Diagnostic) string {
@@ -80,13 +77,13 @@ func (l *List) Format(d *Diagnostic) string {
     line := d.line > 0 ? d.line : 1;
     col := d.col > 0 ? d.col : 1;
     b.Add("[");
-    appendSanitized(&b, d.file == "" ? "<source>" : d.file, false, 0);
+    appendSanitized(&b, d.file == "" ? "<source>" : d.file, false);
     b.Add(":").AddInt(line).Add(":").AddInt(col).Add("]: ");
-    appendSanitized(&b, d.phase, false, 0);
+    appendSanitized(&b, d.phase, false);
     b.Add(" ");
-    appendSanitized(&b, d.severity, false, 0);
+    appendSanitized(&b, d.severity, false);
     b.Add(": ");
-    appendSanitized(&b, d.message, false, 0);
+    appendSanitized(&b, d.message, false);
     b.Add("\n");
     text, ok := l.sources[d.file];
     if (ok) b.Add(Snippet(text, line, col));
@@ -108,14 +105,19 @@ func Snippet(text string, line int, col int) string {
     b: util.Buf;
     prefix := " " + strconv.Itoa(line) + " | ";
     b.Add(prefix);
-    trunc := appendSanitized(&b, text[start:end], true, 512);
-    if (trunc) b.Add("...");
+    truncated := end - start > 512;
+    if (truncated) {
+        end = start + 512;
+        // Move the cut back if it lands inside a multibyte character.
+        for (moved := 0; moved < 3 && ((text[end] -> int) & 192) == 128; moved++) end--;
+    }
+    appendSanitized(&b, text[start:end], true);
+    if (truncated) b.Add("...");
     b.Add("\n");
     for (i := 0; i < len(prefix); i++) b.Addc(prefix[i] == '|' ? '|'->i8 : ' '->i8);
     caret := col - 1;
     if (caret < 0) caret = 0;
     if (caret > end - start) caret = end - start;
-    if (caret > 512) caret = 512;
     i := 0;
     for (i < caret) {
         v := (text[start + i] -> int) & 255;

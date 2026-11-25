@@ -598,7 +598,7 @@ func assignExpr(c *Checker, n *ast.Node) *ast.Type {
     expr(c, n.b, tt);
     coerce(c, n.b, tt, n);
     freedReassign(c, target);
-    if (target.kind == ast.NK.Ident && !nilS(target.sym)) target.sym.stackBuf = isStackBufferExpr(n.b);
+    assignStackBuffer(c, target, stackBufferScope(c, n.b));
     return tt;
 }
 
@@ -664,31 +664,39 @@ func multiAssign(c *Checker, n *ast.Node) {
     tts := make([]*ast.Type);
     for (_, t := range targets) {
         if (t.kind == ast.NK.Blank) { tts.append(zero(*ast.Type)); continue; }
-        if (t.kind == ast.NK.Member) {
-            tt := expr(c, t, zero(*ast.Type));
-            if (t.sem == ast.Sem.ArrayData) err(c, n, "array.data copy assignment must be used on its own");
-            tts.append(tt);
-        } else tts.append(expr(c, t, zero(*ast.Type)));
+        c.assignTarget = t.kind == ast.NK.Ident;
+        tt := expr(c, t, zero(*ast.Type));
+        c.assignTarget = false;
+        if (t.kind == ast.NK.Member && t.sem == ast.Sem.ArrayData) err(c, n, "array.data copy assignment must be used on its own");
+        tts.append(tt);
         checkWritable(c, t, "assignment requires a writable value");
     }
     if (len(values) == 1 && len(targets) == 2 && (values[0].kind == ast.NK.Index || values[0].kind == ast.NK.Assert)) {
         vt := commaOk(c, values[0]);
         if (!nilT(tts[0]) && vt.kind != ast.TK.Invalid) { if (!c.Assignable(vt, tts[0])) mismatch(c, n, tts[0], vt); }
         if (!nilT(tts[1]) && !c.Assignable(tBool, tts[1])) mismatch(c, n, tts[1], tBool);
+        for (_, t := range targets) freedReassign(c, t);
         return;
     }
     if (len(values) == 1 && len(targets) > 1) {
         vt := valueExpr(c, values[0]);
         if (vt.kind != ast.TK.Tuple || len(vt.results) != len(targets)) { if (vt.kind != ast.TK.Invalid) err(c, n, "assignment count mismatch"); return; }
         for (i, r := range vt.results) { if (!nilT(tts[i]) && !c.Assignable(r, tts[i])) mismatch(c, n, tts[i], r); }
+        for (_, t := range targets) freedReassign(c, t);
         return;
     }
     if (len(values) != len(targets)) { err(c, n, "assignment count mismatch"); for (_, v := range values) valueExpr(c, v); return; }
+    origins := make([]*ast.Scope);
     for (i, v := range values) {
-        if (nilT(tts[i])) { valueExpr(c, v); continue; }
+        if (nilT(tts[i])) { valueExpr(c, v); origins.append(zero(*ast.Scope)); continue; }
         if (v.kind == ast.NK.Composite && nilN(v.a)) allowContext(c, v);
         expr(c, v, tts[i]);
         coerce(c, v, tts[i], targets[i]);
+        origins.append(stackBufferScope(c, v));
+    }
+    for (i, t := range targets) {
+        freedReassign(c, t);
+        assignStackBuffer(c, t, origins[i]);
     }
 }
 

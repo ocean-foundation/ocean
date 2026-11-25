@@ -455,8 +455,9 @@ An import path `P` from a package in module `M` resolves to the first of:
    root); otherwise the module is resolved from the module cache
    (`$OCEAN_MOD_CACHE`, or `$HOME/.cache/ocean/modules/<module>@<version|latest>`;
    failing if neither is set rather than falling back to `/tmp`) and verified
-   against `ocean.sum` (deterministic SHA-256 checksum over the sorted relative
-   file paths and file contents, excluding `.git/`). Compilation refuses to run
+   against the root project's `ocean.sum` (deterministic SHA-256 checksum over
+   the sorted relative file paths and file contents, excluding `.git/`).
+   Compilation refuses to run
    if any external dependency is missing from the cache, absent from
    `ocean.sum`, or modified since download. The fetched module must contain
    `ocean.mod` declaring the expected name (unless replaced).
@@ -1925,9 +1926,14 @@ executable. File paths are relative to the compiler's working directory.
     sorted relative file paths and contents, excluding `.git/`) in `ocean.sum`.
   - If `<url>` is already declared in `ocean.mod` and no `@version` is passed,
     fetches the version recorded in `ocean.mod` without altering `ocean.mod`.
-  - Bare `ocean fetch` fetches all dependencies declared in `ocean.mod`.
-  - `ocean build`/`check`/`test` verify cached external dependencies against
-    `ocean.sum` and refuse to compile if any dependency is missing or modified.
+  - Bare `ocean fetch` follows the dependency declarations in the root
+    `ocean.mod` and in each dependency's `ocean.mod`. An explicit fetch follows
+    the selected dependency's declarations. Each module's manifest supplies
+    its own dependency versions and replacements. Only the root project's
+    `ocean.sum` records the checksums of fetched dependencies.
+  - `ocean build`/`check`/`test` verify cached external dependencies against the
+    root project's `ocean.sum` and refuse to compile if any dependency is
+    missing or modified.
 - `ocean fix` rewrites the removed postfix type syntax to prefix syntax in place.
   A location is a package directory, an Ocean file (its directory), or `dir/...`
   (every directory below `dir` containing `.oc` files, skipping hidden
@@ -1955,7 +1961,9 @@ executable. File paths are relative to the compiler's working directory.
   calls to the underlying `compilerReflect*`/`compilerThread*` names from any
   other code are errors. In standard-library `threads`, awaited thread records
   are reclaimed (subsequent `await`/`is_done` on that ID returns `-1`), and
-  `Mutex`/`WaitGroup` provide explicit `Destroy()`/`Close()` cleanup.
+  `Mutex`/`WaitGroup` provide explicit `Destroy()`/`Close()` cleanup. Call them
+  after all threads have finished using the object. Closing an already closed
+  object or calling another operation on it panics.
 
 ---
 
