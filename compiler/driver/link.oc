@@ -20,10 +20,10 @@ func generate(p *Program) (string, bool) {
     opts.library = p.isLibrary;
     opts.usesThreads = p.checker.UsesThreads();
     opts.wasm = targetWasm();
-    ir, ok := backend.Generate(p.checker, p.checker.Packages(), p.build.Root(), opts);
-    p.usesFFI = strings.Contains(ir, "@oc_cvar_call(");
-    p.usesCurl = strings.Contains(ir, "@\"curl_") || strings.Contains(ir, "@curl_");
-    return ir, ok;
+    res := backend.GenerateOutput(p.checker, p.checker.Packages(), p.build.Root(), opts);
+    p.usesFFI = res.UsesFFI;
+    p.usesCurl = res.UsesCurl;
+    return res.IR, res.Ok;
 }
 
 func optLevel() string {
@@ -122,10 +122,10 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
         }
         cacheStore(key, obj);
     }
-    staged := output + ".ocean-tmp" + (p.isLibrary ? "" : os.ExeSuffix());
-    if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
+    staged, sok := util.CreateStagingPath(output, p.isLibrary ? 420 : 493);
+    if (!sok) { util.Stderr("could not create output: " + util.OutputError(output, false) + "\n"); util.RemoveAll(dir); return false; }
     args := []string{"clang", obj, "-o", staged};
-    if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
+    if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); util.Remove(staged); return false; }
     ok2 := clangRun(args);
     util.RemoveAll(dir);
     if (!ok2) { util.Remove(staged); return false; }
@@ -165,8 +165,8 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
         util.RemoveAll(dir); return false;
     }
     rts := runtimeSources(p, dir);
-    staged := output + ".ocean-tmp" + (p.isLibrary || targetWasm() ? "" : os.ExeSuffix());
-    if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
+    staged, sok := util.CreateStagingPath(output, p.isLibrary || targetWasm() ? 420 : 493);
+    if (!sok) { util.Stderr("could not create output: " + util.OutputError(output, false) + "\n"); util.RemoveAll(dir); return false; }
     args := []string{"clang", optLevel(), "-w", "-Wno-override-module"};
     if (targetWasm()) {
         args = []string{"clang", "-O1", "-w", "-Wno-override-module"};
@@ -185,22 +185,40 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
             if (strings.HasSuffix(f, ".ll")) cargs.append("-x", "ir");
             else cargs.append("-x", "c");
             cargs.append(f, "-o", obj);
-            if (!clangRun(cargs)) { util.RemoveAll(dir); return false; }
+            if (!clangRun(cargs)) { util.RemoveAll(dir); util.Remove(staged); return false; }
             objs.append(obj);
         }
         largs := objectLinkArgs(staged);
         largs.append(objs...);
-        if (!clangRun(largs)) { util.RemoveAll(dir); return false; }
+        if (!clangRun(largs)) { util.RemoveAll(dir); util.Remove(staged); return false; }
     } else {
         args.append("-x", "ir", irPath, "-x", "c");
         args.append(rts...);
         args.append("-o", staged);
-        if (!targetWasm() && !appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); return false; }
+        if (!targetWasm() && !appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); util.Remove(staged); return false; }
         if (!clangRun(args)) { util.RemoveAll(dir); util.Remove(staged); return false; }
     }
     util.RemoveAll(dir);
     if (!util.Rename(staged, output)) { util.Stderr("could not save output: " + util.OutputError(output, true) + "\n"); util.Remove(staged); return false; }
     return true;
+}
+
+func emitAsmByte(out *util.Buf, ch i8) {
+    v := (ch -> int) & 255;
+    if (ch == '"' || ch == '\\' || v < 32 || v > 126) { (*out).Addc('\\'); (*out).Addc(util.HexDigit(v >> 4)); (*out).Addc(util.HexDigit(v)); }
+    else (*out).Addc(ch);
+}
+
+func hasPrefixAt(s string, i int, p string) bool {
+    if (i + len(p) > len(s)) return false;
+    for (k := 0; k < len(p); k++) { if (s[i + k] != p[k]) return false; }
+    return true;
+}
+
+func isDarwinLocalLabel(line string, c int) bool {
+    return hasPrefixAt(line, c, "L_") || hasPrefixAt(line, c, "Ltmp") || hasPrefixAt(line, c, "LBB") ||
+        hasPrefixAt(line, c, "LCPI") || hasPrefixAt(line, c, "LJTI") || hasPrefixAt(line, c, "Lfunc_") ||
+        hasPrefixAt(line, c, "Lset") || hasPrefixAt(line, c, "l_");
 }
 
 // selfContainedIR merges the runtime into the program module for --emit-llvm.
@@ -212,15 +230,15 @@ func selfContainedIR(p *Program, ir string) (string, bool) {
     cross, _ := util.Getenv("OCEAN_CROSS_TARGET");
     if (cross != "") return ir, true;   // the host-built runtime does not apply
     dir, ok := util.MakeTempDir("ocean-ir-");
-    if (!ok) return ir, true;
+    if (!ok) return "", false;
     out: util.Buf;
     out.Add(ir);
     if (!strings.HasSuffix(ir, "\n")) out.Add("\n");
     for (i, f := range runtimeSources(p, dir)) {
         asmPath := dir + "/rt" + strconv.Itoa(i) + ".s";
-        if (!clangRun([]string{"clang", optLevel(), "-w", "-S", "-g0", "-fno-asynchronous-unwind-tables", "-x", "c", f, "-o", asmPath})) { util.RemoveAll(dir); return ir, true; }
+        if (!clangRun([]string{"clang", optLevel(), "-w", "-S", "-g0", "-fno-asynchronous-unwind-tables", "-x", "c", f, "-o", asmPath})) { util.RemoveAll(dir); return "", false; }
         text, rok := util.ReadFile(asmPath);
-        if (!rok) { util.RemoveAll(dir); return ir, true; }
+        if (!rok) { util.RemoveAll(dir); return "", false; }
         start := 0;
         for (k := 0; k <= len(text); k++) {
             if (k < len(text) && text[k] != '\n') continue;
@@ -228,17 +246,29 @@ func selfContainedIR(p *Program, ir string) (string, bool) {
             start = k + 1;
             if (line == "" || strings.HasPrefix(strings.TrimSpace(line), ".addrsig") || strings.HasPrefix(strings.TrimSpace(line), ".ident")) continue;
             out.Add("module asm \"");
+            inQ := false; escQ := false;
             for (c := 0; c < len(line); c++) {
                 ch := line[c];
-                // local labels are renamed per unit so they cannot collide
-                if (ch == '.' && c + 1 < len(line) && line[c + 1] == 'L' && (c == 0 || !labelChar(line[c - 1]))) {
-                    out.Add(".Locrt").Add(strconv.Itoa(i)).Add("_");
-                    c++;
+                if (inQ) {
+                    if (escQ) escQ = false;
+                    else if (ch == '\\') escQ = true;
+                    else if (ch == '"') inQ = false;
+                    emitAsmByte(&out, ch);
                     continue;
                 }
-                v := (ch -> int) & 255;
-                if (ch == '"' || ch == '\\' || v < 32 || v > 126) { out.Addc('\\'); out.Addc(util.HexDigit(v >> 4)); out.Addc(util.HexDigit(v)); }
-                else out.Addc(ch);
+                if (ch == '"') { inQ = true; emitAsmByte(&out, ch); continue; }
+                // local labels are renamed per unit so they cannot collide
+                if (c == 0 || !labelChar(line[c - 1])) {
+                    if (ch == '.' && c + 1 < len(line) && line[c + 1] == 'L') {
+                        out.Add(".Locrt").Add(strconv.Itoa(i)).Add("_");
+                        c++;
+                        continue;
+                    }
+                    if (util.MacOS() && isDarwinLocalLabel(line, c)) {
+                        out.Add("Locrt").Add(strconv.Itoa(i)).Add("_");
+                    }
+                }
+                emitAsmByte(&out, ch);
             }
             out.Add("\"\n");
         }
@@ -263,7 +293,8 @@ func emitAndLink(p *Program, o *BuildOptions) int {
     if (!ok) return 1;
     if (o.emit) {
         out := o.output == "" ? "a.ll" : o.output;
-        full, _ := selfContainedIR(p, ir);
+        full, sok := selfContainedIR(p, ir);
+        if (!sok) { util.Stderr("ocean: could not assemble self-contained IR\n"); return 1; }
         if (!util.WriteFile(out, full)) { util.Stderr("ocean: could not save IR\n"); return 1; }
         return 0;
     }

@@ -60,17 +60,22 @@ func funcBody(c *Checker, body *ast.Node, f *FuncCtx) {
 
 // predeclare makes block-level type declarations visible throughout the block.
 func predeclare(c *Checker, stmts []*ast.Node) {
+    localSyms := make([]*ast.Symbol);
     for (_, st := range stmts) {
         if (st.kind == ast.NK.Struct || st.kind == ast.NK.Enum || st.kind == ast.NK.Interface || st.kind == ast.NK.TypeDecl) {
             s := newSym(c, declKind(c, st), st.name, st);
             s.local = true; s.scope = c.scope;
             st.sym = s;
             declare(c, s, st);
+            localSyms.append(s);
         }
     }
-    for (_, st := range stmts) {
-        if (!nilS(st.sym) && st.sym.local && (st.kind == ast.NK.Struct || st.kind == ast.NK.Enum || st.kind == ast.NK.Interface || st.kind == ast.NK.TypeDecl)) {
-            resolveSymType(c, st.sym);
+    for (_, s := range localSyms) resolveSymType(c, s);
+    checkValueCycles(c, localSyms);
+    for (_, s := range localSyms) {
+        if (!nilT(s.ty) && s.ty.kind != ast.TK.Family) {
+            c.CheckLayoutSize(s.node, s.ty);
+            checkInstanceBitfields(c, s.node, s.ty);
         }
     }
 }
@@ -158,6 +163,7 @@ func stmt(c *Checker, n *ast.Node) {
         c.fn.gotos.append(n);
         c.jumps[nodeKey(n)] = jumpInfo(c);
     case ast.NK.Fallthrough:
+        if (!n.flag2) err(c, n, "fallthrough must end a non-final switch case");
     case ast.NK.Asm: asmStmt(c, n);
     case ast.NK.Func:
         err(c, n, "nested named function declarations are not supported; assign a function literal to a variable");
@@ -189,9 +195,27 @@ func declareLocal(c *Checker, id *ast.Node, t *ast.Type) {
     s := newSym(c, ast.SK.Var, id.name, id);
     s.ty = t;
     id.sym = s; id.ty = t;
+    c.CheckLayoutSize(id, t);
     checkInstanceBitfields(c, id, t);
     declRef(c, id.src, id.line, id.col, s, t);
     declare(c, s, id);
+}
+
+func isStackBufferExpr(n *ast.Node) bool {
+    if (nilN(n)) return false;
+    switch (n.kind) {
+    case ast.NK.Ident:
+        return !nilS(n.sym) && n.sym.stackBuf;
+    case ast.NK.Composite:
+        return !nilT(n.ty) && Underlying(n.ty).kind == ast.TK.Buffer;
+    case ast.NK.TBuffer:
+        return true;
+    case ast.NK.Zero:
+        return !nilT(n.ty) && Underlying(n.ty).kind == ast.TK.Buffer && Underlying(n.ty).len > 0;
+    case ast.NK.Ternary:
+        return isStackBufferExpr(n.b) || isStackBufferExpr(n.c);
+    }
+    return false;
 }
 
 // localVar checks `names : [Type] [= values]`.
@@ -233,7 +257,11 @@ func localVar(c *Checker, n *ast.Node) {
                 for (_, f := range c.FieldsOf(t)) { if (f.valueParam) { err(c, n, "struct with parameters requires an initializer"); break; } }
             }
             if (t.kind == ast.TK.Family) err(c, n, "struct literals require concrete type arguments");
-            for (_, id := range names) declareLocal(c, id, t);
+            for (_, id := range names) {
+                declareLocal(c, id, t);
+                u := Underlying(t);
+                if (!nilS(id.sym) && u.kind == ast.TK.Buffer && (u.len > 0 || u.len == -1)) id.sym.stackBuf = true;
+            }
             return;
         }
         if (t.kind == ast.TK.Buffer && t.len == -1) err(c, n, "runtime-sized buffers cannot have initializers");
@@ -254,7 +282,14 @@ func localVar(c *Checker, n *ast.Node) {
                 coerce(c, v, t, n);
             }
         }
-        for (_, id := range names) declareLocal(c, id, t);
+        u := Underlying(t);
+        for (i, id := range names) {
+            declareLocal(c, id, t);
+            if (!nilS(id.sym)) {
+                if (u.kind == ast.TK.Buffer && u.len > 0 && i < len(values) && values[i].kind != ast.NK.Call && values[i].kind != ast.NK.Cast) id.sym.stackBuf = true;
+                else if (i < len(values) && isStackBufferExpr(values[i])) id.sym.stackBuf = true;
+            }
+        }
         return;
     }
     // inferred
@@ -276,7 +311,7 @@ func localVar(c *Checker, n *ast.Node) {
     types := make([]*ast.Type);
     for (_, v := range values) {
         t := valueExpr(c, v);
-        if (t.kind == ast.TK.Null) { err(c, n, "null requires an explicit pointer type"); t = tInvalid; }
+        if (t.kind == ast.TK.Null) { err(c, n, "null requires an explicit nullable type"); t = tInvalid; }
         if (t.kind == ast.TK.Void) { err(c, n, "function returns no value"); t = tInvalid; }
         if (t.kind == ast.TK.Tuple) { err(c, n, len(values) == 1 ? "initializer count mismatch" : "multiple-return call must be the only expression in a value list"); t = tInvalid; }
         if (v.kind == ast.NK.Member && (v.sem == ast.Sem.Method || v.sem == ast.Sem.IfaceMethod)) { err(c, v, "bound method values are not supported"); t = tInvalid; }
@@ -285,7 +320,10 @@ func localVar(c *Checker, n *ast.Node) {
         if ((v.sem == ast.Sem.TypeName) && (v.kind == ast.NK.Ident || v.kind == ast.NK.Member || v.kind == ast.NK.Inst)) { err(c, v, "a type is not a value; use T{...}, zero(T), or [n]T to construct one"); t = tInvalid; }
         types.append(t);
     }
-    for (i, id := range names) declareLocal(c, id, types[i]);
+    for (i, id := range names) {
+        declareLocal(c, id, types[i]);
+        if (!nilS(id.sym) && isStackBufferExpr(values[i])) id.sym.stackBuf = true;
+    }
 }
 
 // multiValue types the single value supplying several names: a call or comma-ok form.
@@ -336,7 +374,7 @@ func switchStmt(c *Checker, n *ast.Node) {
         if (tag.kind == ast.TK.Enum) { }
     }
     c.fn.switchDepth++;
-    for (_, cl := range n.list) {
+    for (ci, cl := range n.list) {
         for (_, e := range cl.list) {
             if (nilT(tag)) { condition(c, e); continue; }
             et := expr(c, e, tag);
@@ -346,6 +384,11 @@ func switchStmt(c *Checker, n *ast.Node) {
             }
             if (isUntyped(et)) { coerce(c, e, tag, e); continue; }
             if (!c.Assignable(et, tag) && !comparable(c, e, tag, et)) mismatch(c, e, tag, et);
+        }
+        if (ci < len(n.list) - 1) {
+            last := -1;
+            for (k := 0; k < len(cl.list2); k++) { if (cl.list2[k].kind != ast.NK.Empty) last = k; }
+            if (last >= 0 && cl.list2[last].kind == ast.NK.Fallthrough) cl.list2[last].flag2 = true;
         }
         push(c);
         predeclare(c, cl.list2);
@@ -473,6 +516,9 @@ func returnStmt(c *Checker, n *ast.Node) {
     results := c.fn.results;
     if (len(n.list) == 0) {
         if (len(results) > 0 && len(c.fn.named) == 0) err(c, n, "return count mismatch: Expected " + itoa(len(results)) + " return values, but got 0.");
+        for (_, ns := range c.fn.named) {
+            if (ns.stackBuf) { warn(c, n, "returning stack-allocated buffer escapes its enclosing scope"); break; }
+        }
         return;
     }
     if (len(n.list) == 1 && len(results) > 1) {
@@ -500,6 +546,7 @@ func returnStmt(c *Checker, n *ast.Node) {
     for (i, v := range n.list) {
         expr(c, v, results[i]);
         coerce(c, v, results[i], v);
+        if (isStackBufferExpr(v)) warn(c, v, "returning stack-allocated buffer escapes its enclosing scope");
     }
 }
 
@@ -650,26 +697,76 @@ func checkGoto(c *Checker, g *ast.Node, label *ast.Node) {
     gi := gj.idx[k];
     if (top.kind != ast.NK.Block || gi >= li) return;
     for (j := gi + 1; j < li; j++) {
-        if (top.list[j].kind == ast.NK.VarDecl) { gotoErr(c, g, "goto cannot jump over a variable declaration"); return; }
+        st := top.list[j];
+        for (st.kind == ast.NK.Labeled || st.kind == ast.NK.Forward) st = st.a;
+        if (st.kind == ast.NK.VarDecl) { gotoErr(c, g, "goto cannot jump over a variable declaration"); return; }
     }
 }
 
-// checkInstanceBitfields validates bitfields of a generic struct instance whose
-// field types come from type arguments (ocean-c reports these while lowering).
+// checkInstanceBitfields validates bitfields of generic struct instances whose
+// field types come from type arguments at all nesting depths.
 func checkInstanceBitfields(c *Checker, at *ast.Node, t *ast.Type) {
     if (nilT(t)) return;
-    u := Underlying(t);
-    if (u.kind != ast.TK.Struct || len(u.args) == 0) return;
-    for (_, f := range c.FieldsOf(u)) {
-        if (f.bits <= 0) continue;
-        ft := Underlying(f.ty);
-        msg := "";
-        if (ft.kind != ast.TK.Int && ft.kind != ast.TK.Bool) msg = "bitfield requires an integer or bool type";
-        else if ((ft.kind == ast.TK.Int && f.bits > ft.bits) || (ft.kind == ast.TK.Bool && f.bits > 1)) msg = "bitfield size exceeds its type width";
-        if (msg != "") {
-            c.errors++;
-            c.diags.Error(nilSrc(at.src) ? "<source>" : at.src.path, at.line, at.col, "backend", msg);
-            return;
+    seen: map[string]bool;
+    checkInstanceBitfieldsWalk(c, at, t, &seen);
+}
+
+func checkInstanceBitfieldsWalk(c *Checker, at *ast.Node, t *ast.Type, seen *map[string]bool) bool {
+    if (nilT(t)) return false;
+    switch (t.kind) {
+    case ast.TK.Invalid, ast.TK.Void, ast.TK.Bool, ast.TK.Int, ast.TK.Float, ast.TK.String, ast.TK.Null, ast.TK.Param, ast.TK.Family, ast.TK.UntypedInt, ast.TK.UntypedFloat:
+        return false;
+    }
+    k := TypeKey(t);
+    sv, sok := (*seen)[k];
+    if (sok && sv) return false;
+    (*seen)[k] = true;
+    switch (t.kind) {
+    case ast.TK.Ptr, ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
+        return !nilT(t.elem) && checkInstanceBitfieldsWalk(c, at, t.elem, seen);
+    case ast.TK.Map:
+        return checkInstanceBitfieldsWalk(c, at, t.key, seen) || checkInstanceBitfieldsWalk(c, at, t.elem, seen);
+    case ast.TK.Tuple, ast.TK.Func:
+        for (_, p := range t.params) { if (checkInstanceBitfieldsWalk(c, at, p, seen)) return true; }
+        for (_, r := range t.results) { if (checkInstanceBitfieldsWalk(c, at, r, seen)) return true; }
+        return false;
+    case ast.TK.Union, ast.TK.Interface:
+        for (_, term := range t.terms) { if (checkInstanceBitfieldsWalk(c, at, term, seen)) return true; }
+        return false;
+    case ast.TK.Named:
+        if (!nilS(t.sym) && t.sym.state != 2) return false;
+        u := Underlying(t);
+        return u != t && checkInstanceBitfieldsWalk(c, at, u, seen);
+    case ast.TK.Enum:
+        if (!nilS(t.sym) && t.sym.state != 2) return false;
+        for (_, a := range t.args) { if (checkInstanceBitfieldsWalk(c, at, a, seen)) return true; }
+        for (_, v := range c.VariantsOf(t)) {
+            for (_, pt := range v.types) { if (checkInstanceBitfieldsWalk(c, at, pt, seen)) return true; }
+            for (_, pf := range v.fields) { if (checkInstanceBitfieldsWalk(c, at, pf.ty, seen)) return true; }
+            if (!nilT(v.fixedType) && checkInstanceBitfieldsWalk(c, at, v.fixedType, seen)) return true;
+        }
+        return false;
+    case ast.TK.Struct:
+        if (!nilS(t.sym) && t.sym.state != 2) return false;
+        for (_, a := range t.args) { if (checkInstanceBitfieldsWalk(c, at, a, seen)) return true; }
+        if (len(t.args) > 0) {
+            for (_, f := range c.FieldsOf(t)) {
+                if (f.bits <= 0) continue;
+                ft := Underlying(f.ty);
+                if (ft.kind == ast.TK.Param) continue;
+                msg := "";
+                if (ft.kind != ast.TK.Int && ft.kind != ast.TK.Bool) msg = "bitfield requires an integer or bool type";
+                else if ((ft.kind == ast.TK.Int && f.bits > ft.bits) || (ft.kind == ast.TK.Bool && f.bits > 1)) msg = "bitfield size exceeds its type width";
+                if (msg != "") {
+                    c.errors++;
+                    c.diags.Error(nilSrc(at.src) ? "<source>" : at.src.path, at.line, at.col, "backend", msg);
+                    return true;
+                }
+            }
+        }
+        for (_, f := range c.FieldsOf(t)) {
+            if (!f.valueParam && checkInstanceBitfieldsWalk(c, at, f.ty, seen)) return true;
         }
     }
+    return false;
 }

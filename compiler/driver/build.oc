@@ -71,7 +71,8 @@ func buildPackage(o *BuildOptions) int {
     if (o.check) {
         failed := checkBackend(prog);
         if (!failed && prog.build.HasTestSources(o.location)) {
-            harness, _ := util.MakeTempDir(".ocean-check-harness-");
+            harness, hok := util.MakeTempDir(".ocean-check-harness-");
+            if (!hok) { util.Stderr("ocean: temporary directory\n"); return 1; }
             tdiags := newDiags();
             tprog := Frontend(o.location, true, harness, tdiags);
             failed = tprog.fatal || !tprog.ok;

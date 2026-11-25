@@ -62,6 +62,14 @@ func expr(p *Parser) *ast.Node {
 }
 
 func assignExpr(p *Parser) *ast.Node {
+    p.depth++;
+    if (p.depth > 400) { err(p, "Parser nesting limit exceeded"); p.depth--; return node(p, ast.NK.Bad); }
+    n := assignExpr1(p);
+    p.depth--;
+    return n;
+}
+
+func assignExpr1(p *Parser) *ast.Node {
     lhs := ternary(p);
     if (isAssignOp(tk(p))) {
         n := nodeAt(p, ast.NK.Assign, lhs);
@@ -77,6 +85,14 @@ func assignExpr(p *Parser) *ast.Node {
 }
 
 func ternary(p *Parser) *ast.Node {
+    p.depth++;
+    if (p.depth > 400) { err(p, "Parser nesting limit exceeded"); p.depth--; return node(p, ast.NK.Bad); }
+    n := ternary1(p);
+    p.depth--;
+    return n;
+}
+
+func ternary1(p *Parser) *ast.Node {
     c := binary(p, 1);
     if (!is(p, scanner.Kind.Question)) return c;
     n := nodeAt(p, ast.NK.Ternary, c);
@@ -99,6 +115,14 @@ func ternary(p *Parser) *ast.Node {
 func additive(p *Parser) *ast.Node { return binary(p, 9); }
 
 func binary(p *Parser, minPrec int) *ast.Node {
+    p.depth++;
+    if (p.depth > 400) { err(p, "Parser nesting limit exceeded"); p.depth--; return node(p, ast.NK.Bad); }
+    n := binary1(p, minPrec);
+    p.depth--;
+    return n;
+}
+
+func binary1(p *Parser, minPrec int) *ast.Node {
     lhs := unary(p);
     for (!p.failed) {
         op := tk(p);
@@ -124,7 +148,7 @@ func unary(p *Parser) *ast.Node {
         n.op = k;
         next(p);
         p.depth++;
-        if (p.depth > 2000) { err(p, "Parser nesting limit exceeded"); return n; }
+        if (p.depth > 400) { err(p, "Parser nesting limit exceeded"); p.depth--; return n; }
         n.a = unary(p);
         p.depth--;
         return finish(p, n);
@@ -147,6 +171,9 @@ func followsTypeArgs(p *Parser) bool {
 }
 
 func tryTypeArgs(p *Parser) ([]*ast.Node, bool) {
+    key := trialKey(p.pos, p.split, 1);
+    ft, fok := p.failedTrials[key];
+    if (fok && ft) return make([]*ast.Node), false;
     m := save(p);
     p.trial++;
     args := typeArgs(p);
@@ -154,6 +181,7 @@ func tryTypeArgs(p *Parser) ([]*ast.Node, bool) {
     p.trial--;
     if (ok) return args, true;
     restore(p, m);
+    p.failedTrials[key] = true;
     return args, false;
 }
 
@@ -180,6 +208,14 @@ func compositeAllowed(p *Parser, n *ast.Node) bool {
 }
 
 func postfix(p *Parser, n *ast.Node) *ast.Node {
+    p.depth++;
+    if (p.depth > 400) { err(p, "Parser nesting limit exceeded"); p.depth--; return n; }
+    res := postfix1(p, n);
+    p.depth--;
+    return res;
+}
+
+func postfix1(p *Parser, n *ast.Node) *ast.Node {
     for (!p.failed) {
         k := tk(p);
         if (k == scanner.Kind.Dot) {
@@ -217,7 +253,16 @@ func postfix(p *Parser, n *ast.Node) *ast.Node {
             if (p.fix && fixEligible(p, n)) {
                 st := indexOfNodeStart(p, n);
                 r := legacy.TypeRewrite(&p.toks, st, p.src.text, true);
-                if (r.ok) { recordFix(p, st, r); continue; }
+                if (r.ok) {
+                    recordFix(p, st, r);
+                    if (is(p, scanner.Kind.LBrace)) {
+                        c := nodeAt(p, ast.NK.Composite, n);
+                        c.a = n;
+                        c.list = compositeBody(p);
+                        return finish(p, c);
+                    }
+                    return n;
+                }
             }
             if (peek(p, 1) == scanner.Kind.RBrack) {
                 r := legacy.TypeRewrite(&p.toks, indexOfNodeStart(p, n), p.src.text, true);
@@ -348,6 +393,14 @@ func castTarget(p *Parser) *ast.Node {
 }
 
 func compositeBody(p *Parser) []*ast.Node {
+    p.depth++;
+    if (p.depth > 400) { err(p, "Parser nesting limit exceeded"); p.depth--; return make([]*ast.Node); }
+    out := compositeBody1(p);
+    p.depth--;
+    return out;
+}
+
+func compositeBody1(p *Parser) []*ast.Node {
     out := make([]*ast.Node);
     next(p); // {
     keyed := 0; positional := 0;
@@ -382,6 +435,9 @@ func parenType(p *Parser, k ast.NK, msg string) *ast.Node {
 
 // tryParenType checks whether '(' Type ')' follows the current name.
 func tryParenType(p *Parser) bool {
+    key := trialKey(p.pos, p.split, 2);
+    ft, fok := p.failedTrials[key];
+    if (fok && ft) return false;
     m := save(p);
     next(p); next(p);
     p.trial++;
@@ -389,10 +445,19 @@ func tryParenType(p *Parser) bool {
     ok := !p.failed && is(p, scanner.Kind.RParen);
     p.trial--;
     restore(p, m);
+    if (!ok) p.failedTrials[key] = true;
     return ok;
 }
 
 func primary(p *Parser) *ast.Node {
+    p.depth++;
+    if (p.depth > 400) { err(p, "Parser nesting limit exceeded"); p.depth--; return node(p, ast.NK.Bad); }
+    n := primary1(p);
+    p.depth--;
+    return n;
+}
+
+func primary1(p *Parser) *ast.Node {
     k := tk(p);
     t := tok(p);
     if (k == scanner.Kind.Ident) {
@@ -402,7 +467,7 @@ func primary(p *Parser) *ast.Node {
             if (name == "new" && tryParenType(p)) return parenType(p, ast.NK.New, "Expected right paren");
             if (name == "make") {
                 k2 := peek(p, 2);
-                if (k2 == scanner.Kind.LBrack || (k2 == scanner.Kind.Ident && peekTok(p, 2).text == "map")) return parenType(p, ast.NK.Make, "Expected right paren");
+                if (k2 == scanner.Kind.LBrack || (k2 == scanner.Kind.Ident && peekTok(p, 2).text == "map" && peek(p, 3) == scanner.Kind.LBrack)) return parenType(p, ast.NK.Make, "Expected right paren");
             }
             if (name == "sizeof") {
                 n := node(p, ast.NK.Sizeof);
@@ -419,21 +484,26 @@ func primary(p *Parser) *ast.Node {
             }
         }
         if (name == "buffer" && peek(p, 1) == scanner.Kind.Lt) {
-            m := save(p);
-            p.trial++;
-            b := bufferType(p, true);
-            ok := !p.failed && (!ast.Nil(b.b) || is(p, scanner.Kind.LBrace));
-            p.trial--;
-            if (ok) {
-                if (is(p, scanner.Kind.LBrace)) {
-                    c := nodeAt(p, ast.NK.Composite, b);
-                    c.a = b;
-                    c.list = compositeBody(p);
-                    return finish(p, c);
+            bkey := trialKey(p.pos, p.split, 3);
+            ft, fok := p.failedTrials[bkey];
+            if (!(fok && ft)) {
+                m := save(p);
+                p.trial++;
+                b := bufferType(p, true);
+                ok := !p.failed && (!ast.Nil(b.b) || is(p, scanner.Kind.LBrace));
+                p.trial--;
+                if (ok) {
+                    if (is(p, scanner.Kind.LBrace)) {
+                        c := nodeAt(p, ast.NK.Composite, b);
+                        c.a = b;
+                        c.list = compositeBody(p);
+                        return finish(p, c);
+                    }
+                    return b;
                 }
-                return b;
+                restore(p, m);
+                p.failedTrials[bkey] = true;
             }
-            restore(p, m);
         }
         if (name == "map" && peek(p, 1) == scanner.Kind.LBrack) {
             mt := mapType(p);
@@ -511,7 +581,6 @@ func primary(p *Parser) *ast.Node {
         return ty;
     }
     if (k == scanner.Kind.KwVarint || k == scanner.Kind.KwVaruint) return varintType(p);
-    if (k == scanner.Kind.Star && false) return typ(p);
     if (k == scanner.Kind.LBrack) {
         ty := arrayType(p);
         if (is(p, scanner.Kind.LBrace)) {
@@ -523,7 +592,6 @@ func primary(p *Parser) *ast.Node {
         if (ty.kind == ast.NK.TSlice && p.depth == 0) { /* checked by caller context */ }
         return ty;
     }
-    if (k == scanner.Kind.KwFunc) return funcType(p);
     if (k == scanner.Kind.EOF) { err(p, "Unexpected end of file, expected expression"); return node(p, ast.NK.Bad); }
     err(p, "Unexpected '" + (k == scanner.Kind.Ident ? t.text : scanner.KindText(k)) + "', expected expression");
     return node(p, ast.NK.Bad);

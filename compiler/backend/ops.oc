@@ -49,6 +49,84 @@ func arithOp(op scanner.Kind, t *ast.Type) string {
 }
 
 // scalarArith applies a numeric operator after converting both operands to rt.
+func intDivRem(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, rt *ast.Type) V {
+    u := under(rt);
+    ty := ll(u);
+    x := numConv(g, a.r, a.t, rt);
+    y := numConv(g, b.r, b.t, rt);
+    z := tmp(g); emit(g, z + " = icmp eq " + ty + " " + y + ", 0");
+    zLbl := newLabel(g, "divzero"); okLbl := newLabel(g, "divnz");
+    condBr(g, z, zLbl, okLbl);
+    label(g, zLbl);
+    if (!nilN(n)) setSite(g, n);
+    emit(g, "call void @oc_panic_div_zero(i64 " + itoa(site(g, n)) + ")");
+    term(g, "unreachable");
+    label(g, okLbl);
+    if (!u.signed) {
+        r := tmp(g);
+        emit(g, r + " = " + (op == scanner.Kind.Slash ? "udiv " : "urem ") + ty + " " + x + ", " + y);
+        return mkV(r, rt);
+    }
+    minV := tmp(g);
+    emit(g, minV + " = shl " + ty + " 1, " + itoa(u.bits - 1));
+    isMin := tmp(g); emit(g, isMin + " = icmp eq " + ty + " " + x + ", " + minV);
+    isNeg1 := tmp(g); emit(g, isNeg1 + " = icmp eq " + ty + " " + y + ", -1");
+    ovf := tmp(g); emit(g, ovf + " = and i1 " + isMin + ", " + isNeg1);
+    ovfLbl := newLabel(g, "divovf"); doLbl := newLabel(g, "divdo"); doneLbl := newLabel(g, "divdone");
+    condBr(g, ovf, ovfLbl, doLbl);
+    label(g, ovfLbl);
+    ovfRes := op == scanner.Kind.Slash ? minV : "0";
+    ovfEnd := g.fn.cur;
+    br(g, doneLbl);
+    label(g, doLbl);
+    q := tmp(g);
+    emit(g, q + " = " + (op == scanner.Kind.Slash ? "sdiv " : "srem ") + ty + " " + x + ", " + y);
+    doEnd := g.fn.cur;
+    br(g, doneLbl);
+    label(g, doneLbl);
+    r := tmp(g);
+    emit(g, r + " = phi " + ty + " [" + ovfRes + ", %" + ovfEnd + "], [" + q + ", %" + doEnd + "]");
+    return mkV(r, rt);
+}
+
+func intShift(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, rt *ast.Type) V {
+    u := under(rt);
+    ub := under(b.t);
+    if (ub.signed) {
+        neg := tmp(g); emit(g, neg + " = icmp slt " + ll(ub) + " " + b.r + ", 0");
+        negLbl := newLabel(g, "shneg"); posLbl := newLabel(g, "shpos");
+        condBr(g, neg, negLbl, posLbl);
+        label(g, negLbl);
+        if (!nilN(n)) setSite(g, n);
+        emit(g, "call void @oc_panic_neg_shift(i64 " + itoa(site(g, n)) + ")");
+        term(g, "unreachable");
+        label(g, posLbl);
+    }
+    cw := ub.bits > u.bits ? ub.bits : u.bits;
+    if (cw < 64) cw = 64;
+    cwTy := "i" + itoa(cw);
+    bCmp := b.r;
+    if (ub.bits < cw) { bCmp = tmp(g); emit(g, bCmp + " = zext " + ll(ub) + " " + b.r + " to " + cwTy); }
+    big := tmp(g); emit(g, big + " = icmp uge " + cwTy + " " + bCmp + ", " + itoa(u.bits));
+    zeroLbl := newLabel(g, "shbig"); shLbl := newLabel(g, "shok"); doneLbl := newLabel(g, "shdone");
+    condBr(g, big, zeroLbl, shLbl);
+    label(g, zeroLbl);
+    zEnd := g.fn.cur;
+    br(g, doneLbl);
+    label(g, shLbl);
+    x := numConv(g, a.r, a.t, rt);
+    shAmt := bCmp;
+    if (cw != u.bits) { shAmt = tmp(g); emit(g, shAmt + " = trunc " + cwTy + " " + bCmp + " to " + ll(u)); }
+    q := tmp(g);
+    emit(g, q + " = " + arithOp(op, rt) + " " + ll(u) + " " + x + ", " + shAmt);
+    shEnd := g.fn.cur;
+    br(g, doneLbl);
+    label(g, doneLbl);
+    r := tmp(g);
+    emit(g, r + " = phi " + ll(u) + " [0, %" + zEnd + "], [" + q + ", %" + shEnd + "]");
+    return mkV(r, rt);
+}
+
 func scalarArith(g *Gen, op scanner.Kind, a V, b V, rt *ast.Type) V {
     x := numConv(g, a.r, a.t, rt);
     y := numConv(g, b.r, b.t, rt);
@@ -62,7 +140,7 @@ func genBinary(g *Gen, n *ast.Node, t *ast.Type) V {
     if (op == scanner.Kind.AndAnd || op == scanner.Kind.OrOr) return genLogical(g, n);
     a := genExpr(g, n.a);
     // keep the left value stable against side effects of the right operand
-    if ((isAgg(a.t) || under(a.t).kind == ast.TK.Dyn || under(a.t).kind == ast.TK.Map) && !a.fresh && !pureExpr(n.b)) a = copyV(g, a);
+    if ((isAgg(a.t) || owned(g, a.t)) && !a.fresh && !pureExpr(n.b)) a = copyV(g, a);
     b := genExpr(g, n.b);
     return binaryValues(g, n, op, a, b, t);
 }
@@ -99,12 +177,11 @@ func binaryValues(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, t *ast.Type) V
             emit(g, x + " = ptrtoint ptr " + a.r + " to i64");
             emit(g, y + " = ptrtoint ptr " + b.r + " to i64");
             emit(g, d + " = sub i64 " + x + ", " + y);
-            emit(g, r + " = sdiv exact i64 " + d + ", " + itoa(sizeOf(g, ua.elem)));
+            emit(g, r + " = sdiv i64 " + d + ", " + itoa(sizeOf(g, ua.elem)));
             return mkV(r, check.TInt());
         }
         p := ua.kind == ast.TK.Ptr ? a : b;
         k := ua.kind == ast.TK.Ptr ? b : a;
-        checkNullPtr(g, p.r);
         idx := intConv(g, k.r, k.t, check.TInt());
         if (op == scanner.Kind.Minus) { neg := tmp(g); emit(g, neg + " = sub i64 0, " + idx); idx = neg; }
         return mkV(gepDyn(g, p.r, idx, sizeOf(g, under(p.t).elem)), p.t);
@@ -112,13 +189,8 @@ func binaryValues(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, t *ast.Type) V
     // collections
     if (op == scanner.Kind.Plus && (under(t).kind == ast.TK.Dyn || under(t).kind == ast.TK.Array)) return concatValues(g, a, b, t);
     rt := t;
-    if (op == scanner.Kind.Shl || op == scanner.Kind.Shr) {
-        x := numConv(g, a.r, a.t, rt);
-        y := numConv(g, b.r, b.t, rt);
-        r := tmp(g);
-        emit(g, r + " = " + arithOp(op, rt) + " " + ll(rt) + " " + x + ", " + y);
-        return mkV(r, rt);
-    }
+    if ((op == scanner.Kind.Slash || op == scanner.Kind.Percent) && under(rt).kind == ast.TK.Int) return intDivRem(g, n, op, a, b, rt);
+    if (op == scanner.Kind.Shl || op == scanner.Kind.Shr) return intShift(g, n, op, a, b, rt);
     return scalarArith(g, op, a, b, rt);
 }
 
@@ -203,7 +275,7 @@ func equality(g *Gen, n *ast.Node, a V, b V) string {
             r := tmp(g); emit(g, r + " = icmp eq ptr " + d + ", null"); return r;
         }
         if (uo.kind == ast.TK.Enum) { t := tagOf(g, o); r := tmp(g); emit(g, r + " = icmp eq i64 " + t + ", 0"); return r; }
-        r := tmp(g); emit(g, r + " = icmp eq ptr " + o.r + ", " + nullPtr()); return r;
+        r := tmp(g); emit(g, r + " = icmp eq ptr " + o.r + ", null"); return r;
     }
     // interface on either side: compare boxes
     if (ua.kind == ast.TK.Interface || ua.kind == ast.TK.Union || ub.kind == ast.TK.Interface || ub.kind == ast.TK.Union) {
@@ -374,7 +446,7 @@ func unionBinary(g *Gen, n *ast.Node, op scanner.Kind, a V, b V, t *ast.Type) V 
             if (isCmp(op)) rt = check.TBool();
             else if (under(x).kind == ast.TK.String || under(x).kind == ast.TK.Dyn || under(x).kind == ast.TK.Array) rt = x;
             else rt = g.c.NumericResult(x, y);
-            res := binaryValues(g, zero(*ast.Node), op, av, bv, rt);
+            res := binaryValues(g, n, op, av, bv, rt);
             stored := res;
             if (resultBoxed) stored = conv(g, res, t);
             else stored = conv(g, res, t);

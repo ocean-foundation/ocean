@@ -32,7 +32,7 @@ func indexAddr(g *Gen, n *ast.Node, readOnly bool) string {
     if (readOnly && u.kind != ast.TK.Buffer && mayMutate(n.b, rootSym(n.a))) base = copyV(g, base);
     idxV := genExpr(g, n.b);
     idx := intConv(g, idxV.r, idxV.t, check.TInt());
-    if (u.kind == ast.TK.Buffer) return gepDyn(g, base.r, idx, sizeOf(g, u.elem));
+    if (u.kind == ast.TK.Buffer || u.kind == ast.TK.Ptr) return gepDyn(g, base.r, idx, sizeOf(g, u.elem));
     elem := u.kind == ast.TK.String ? check.TI8() : u.elem;
     length := collectionLen(g, base);
     boundsCheck(g, n, idx, length);
@@ -165,6 +165,107 @@ func assignTo(g *Gen, target *ast.Node, v V) V {
     return stored(val);
 }
 
+struct LPath {
+    node *ast.Node;
+    parent *LPath;
+    fixedPtr string;
+    keyVal V;
+    keySlot string;
+    isMap bool;
+    isBit bool;
+    isIdx bool;
+    bitSt *ast.Type;
+}
+
+func nilLPath(lp *LPath) bool { return (lp -> int) == 0; }
+
+func captureLPath(g *Gen, n *ast.Node) *LPath {
+    lp := new(LPath);
+    lp.node = n;
+    switch (n.kind) {
+    case ast.NK.Ident:
+        lp.fixedPtr = storageOf(g, n.sym, n);
+        return lp;
+    case ast.NK.Unary:
+        if (n.op == scanner.Kind.Star) lp.fixedPtr = genExpr(g, n.a).r;
+        return lp;
+    case ast.NK.Member:
+        if (n.sem == ast.Sem.PkgMember) {
+            lp.fixedPtr = globalRef(g, n.sym);
+            return lp;
+        }
+        lp.isBit = n.sem == ast.Sem.BitField;
+        bt := typeOf(g, n.a);
+        if (bt.kind == ast.TK.Ptr) {
+            v := derefChain(g, genExpr(g, n.a));
+            lp.fixedPtr = v.r;
+            lp.bitSt = v.t.elem;
+        } else if (isLvalue(n.a)) {
+            lp.parent = captureLPath(g, n.a);
+            lp.bitSt = bt;
+        } else {
+            v := genExpr(g, n.a);
+            lp.fixedPtr = spill(g, v);
+            lp.bitSt = bt;
+        }
+        return lp;
+    case ast.NK.Index:
+        lp.isIdx = true;
+        bt := typeOf(g, n.a);
+        u := under(bt);
+        if (isLvalue(n.a)) lp.parent = captureLPath(g, n.a);
+        else lp.fixedPtr = spill(g, genExpr(g, n.a));
+        if (u.kind == ast.TK.Map) {
+            lp.isMap = true;
+            k := genAs(g, n.b, u.key);
+            kp := alloca(g, u.key);
+            store(g, u.key, kp, k);
+            lp.keyVal = k;
+            lp.keySlot = kp;
+        } else {
+            idxV := genExpr(g, n.b);
+            lp.keyVal = mkV(intConv(g, idxV.r, idxV.t, check.TInt()), check.TInt());
+        }
+        return lp;
+    }
+    lp.fixedPtr = addrOf(g, n);
+    return lp;
+}
+
+func resolveLPath(g *Gen, lp *LPath) string {
+    if (!lp.isIdx && !lp.isBit) {
+        if (lp.node.kind == ast.NK.Member && lp.node.sem == ast.Sem.Field) {
+            base := lp.fixedPtr != "" ? lp.fixedPtr : resolveLPath(g, lp.parent);
+            return gep(g, base, fieldPlace(g, lp.bitSt, lp.node.ival).offset);
+        }
+        return lp.fixedPtr;
+    }
+    if (lp.isBit) return lp.fixedPtr != "" ? lp.fixedPtr : resolveLPath(g, lp.parent);
+    slot := lp.fixedPtr != "" ? lp.fixedPtr : resolveLPath(g, lp.parent);
+    bt := typeOf(g, lp.node.a);
+    u := under(bt);
+    if (lp.isMap) {
+        r := tmp(g);
+        emit(g, r + " = call ptr @oc_map_slot(ptr " + slot + ", ptr " + lp.keySlot + ", ptr " + desc(g, u.key) + ", ptr " + desc(g, u.elem) + ")");
+        return r;
+    }
+    bv := load(g, bt, slot);
+    if (u.kind == ast.TK.Buffer || u.kind == ast.TK.Ptr) return gepDyn(g, bv.r, lp.keyVal.r, sizeOf(g, u.elem));
+    elem := u.kind == ast.TK.String ? check.TI8() : u.elem;
+    length := collectionLen(g, bv);
+    boundsCheck(g, lp.node, lp.keyVal.r, length);
+    return gepDyn(g, arrayDataPtr(g, bv), lp.keyVal.r, sizeOf(g, elem));
+}
+
+func dropLPath(g *Gen, lp *LPath) {
+    if (nilLPath(lp)) return;
+    if (lp.isMap && lp.keySlot != "" && g.trackTemps) {
+        mt := under(typeOf(g, lp.node.a));
+        if (owned(g, mt.key)) emit(g, "call void @oc_drop(ptr " + lp.keySlot + ", ptr " + desc(g, mt.key) + ")");
+    }
+    if (!nilLPath(lp.parent)) dropLPath(g, lp.parent);
+}
+
 func genAssign(g *Gen, n *ast.Node) V {
     target := n.a;
     tt := typeOf(g, target);
@@ -191,10 +292,10 @@ func genAssign(g *Gen, n *ast.Node) V {
     op := check.CompoundBase(n.op);
     u := under(tt);
     if (op == scanner.Kind.Plus && (u.kind == ast.TK.Dyn || u.kind == ast.TK.Array) && (u.kind == ast.TK.Dyn)) {
-        // dynamic-array += element or array (snapshot first: self-concatenation is allowed)
-        slot := lvalueAddr(g, target);
-        if (mayMutate(n.b, rootSym(target))) {
-            // the left value is read before the right operand runs
+        // dynamic-array += element or array (snapshot first so RHS mutations cannot UAF)
+        lp := captureLPath(g, target);
+        slot := resolveLPath(g, lp);
+        if (mayMutate(n.b, rootSym(target)) || target.kind != ast.NK.Ident) {
             cur := tmp(g); emit(g, cur + " = load ptr, ptr " + slot);
             cp := tmp(g); emit(g, cp + " = call ptr @oc_arr_copy(ptr " + cur + ", ptr " + desc(g, u.elem) + ")");
             snap := alloca(g, check.TVoidPtr());
@@ -203,31 +304,42 @@ func genAssign(g *Gen, n *ast.Node) V {
             appendSide(g, snap, bv, isArraySide(g, bv.t, tt), u.elem);
             homCheckSlot(g, tt, snap, "0", "9223372036854775807");
             nv := tmp(g); emit(g, nv + " = load ptr, ptr " + snap);
-            dst := lvalueAddr(g, target);
+            dst := resolveLPath(g, lp);
             if (g.trackTemps) emit(g, "call void @oc_drop(ptr " + dst + ", ptr " + desc(g, tt) + ")");
             emit(g, "store ptr " + nv + ", ptr " + dst);
-            return load(g, tt, dst);
+            res := load(g, tt, dst);
+            dropLPath(g, lp);
+            return res;
         }
         bv := copyV(g, genExpr(g, n.b));
         appendSide(g, slot, bv, isArraySide(g, bv.t, tt), u.elem);
         homCheckSlot(g, tt, slot, "0", "9223372036854775807");
-        return load(g, tt, slot);
+        res := load(g, tt, slot);
+        dropLPath(g, lp);
+        return res;
     }
     if (target.kind == ast.NK.Member && target.sem == ast.Sem.BitField) {
-        p, st := structBase(g, target.a);
-        place := fieldPlace(g, st, target.ival);
+        lp := captureLPath(g, target);
+        p := resolveLPath(g, lp);
+        place := fieldPlace(g, lp.bitSt, target.ival);
         old := readBitfield(g, p, place, tt);
         b := genExpr(g, n.b);
         r := binaryValues(g, n, op, old, b, binaryResult(g, op, old.t, b.t, tt));
-        return writeBitfield(g, p, place, tt, conv(g, r, tt));
+        p2 := resolveLPath(g, lp);
+        res := writeBitfield(g, p2, place, tt, conv(g, r, tt));
+        dropLPath(g, lp);
+        return res;
     }
-    p := lvalueAddr(g, target);
-    old := load(g, tt, p);
-    if (isAgg(tt)) old = copyV(g, old);
+    lp := captureLPath(g, target);
+    p1 := resolveLPath(g, lp);
+    old := load(g, tt, p1);
+    if (isAgg(tt) || owned(g, tt)) old = copyV(g, old);
     b := genExpr(g, n.b);
     r := binaryValues(g, n, op, old, b, binaryResult(g, op, old.t, b.t, tt));
     val := copyV(g, conv(g, r, tt));
-    storeReplace(g, tt, p, val);
+    p2 := resolveLPath(g, lp);
+    storeReplace(g, tt, p2, val);
+    dropLPath(g, lp);
     return stored(val);
 }
 
@@ -297,17 +409,30 @@ func genMultiAssign(g *Gen, n *ast.Node) {
             vals.append(x);
         }
     }
-    // compute every simple target address before storing anything
-    addrs := make([]string);
-    for (_, t := range targets) {
-        simple := t.kind != ast.NK.Blank && !(t.kind == ast.NK.Member && t.sem == ast.Sem.BitField) &&
-            !(t.kind == ast.NK.Index && under(typeOf(g, t.a)).kind == ast.TK.Map);
-        addrs.append(simple ? addrOf(g, t) : "");
-    }
+    paths := make([]*LPath);
+    for (_, t := range targets) paths.append(t.kind == ast.NK.Blank ? zero(*LPath) : captureLPath(g, t));
     for (i, t := range targets) {
-        if (addrs[i] == "") { assignTo(g, t, vals[i]); continue; }
+        if (t.kind == ast.NK.Blank) continue;
+        lp := paths[i];
         tt := typeOf(g, t);
-        storeReplace(g, tt, addrs[i], conv(g, vals[i], tt));
+        if (lp.isBit) {
+            p := resolveLPath(g, lp);
+            writeBitfield(g, p, fieldPlace(g, lp.bitSt, t.ival), tt, conv(g, vals[i], tt));
+        } else if (lp.isMap) {
+            slot := !nilLPath(lp.parent) ? resolveLPath(g, lp.parent) : lp.fixedPtr;
+            mt := under(typeOf(g, t.a));
+            val := conv(g, vals[i], mt.elem);
+            emit(g, "call void @oc_map_set(ptr " + slot + ", ptr " + lp.keySlot + ", ptr " + spill(g, val) + ", ptr " + desc(g, mt.key) + ", ptr " + desc(g, mt.elem) + ")");
+        } else {
+            p := resolveLPath(g, lp);
+            val := conv(g, vals[i], tt);
+            storeReplace(g, tt, p, val);
+            if (lp.isIdx && homogeneous(typeOf(g, t.a))) {
+                cslot := !nilLPath(lp.parent) ? resolveLPath(g, lp.parent) : lp.fixedPtr;
+                homCheckSlot(g, typeOf(g, t.a), cslot, lp.keyVal.r, "1");
+            }
+        }
+        dropLPath(g, lp);
     }
 }
 
@@ -344,14 +469,32 @@ func genDataAssign(g *Gen, n *ast.Node) {
         label(g, ok);
         vals := make([]V);
         for (_, e := range v.list) vals.append(genAs(g, e.b, elem));
+        if (g.trackTemps && owned(g, elem)) emit(g, "call void @oc_data_destroy_elems(ptr " + data + ", i64 " + length + ", ptr " + desc(g, elem) + ")");
         bytes := tmp(g); emit(g, bytes + " = mul i64 " + length + ", " + itoa(es));
         emit(g, "call void @llvm.memset.p0.i64(ptr " + data + ", i8 0, i64 " + bytes + ", i1 false)");
+        if (needsInit(g, elem)) {
+            idx := alloca(g, check.TInt());
+            emit(g, "store i64 " + cnt + ", ptr " + idx);
+            zh := newLabel(g, "dzh"); zb := newLabel(g, "dzb"); zd := newLabel(g, "dzd");
+            br(g, zh);
+            label(g, zh);
+            iv := tmp(g); emit(g, iv + " = load i64, ptr " + idx);
+            zc := tmp(g); emit(g, zc + " = icmp ult i64 " + iv + ", " + length);
+            condBr(g, zc, zb, zd);
+            label(g, zb);
+            zeroInto(g, elem, gepDyn(g, data, iv, es));
+            iv2 := tmp(g); emit(g, iv2 + " = add i64 " + iv + ", 1");
+            emit(g, "store i64 " + iv2 + ", ptr " + idx);
+            br(g, zh);
+            label(g, zd);
+        }
         for (i, x := range vals) store(g, elem, gep(g, data, i * es), x);
+        if (homogeneous(u)) emit(g, "call void @oc_hom_range(ptr " + arrV.r + ", i64 0, i64 " + length + ")");
         return;
     }
     src := genExpr(g, v);
-    bytes := tmp(g); emit(g, bytes + " = mul i64 " + length + ", " + itoa(es));
-    emit(g, "call void @llvm.memmove.p0.p0.i64(ptr " + data + ", ptr " + src.r + ", i64 " + bytes + ", i1 false)");
+    emit(g, "call void @oc_data_copy_elems(ptr " + data + ", ptr " + src.r + ", i64 " + length + ", ptr " + desc(g, elem) + ")");
+    if (homogeneous(u)) emit(g, "call void @oc_hom_range(ptr " + arrV.r + ", i64 0, i64 " + length + ")");
 }
 
 // ---- composite literals ----
@@ -413,14 +556,11 @@ func genComposite(g *Gen, n *ast.Node, t *ast.Type) V {
             for (i, e := range n.list) store(g, u.elem, gep(g, p, i * es), genAs(g, e.b, u.elem));
             return freshV(g, p, t);
         }
-        // literal storage behind an unsized buffer view: owned by a hidden
-        // per-site slot (replaced on re-evaluation, released at function exit)
-        blkT := check.ArrayOf(u.elem, -2);
-        hidden := alloca(g, blkT);
-        if (g.trackTemps) { emit(g, "call void @oc_drop(ptr " + hidden + ", ptr " + desc(g, blkT) + ")"); ownLocal(g, hidden, blkT); }
+        // literal storage behind an unsized buffer view: block-scoped (released at block exit)
         blk := tmp(g);
         emit(g, blk + " = call ptr @oc_block_new(i64 " + itoa(len(n.list)) + ", ptr " + desc(g, u.elem) + ")");
-        emit(g, "store ptr " + blk + ", ptr " + hidden);
+        if (needsInit(g, u.elem)) emit(g, "call void @oc_init_block(ptr " + blk + ", ptr " + desc(g, u.elem) + ")");
+        emit(g, "call void @oc_buf_push(ptr " + scopeBufList(g) + ", ptr " + blk + ", ptr " + desc(g, u.elem) + ")");
         r := gep(g, blk, g.c.ArrayDataOffset(u.elem));
         for (i, e := range n.list) store(g, u.elem, gep(g, r, i * es), genAs(g, e.b, u.elem));
         return mkV(r, t);
@@ -469,10 +609,6 @@ func genCast(g *Gen, n *ast.Node, t *ast.Type) V {
     v := genExpr(g, n.a);
     st := v.t;
     us := under(st); ut := under(t);
-    if (n.sem == ast.Sem.CallIface) {
-        // a boxed primitive cast: assert the dynamic type, then convert
-        return assertValue(g, n, v, t, false);
-    }
     if (check.Identical(st, t)) return v;
     if ((us.kind == ast.TK.Int || us.kind == ast.TK.Float || us.kind == ast.TK.Bool) && (ut.kind == ast.TK.Int || ut.kind == ast.TK.Float || ut.kind == ast.TK.Bool)) {
         return mkV(numConv(g, v.r, us, ut), t);
@@ -491,6 +627,14 @@ func genCast(g *Gen, n *ast.Node, t *ast.Type) V {
     if ((us.kind == ast.TK.String && ut.kind == ast.TK.Dyn) || (us.kind == ast.TK.Dyn && ut.kind == ast.TK.String)) return conv(g, v, t);
     if (ut.kind == ast.TK.Array && ut.len >= 0 && (us.kind == ast.TK.Buffer || us.kind == ast.TK.Ptr)) {
         // view raw storage as an array value: build a block copy of N elements
+        if (ut.len > 0) {
+            isNull := tmp(g); emit(g, isNull + " = icmp eq ptr " + v.r + ", null");
+            bad := newLabel(g, "castnull"); ok := newLabel(g, "castnn");
+            condBr(g, isNull, bad, ok);
+            label(g, bad);
+            term(g, "call void @llvm.trap()\n  unreachable");
+            label(g, ok);
+        }
         p := alloca(g, t);
         zeroInto(g, t, p);
         memcpy(g, gep(g, p, g.c.ArrayDataOffset(ut.elem)), v.r, ut.len * sizeOf(g, ut.elem));
@@ -499,11 +643,19 @@ func genCast(g *Gen, n *ast.Node, t *ast.Type) V {
     }
     if (ut.kind == ast.TK.Array && ut.len < 0 && (us.kind == ast.TK.Buffer || us.kind == ast.TK.Ptr) && !nilN(t.lenNode)) {
         cnt := genAs(g, t.lenNode, check.TInt());
+        gt0 := tmp(g); emit(g, gt0 + " = icmp sgt i64 " + cnt.r + ", 0");
+        isZero := tmp(g); emit(g, isZero + " = icmp eq ptr " + v.r + ", null");
+        badNull := tmp(g); emit(g, badNull + " = and i1 " + gt0 + ", " + isZero);
+        bad := newLabel(g, "rcastnull"); ok := newLabel(g, "rcastnn");
+        condBr(g, badNull, bad, ok);
+        label(g, bad);
+        term(g, "call void @llvm.trap()\n  unreachable");
+        label(g, ok);
         blk := tmp(g);
         emit(g, blk + " = call ptr @oc_block_new(i64 " + cnt.r + ", ptr " + desc(g, ut.elem) + ")");
         bytes := tmp(g); emit(g, bytes + " = mul i64 " + cnt.r + ", " + itoa(sizeOf(g, ut.elem)));
         emit(g, "call void @llvm.memcpy.p0.p0.i64(ptr " + gep(g, blk, g.c.ArrayDataOffset(ut.elem)) + ", ptr " + v.r + ", i64 " + bytes + ", i1 false)");
-        if (owned(g, ut.elem)) { sl := spill(g, mkV(blk, t)); emit(g, "call void @oc_copy(ptr " + sl + ", ptr " + sl + ", ptr " + desc(g, t) + ")"); r2 := tmp(g); emit(g, r2 + " = load ptr, ptr " + sl); blk = r2; }
+        if (owned(g, ut.elem)) emit(g, "call void @oc_block_copy_elems(ptr " + blk + ", ptr " + desc(g, ut.elem) + ")");
         return freshV(g, blk, t);
     }
     if (us.kind == ast.TK.Union && (ut.kind == ast.TK.Int || ut.kind == ast.TK.Float || ut.kind == ast.TK.Bool)) return assertValue(g, n, v, t, true);

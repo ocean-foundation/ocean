@@ -91,8 +91,10 @@ func offsetAt(text string, line int, character int) int {
         n := 1;
         if (c >= 240) n = 4; else if (c >= 224) n = 3; else if (c >= 192) n = 2;
         units += n == 4 ? 2 : 1;
+        if (i + n > len(text)) { i = len(text); break; }
         i += n;
     }
+    if (i > len(text)) return len(text);
     return i;
 }
 
@@ -204,8 +206,8 @@ func typeDefinition(a *Analysis, off int) string {
     if (nilR(r)) return "[]";
     t := refType(a, r);
     if (nilT(t)) return "[]";
-    for (t.kind == ast.TK.Ptr) t = t.elem;
-    if (ast.NilSym(t.sym) || t.sym.builtin) return "[]";
+    for (!nilT(t) && t.kind == ast.TK.Ptr) t = t.elem;
+    if (nilT(t) || ast.NilSym(t.sym) || t.sym.builtin) return "[]";
     d, ok := a.checker.Index().decls["s" + strconv.Itoa(t.sym.id)];
     if (!ok) return "[]";
     return "[" + refLocation(a, d) + "]";

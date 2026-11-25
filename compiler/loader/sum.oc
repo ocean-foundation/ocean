@@ -1,0 +1,173 @@
+package loader;
+import "github.com/ocean-foundation/ocean/compiler/util";
+import "path" as filepath;
+import "strings";
+
+struct SumEntry {
+    module string;
+    version string;
+    hash string;
+}
+
+// ModuleCacheDir returns the external module cache root without falling back to /tmp.
+func ModuleCacheDir() (string, bool) {
+    c, ok := util.Getenv("OCEAN_MOD_CACHE");
+    if (ok) {
+        if (c == "") return "", false;
+        return util.NormalizePath(c), true;
+    }
+    home, hok := util.Getenv("HOME");
+    if ((!hok || home == "") && util.Windows()) home, hok = util.Getenv("LOCALAPPDATA");
+    if (!hok || home == "") return "", false;
+    return util.NormalizePath(home) + "/.cache/ocean/modules", true;
+}
+
+func SumPath(modRoot string) string { return modRoot + "/ocean.sum"; }
+
+func ReadSum(modRoot string) ([]SumEntry, bool) {
+    entries := make([]SumEntry);
+    if (modRoot == "") return entries, false;
+    path := SumPath(modRoot);
+    if (!util.IsRegular(path)) return entries, false;
+    text, ok := util.ReadFile(path);
+    if (!ok) return entries, false;
+    for (_, line := range strings.Split(text, "\n")) {
+        parts := words(line);
+        if (len(parts) == 0) continue;
+        if (len(parts) != 3) continue;
+        e: SumEntry;
+        e.module = parts[0];
+        e.version = parts[1];
+        e.hash = parts[2];
+        entries.append(e);
+    }
+    return entries, true;
+}
+
+func WriteSum(modRoot string, entries []SumEntry) bool {
+    if (modRoot == "") return false;
+    sorted := make([]SumEntry);
+    sorted.append(entries...);
+    for (i := 1; i < len(sorted); i++) {
+        for (j := i; j > 0; j--) {
+            a := sorted[j - 1]; b := sorted[j];
+            if (a.module < b.module || (a.module == b.module && a.version <= b.version)) break;
+            sorted[j - 1] = b; sorted[j] = a;
+        }
+    }
+    b: util.Buf;
+    for (_, e := range sorted) {
+        b.Add(e.module).Add(" ").Add(e.version).Add(" ").Add(e.hash).Add("\n");
+    }
+    return util.WriteFileAtomic(SumPath(modRoot), b.String(), 420);
+}
+
+func findSumHash(entries []SumEntry, modPath string, ver string) (string, bool) {
+    for (_, e := range entries) {
+        if (e.module == modPath && e.version == ver) return e.hash, true;
+    }
+    return "", false;
+}
+
+func setSumEntry(entries *[]SumEntry, modPath string, ver string, hash string) {
+    for (i := 0; i < len(*entries); i++) {
+        if ((*entries)[i].module == modPath && (*entries)[i].version == ver) {
+            (*entries)[i].hash = hash;
+            return;
+        }
+    }
+    e: SumEntry;
+    e.module = modPath; e.version = ver; e.hash = hash;
+    (*entries).append(e);
+}
+
+// VerifyCachedModule ensures a dependency exists in the cache and matches ocean.sum.
+func VerifyCachedModule(modRoot string, modPath string, version string, cacheDir string) (string, string) {
+    if (!ValidModulePath(modPath) || (version != "" && (!ValidModulePath(version) || version[0] == '-'))) {
+        return "", "invalid module path or version";
+    }
+    ver := version == "" ? "latest" : version;
+    dest := cacheDir + "/" + modPath + "@" + ver;
+    if (!util.IsDir(dest)) {
+        spec := modPath + (version != "" ? "@" + version : "");
+        return "", "module " + modPath + "@" + ver + " is not in cache; run `ocean fetch " + spec + "`";
+    }
+    if (modRoot == "") return "", "external dependency " + modPath + " requires ocean.mod and ocean.sum";
+    entries, sumOk := ReadSum(modRoot);
+    if (!sumOk) return "", "missing ocean.sum entry for " + modPath + "@" + ver + "; run `ocean fetch`";
+    expected, found := findSumHash(entries, modPath, ver);
+    if (!found) return "", "missing ocean.sum entry for " + modPath + "@" + ver + "; run `ocean fetch`";
+    actual, hok := util.HashDir(dest);
+    if (!hok) return "", "cannot hash cached module: " + modPath;
+    if (actual != expected) {
+        return "", "checksum mismatch in ocean.sum for " + modPath + "@" + ver + " (expected " + expected + ", got " + actual + ")";
+    }
+    r, rok := util.Realpath(dest);
+    if (!rok) return "", "cannot resolve cached module: " + modPath;
+    return r, "";
+}
+
+// FetchModule clones a dependency with git hooks disabled, verifies or records its
+// SHA-256 digest in ocean.sum, and returns (cachedRoot, hash, errMsg).
+func FetchModule(modRoot string, modPath string, version string) (string, string, string) {
+    if (!ValidModulePath(modPath) || (version != "" && (!ValidModulePath(version) || version[0] == '-'))) {
+        return "", "", "invalid module path or version";
+    }
+    cacheDir, cok := ModuleCacheDir();
+    if (!cok) return "", "", "cannot locate module cache; set OCEAN_MOD_CACHE or HOME";
+    ver := version == "" ? "latest" : version;
+    dest := cacheDir + "/" + modPath + "@" + ver;
+    base := filepath.Dir(dest);
+    if (!util.MkdirAll(base)) return "", "", "cannot create module cache directory: " + base;
+
+    entries, _ := ReadSum(modRoot);
+    if (!util.IsDir(dest)) {
+        tmp, tok := util.MakeTempDirIn(base, ".fetch-");
+        if (!tok) return "", "", "cannot create staging directory in " + base;
+        util.Stderr("ocean: fetching " + modPath + "@" + ver + "\n");
+        prevPrompt, hadPrompt := util.Getenv("GIT_TERMINAL_PROMPT");
+        util.Setenv("GIT_TERMINAL_PROMPT", "0");
+        args := []string{"git", "-c", "core.hooksPath=/dev/null", "clone", "--quiet", "--depth", "1"};
+        if (ver != "latest") { args.append("--branch", ver); }
+        args.append("--", "https://" + modPath, tmp);
+        st := util.Run(args.array());
+        if (hadPrompt) util.Setenv("GIT_TERMINAL_PROMPT", prevPrompt); else util.Unsetenv("GIT_TERMINAL_PROMPT");
+        if (st.Code != 0 || st.Failed) {
+            util.RemoveAll(tmp);
+            return "", "", "module download failed for " + modPath + "@" + ver;
+        }
+        if (!util.Exists(tmp + "/ocean.mod")) {
+            util.RemoveAll(tmp);
+            return "", "", "downloaded module has no ocean.mod: " + modPath;
+        }
+        digest, hok := util.HashDir(tmp);
+        if (!hok) {
+            util.RemoveAll(tmp);
+            return "", "", "cannot compute checksum for " + modPath;
+        }
+        if (modRoot != "") {
+            expected, found := findSumHash(entries, modPath, ver);
+            if (found && expected != digest) {
+                util.RemoveAll(tmp);
+                return "", "", "checksum mismatch with ocean.sum for " + modPath + "@" + ver;
+            }
+        }
+        if (!util.Rename(tmp, dest)) {
+            util.RemoveAll(tmp);
+            if (!util.IsDir(dest)) return "", "", "cannot install downloaded module: " + dest;
+        }
+    }
+    digest, hok := util.HashDir(dest);
+    if (!hok) return "", "", "cannot compute checksum for " + modPath;
+    if (modRoot != "") {
+        expected, found := findSumHash(entries, modPath, ver);
+        if (found && expected != digest) {
+            return "", "", "checksum mismatch with ocean.sum for " + modPath + "@" + ver;
+        }
+        setSumEntry(&entries, modPath, ver, digest);
+        if (!WriteSum(modRoot, entries)) return "", "", "cannot write ocean.sum in " + modRoot;
+    }
+    r, rok := util.Realpath(dest);
+    if (!rok) return "", "", "cannot resolve cached module: " + modPath;
+    return r, digest, "";
+}

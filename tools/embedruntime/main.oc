@@ -10,13 +10,13 @@ func main() int {
     names := []string{"Core", "Threads", "Process", "Ffi", "Wasm"};
     for (i, file := range files) {
         source, ok := util.ReadFile(dir + file);
-        if (!ok || strings.Contains(source, "`")) { util.Stderr("cannot embed " + file + "\n"); return 1; }
+        if (!ok || strings.Contains(source, "`") || strings.Contains(source, "\x00")) { util.Stderr("cannot embed " + file + "\n"); return 1; }
         source = strings.ReplaceAll(source, "\r\n", "\n");
         out += "func " + names[i] + "() string {\n    return `" + source + "`;\n}\n";
         if (i + 1 < len(files)) out += "\n";
     }
     old, ok := util.ReadFile(dir + "source.oc");
     if (ok && old == out) return 0;
-    if (!util.WriteFile(dir + "source.oc", out)) { util.Stderr("cannot write embedded runtime\n"); return 1; }
+    if (!util.WriteFileAtomic(dir + "source.oc", out, 420)) { util.Stderr("cannot write embedded runtime\n"); return 1; }
     return 0;
 }

@@ -51,20 +51,20 @@ func typeDisplay(t *ast.Type) string {
     return check.TypeString(t);
 }
 
-func fieldEntry(g *Gen, name string, t *ast.Type, off int, bitOff int, bits int, vp bool) string {
-    return "{ptr, ptr, i64, i64, i64, i64} {ptr " + cstr(g, name) + ", ptr " + desc(g, t) + ", i64 " + itoa(off) + ", i64 " + itoa(bitOff) + ", i64 " + itoa(bits) + ", i64 " + (vp ? "1" : "0") + "}";
+func fieldEntry(g *Gen, name string, t *ast.Type, off int, bitOff int, bits int, vp bool, unitSize int) string {
+    return "{ptr, ptr, i64, i64, i64, i64, i64} {ptr " + cstr(g, name) + ", ptr " + desc(g, t) + ", i64 " + itoa(off) + ", i64 " + itoa(bitOff) + ", i64 " + itoa(bits) + ", i64 " + (vp ? "1" : "0") + ", i64 " + itoa(unitSize) + "}";
 }
 
 func fieldsArray(g *Gen, name string, fields []*ast.FieldInfo) string {
     if (len(fields) == 0) return "null";
     l := g.c.FieldsLayout("desc" + name, fields);
     b: util.Buf;
-    b.Add(name).Add(" = private constant [").AddInt(len(fields)).Add(" x {ptr, ptr, i64, i64, i64, i64}] [");
+    b.Add(name).Add(" = private constant [").AddInt(len(fields)).Add(" x {ptr, ptr, i64, i64, i64, i64, i64}] [");
     for (i, f := range fields) {
         if (i > 0) b.Add(", ");
         p := l.places[i];
-        if (f.bits > 0) b.Add(fieldEntry(g, f.name, f.ty, p.offset, p.bitOffset, p.bits, f.valueParam));
-        else b.Add(fieldEntry(g, f.name, f.ty, p.offset, 0, 0, f.valueParam));
+        if (f.bits > 0) b.Add(fieldEntry(g, f.name, f.ty, p.offset, p.bitOffset, p.bits, f.valueParam, p.unitSize));
+        else b.Add(fieldEntry(g, f.name, f.ty, p.offset, 0, 0, f.valueParam, 0));
     }
     b.Add("]\n");
     g.globals.AddBuf(&b);

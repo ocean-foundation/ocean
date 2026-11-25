@@ -84,3 +84,41 @@ func TestBinaryFiles(t *testing.T) {
     actual, read = ReadFile(path);
     if (!read || actual != "new") t.Error("replacement contents");
 }
+
+func TestSHA256AndSafety(t *testing.T) {
+    if (SHA256("") != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") t.Error("sha256 empty");
+    if (SHA256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") t.Error("sha256 abc");
+    if (SHA256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") != "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1") t.Error("sha256 two-block");
+
+    nan := 0.0 / 0.0;
+    if (FormatFixed(nan, 2) != "NaN") t.Error("FormatFixed NaN");
+    if (Rel("/", "") != "." || Rel("/", "rel") != "rel" || Rel("/", "/a/b") != "a/b") t.Error("Rel edge cases");
+
+    dir, ok := MakeTempDir("ocean-sha-dir-");
+    if (!ok) t.Fatal("tempdir");
+    defer RemoveAll(dir);
+    MkdirAll(dir + "/.git/objects");
+    WriteFile(dir + "/.git/objects/ignored", "xyz");
+    WriteFile(dir + "/b.oc", "package p;\n");
+    WriteFile(dir + "/a.oc", "func f() {}\n");
+    h1, ok1 := HashDir(dir);
+    WriteFile(dir + "/.git/objects/ignored", "modified");
+    h2, ok2 := HashDir(dir);
+    if (!ok1 || !ok2 || h1 != h2) t.Error("HashDir should ignore .git");
+    WriteFile(dir + "/a.oc", "func g() {}\n");
+    h3, ok3 := HashDir(dir);
+    if (!ok3 || h3 == h1) t.Error("HashDir should detect changes");
+
+    atomTarget := dir + "/atomic.txt";
+    if (!WriteFileAtomic(atomTarget, "hello atomic", 420)) t.Error("WriteFileAtomic");
+    got, gok := ReadFile(atomTarget);
+    if (!gok || got != "hello atomic") t.Error("WriteFileAtomic contents");
+
+    // Verify pid <= 0 checks do not crash or error.
+    Kill(0, 9);
+    Kill(-1, 9);
+    KillGroup(0, 9);
+    KillGroup(-5, 9);
+    done0, _ := WaitNoHang(0);
+    if (done0) t.Error("WaitNoHang(0) must be false");
+}

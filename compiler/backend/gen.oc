@@ -10,7 +10,7 @@ struct V { r string; t *ast.Type; fresh bool; tmp int; }
 
 // Temp is an owned temporary awaiting a move; Local an owned variable slot.
 struct Temp { slot string; t *ast.Type; dead bool; }
-struct Local { slot string; t *ast.Type; }
+struct Local { slot string; t *ast.Type; isBufList bool; }
 
 struct Inst {
     sym *ast.Symbol;       // function or method (nil for literals)
@@ -55,6 +55,8 @@ struct Fn {
     pendingLabel *ast.Node;
     temps []*Temp;
     scopes [][]*Local;
+    scopeBufs []string;
+    fnBufList string;
     allLocals []*Local;
     lastLoop *Loop;
 }
@@ -101,6 +103,9 @@ struct Gen {
     globalUsed map[int]bool;
     ownedMemo map[string]bool;
     initMemo map[string]bool;
+    usesFFI bool;
+    usesCurl bool;
+    satDecls map[string]bool;
 }
 
 struct Matcher { name string; term *ast.Type; tilde bool; }
@@ -241,6 +246,7 @@ func needsInit(g *Gen, t *ast.Type) bool {
     key := check.TypeKey(u);
     v, ok := g.initMemo[key];
     if (ok) return v;
+    g.initMemo[key] = false;
     v = needsInit1(g, u);
     g.initMemo[key] = v;
     return v;
@@ -400,16 +406,23 @@ func dropTemps(g *Gen, mark int, forget bool) {
     if (forget) { for (len(g.fn.temps) > mark) { g.fn.temps[len(g.fn.temps) - 1].dead = true; g.fn.temps.pop(); } }
 }
 
-func pushScope(g *Gen) { g.fn.scopes.append(make([]*Local)); }
+func pushScope(g *Gen) {
+    g.fn.scopes.append(make([]*Local));
+    g.fn.scopeBufs.append("");
+}
 func dropScope(g *Gen, i int) {
     sc := g.fn.scopes[i];
-    for (k := len(sc) - 1; k >= 0; k--) emit(g, "call void @oc_drop(ptr " + sc[k].slot + ", ptr " + desc(g, sc[k].t) + ")");
+    for (k := len(sc) - 1; k >= 0; k--) {
+        if (sc[k].isBufList) emit(g, "call void @oc_buf_drop(ptr " + sc[k].slot + ")");
+        else emit(g, "call void @oc_drop(ptr " + sc[k].slot + ", ptr " + desc(g, sc[k].t) + ")");
+    }
 }
 // popScope releases a block's locals on normal exit. Functions with defers keep
 // them until the epilogue (deferred calls may still refer to them).
 func popScope(g *Gen) {
     if (!g.fn.terminated && !g.fn.hasDefer) dropScope(g, len(g.fn.scopes) - 1);
     g.fn.scopes.pop();
+    if (len(g.fn.scopeBufs) > 0) g.fn.scopeBufs.pop();
 }
 // dropScopesTo releases scopes at depth or deeper (for jumps out of them).
 func dropScopesTo(g *Gen, depth int) {
@@ -421,8 +434,31 @@ func dropScopesTo(g *Gen, depth int) {
 func dropAllLocals(g *Gen) {
     for (k := len(g.fn.allLocals) - 1; k >= 0; k--) {
         l := g.fn.allLocals[k];
-        emit(g, "call void @oc_drop(ptr " + l.slot + ", ptr " + desc(g, l.t) + ")");
+        if (l.isBufList) emit(g, "call void @oc_buf_drop(ptr " + l.slot + ")");
+        else emit(g, "call void @oc_drop(ptr " + l.slot + ", ptr " + desc(g, l.t) + ")");
     }
+}
+func scopeBufList(g *Gen) string {
+    if (len(g.fn.scopeBufs) == 0) {
+        if (g.fn.fnBufList == "") {
+            slot := allocaBytes(g, g.c.PtrSize(), 8);
+            g.fn.allocas.Add("  store ptr null, ptr ").Add(slot).Add("\n");
+            g.fn.fnBufList = slot;
+            l := new(Local); l.slot = slot; l.isBufList = true;
+            g.fn.allLocals.append(l);
+        }
+        return g.fn.fnBufList;
+    }
+    idx := len(g.fn.scopeBufs) - 1;
+    if (g.fn.scopeBufs[idx] == "") {
+        slot := allocaBytes(g, g.c.PtrSize(), 8);
+        g.fn.allocas.Add("  store ptr null, ptr ").Add(slot).Add("\n");
+        g.fn.scopeBufs[idx] = slot;
+        l := new(Local); l.slot = slot; l.isBufList = true;
+        g.fn.allLocals.append(l);
+        g.fn.scopes[idx].append(l);
+    }
+    return g.fn.scopeBufs[idx];
 }
 func ownLocal(g *Gen, slot string, t *ast.Type) {
     if (!g.trackTemps || !owned(g, t)) return;
@@ -597,6 +633,13 @@ func declare(g *Gen, name string, text string) {
     if (ok) return;
     g.decls[name] = text;
     g.declOrder.append(name);
+}
+
+func declareSat(g *Gen, name string, retTy string, argTy string) {
+    _, ok := g.satDecls[name];
+    if (ok) return;
+    g.satDecls[name] = true;
+    declare(g, "@" + name, "declare " + retTy + " @" + name + "(" + argTy + ")");
 }
 
 func fail(g *Gen, n *ast.Node, msg string) {

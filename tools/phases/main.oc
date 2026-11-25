@@ -9,10 +9,16 @@ import "strconv";
 
 func main() int {
     args := os.Args();
+    if (len(args) < 3) {
+        util.Stderr("usage: phases <location> <front|ir>\n");
+        return 1;
+    }
     phase := args[2];
     prog := driver.Frontend(args[1], false, "", driver.NewDiagsQuiet());
+    if (prog.fatal || !prog.ok) return 1;
     if (phase == "front") return 0;
-    ir, _ := driver.Generate(prog);
+    ir, ok := driver.Generate(prog);
+    if (!ok) return 1;
     util.Stdout("ir bytes: " + strconv.Itoa(len(ir)) + "\n");
     return 0;
 }

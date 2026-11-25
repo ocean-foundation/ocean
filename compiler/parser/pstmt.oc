@@ -447,7 +447,7 @@ func asmOperands(p *Parser, n *ast.Node, body *scanner.Token) {
         if (c == '$' && nx == '{') {
             j := i + 2;
             start := j;
-            for (j < len(s) && (s[j] == '_' || (s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= '0' && s[j] <= '9' && j > start) || ((s[j]->int) & 255) >= 128)) j++;
+            for (j < len(s) && (s[j] == '_' || (s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= '0' && s[j] <= '9' && j > start))) j++;
             if (j == start) { errTok(p, body, body.col, "Expected variable name in asm ${name} operand"); return; }
             if (j >= len(s) || s[j] != '}') { errTok(p, body, body.col, "Expected '}' after asm operand name"); return; }
             name := s[start:j];

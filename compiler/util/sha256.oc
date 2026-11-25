@@ -1,0 +1,148 @@
+package util;
+
+import "sort";
+import "strconv";
+
+sha256K := [64]u32{
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+struct Sha256 {
+    h [8]u32;
+    block [64]u8;
+    blen int;
+    total uint;
+}
+
+func rotr32(x u32, n int) u32 {
+    u := n -> u32;
+    return (x >> u) | (x << (32->u32 - u));
+}
+
+func NewSha256() Sha256 {
+    s: Sha256;
+    s.h = [8]u32{
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    };
+    return s;
+}
+
+func (s *Sha256) compress() {
+    w: [64]u32;
+    for (i := 0; i < 16; i++) {
+        j := i * 4;
+        w[i] = ((s.block[j] -> u32) << 24->u32) |
+               ((s.block[j + 1] -> u32) << 16->u32) |
+               ((s.block[j + 2] -> u32) << 8->u32) |
+               (s.block[j + 3] -> u32);
+    }
+    for (i := 16; i < 64; i++) {
+        s0 := rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3->u32);
+        s1 := rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10->u32);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a := s.h[0]; b := s.h[1]; c := s.h[2]; d := s.h[3];
+    e := s.h[4]; f := s.h[5]; g := s.h[6]; h := s.h[7];
+    for (i := 0; i < 64; i++) {
+        s1 := rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+        ch := (e & f) ^ ((~e) & g);
+        t1 := h + s1 + ch + sha256K[i] + w[i];
+        s0 := rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+        maj := (a & b) ^ (a & c) ^ (b & c);
+        t2 := s0 + maj;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    s.h[0] += a; s.h[1] += b; s.h[2] += c; s.h[3] += d;
+    s.h[4] += e; s.h[5] += f; s.h[6] += g; s.h[7] += h;
+}
+
+func (s *Sha256) writeByte(b u8) {
+    s.block[s.blen] = b;
+    s.blen++;
+    if (s.blen == 64) { s.compress(); s.blen = 0; }
+}
+
+func (s *Sha256) WriteString(data string) {
+    n := len(data);
+    s.total += n -> uint;
+    for (i := 0; i < n; i++) s.writeByte(((data[i] -> int) & 255) -> u8);
+}
+
+func (s *Sha256) WriteBytes(b []i8) {
+    n := len(b);
+    s.total += n -> uint;
+    for (i := 0; i < n; i++) s.writeByte(((b[i] -> int) & 255) -> u8);
+}
+
+func (s *Sha256) SumHex() string {
+    copy := *s;
+    bitLen := copy.total * 8->uint;
+    copy.writeByte(128->u8);
+    for (copy.blen != 56) copy.writeByte(0->u8);
+    for (i := 7; i >= 0; i--) {
+        shift := (i * 8) -> uint;
+        copy.writeByte(((bitLen >> shift) & 255->uint) -> u8);
+    }
+    out := "";
+    for (i := 0; i < 8; i++) out += Hex(copy.h[i] -> uint, 8);
+    return out;
+}
+
+func SHA256(data string) string {
+    s := NewSha256();
+    s.WriteString(data);
+    return s.SumHex();
+}
+
+func collectDirFiles(dir string, relPrefix string, files *[]string) bool {
+    entries, ok := ListDir(dir);
+    if (!ok) return false;
+    for (_, name := range entries) {
+        if (name == ".git") continue;
+        full := dir + "/" + name;
+        rel := relPrefix == "" ? name : relPrefix + "/" + name;
+        if (IsSymlink(full)) return false;
+        if (IsDir(full)) {
+            if (!collectDirFiles(full, rel, files)) return false;
+            continue;
+        }
+        if (IsRegular(full)) { (*files).append(rel); continue; }
+        return false;
+    }
+    return true;
+}
+
+// HashDir computes a deterministic SHA-256 digest over sorted relative file
+// paths and file contents under root, excluding .git directories.
+func HashDir(root string) (string, bool) {
+    realRoot, ok := Realpath(root);
+    if (!ok || !IsDir(realRoot)) return "", false;
+    files := make([]string);
+    if (!collectDirFiles(realRoot, "", &files)) return "", false;
+    sort.Strings(&files);
+    st := NewSha256();
+    st.WriteString("ocean-sum-v1\n");
+    for (_, rel := range files) {
+        data, rok := ReadFile(realRoot + "/" + rel);
+        if (!rok) return "", false;
+        st.WriteString("F ");
+        st.WriteString(strconv.Itoa(len(rel)));
+        st.WriteString(":");
+        st.WriteString(rel);
+        st.WriteString("\n");
+        st.WriteString(strconv.Itoa(len(data)));
+        st.WriteString(":");
+        st.WriteString(data);
+        st.WriteString("\n");
+    }
+    return "sha256:" + st.SumHex(), true;
+}

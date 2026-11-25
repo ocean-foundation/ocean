@@ -25,7 +25,7 @@ func (c *Checker) Assignable(a *ast.Type, d *ast.Type) bool {
     if (a.kind == ast.TK.Int && d.kind == ast.TK.Int) return intFits(a, d);
     if (a.kind == ast.TK.Float && d.kind == ast.TK.Float) return a.bits <= d.bits;
     if (a.kind == ast.TK.Null && d.kind == ast.TK.Named) return c.Assignable(a, Underlying(d));
-    if (a.kind == ast.TK.Null) return d.kind == ast.TK.Ptr || d.kind == ast.TK.Interface || IsOptional(d) || (d.kind == ast.TK.Buffer && d.len == -2) || d.kind == ast.TK.Union;
+    if (a.kind == ast.TK.Null) return d.kind == ast.TK.Interface || IsOptional(d) || d.kind == ast.TK.Union;
     if (d.kind == ast.TK.Interface) {
         if (IsAny(d)) return a.kind != ast.TK.Void && a.kind != ast.TK.Tuple;
         if (a.kind == ast.TK.Interface) return true;
@@ -205,6 +205,57 @@ func defaultType(c *Checker, n *ast.Node, t *ast.Type) *ast.Type {
     return t;
 }
 
+func isStringPtr(t *ast.Type) bool {
+    if (nilT(t)) return false;
+    u := Underlying(t);
+    return u.kind == ast.TK.Ptr && !nilT(u.elem) && Underlying(u.elem).kind == ast.TK.String;
+}
+
+func containsOwned(c *Checker, t *ast.Type, seen *map[string]bool) bool {
+    if (nilT(t)) return false;
+    switch (t.kind) {
+    case ast.TK.String, ast.TK.Dyn, ast.TK.Map, ast.TK.Interface, ast.TK.Union, ast.TK.Func:
+        return true;
+    case ast.TK.Param:
+        terms := constraintTerms(c, t);
+        if (len(terms) == 0) return true;
+        for (_, term := range terms) { if (containsOwned(c, term, seen)) return true; }
+        return false;
+    case ast.TK.Buffer:
+        return t.len > 0 || t.len == -1;
+    case ast.TK.Array:
+        if (t.len < 0) return true;
+        return !nilT(t.elem) && containsOwned(c, t.elem, seen);
+    }
+    k := TypeKey(t);
+    sv, sok := (*seen)[k];
+    if (sok && sv) return false;
+    (*seen)[k] = true;
+    switch (t.kind) {
+    case ast.TK.Named:
+        u := Underlying(t);
+        if (u != t) return containsOwned(c, u, seen);
+    case ast.TK.Tuple:
+        for (_, r := range t.results) { if (containsOwned(c, r, seen)) return true; }
+    case ast.TK.Struct:
+        for (_, f := range c.FieldsOf(t)) { if (!f.valueParam && containsOwned(c, f.ty, seen)) return true; }
+    case ast.TK.Enum:
+        for (_, v := range c.VariantsOf(t)) {
+            for (_, pt := range v.types) { if (containsOwned(c, pt, seen)) return true; }
+            for (_, pf := range v.fields) { if (containsOwned(c, pf.ty, seen)) return true; }
+            if (!nilT(v.fixedType) && containsOwned(c, v.fixedType, seen)) return true;
+        }
+    }
+    return false;
+}
+
+func paramConvertibleTerms(c *Checker, t *ast.Type) []*ast.Type {
+    if (t.kind == ast.TK.Param) return constraintTerms(c, t);
+    out := make([]*ast.Type);
+    out.append(t);
+    return out;
+}
+
 // Convertible implements explicit -> conversions (§7.5).
 func (c *Checker) Convertible(a *ast.Type, d *ast.Type) bool {
     if (a.kind == ast.TK.Invalid || d.kind == ast.TK.Invalid) return true;
@@ -212,22 +263,50 @@ func (c *Checker) Convertible(a *ast.Type, d *ast.Type) bool {
     ua := Underlying(a); ud := Underlying(d);
     if (Identical(ua, ud)) return true;
     if (d.kind == ast.TK.Named && ud.kind == ast.TK.Interface && c.Assignable(a, ud)) return true;
+    if (ua.kind == ast.TK.Param || ud.kind == ast.TK.Param) {
+        taList := paramConvertibleTerms(c, ua);
+        tdList := paramConvertibleTerms(c, ud);
+        if (len(taList) == 0 || len(tdList) == 0) return false;
+        for (_, ta := range taList) {
+            for (_, td := range tdList) { if (!c.Convertible(ta, td)) return false; }
+        }
+        return true;
+    }
     numA := ua.kind == ast.TK.Int || ua.kind == ast.TK.Float || ua.kind == ast.TK.Bool;
     numD := ud.kind == ast.TK.Int || ud.kind == ast.TK.Float || ud.kind == ast.TK.Bool;
     if (numA && numD) return true;
+    if (ua.kind == ast.TK.Array && ud.kind == ast.TK.Array) {
+        if (ua.len == -3 || ud.len == -3) return false;
+        if (!Identical(ua.elem, ud.elem)) {
+            if (HasParams(ua.elem) || HasParams(ud.elem)) return false;
+            seenA: map[string]bool; seenD: map[string]bool;
+            if (containsOwned(c, ua.elem, &seenA) || containsOwned(c, ud.elem, &seenD)) return false;
+        }
+        if (ua.len >= 0 && ud.len >= 0) {
+            c.SizeOf(ua); c.SizeOf(ud);
+            if (c.hasLayoutOverflow(ua) || c.hasLayoutOverflow(ud)) return false;
+            sa, ovA := mulCap(ua.len, c.SizeOf(ua.elem), maxStaticSize(c));
+            sd, ovD := mulCap(ud.len, c.SizeOf(ud.elem), maxStaticSize(c));
+            return !ovA && !ovD && sa == sd;
+        }
+        if (!Identical(ua.elem, ud.elem)) {
+            return c.SizeOf(ua.elem) == c.SizeOf(ud.elem);
+        }
+        return true;
+    }
     ptrA := ua.kind == ast.TK.Ptr || ua.kind == ast.TK.Buffer || (ua.kind == ast.TK.Array && ua.len != -3);
-    ptrD := ud.kind == ast.TK.Ptr || ud.kind == ast.TK.Buffer || ud.kind == ast.TK.Array;
+    ptrD := ud.kind == ast.TK.Ptr || ud.kind == ast.TK.Buffer || (ud.kind == ast.TK.Array && ud.len != -3);
     if (ua.kind == ast.TK.Ptr && ud.kind == ast.TK.Ptr) {
-        sa := ua.elem.kind == ast.TK.String; sd := ud.elem.kind == ast.TK.String;
+        sa := isStringPtr(ua); sd := isStringPtr(ud);
         if (sa != sd && !IsVoidPtr(ua) && !IsVoidPtr(ud)) return false;
         return true;
     }
+    if ((isStringPtr(ua) || isStringPtr(ud)) && ptrA && ptrD && !IsVoidPtr(ua) && !IsVoidPtr(ud)) return false;
     if (ptrA && ptrD) return true;
     if ((ptrA && ud.kind == ast.TK.Int) || (ua.kind == ast.TK.Int && ptrD)) return true;
     if (ua.kind == ast.TK.String && ud.kind == ast.TK.Dyn && Identical(ud.elem, tI8)) return true;
     if (ud.kind == ast.TK.String && ua.kind == ast.TK.Dyn && Identical(ua.elem, tI8)) return true;
     if (ua.kind == ast.TK.Struct && ud.kind == ast.TK.Struct) return layoutEquivalent(c, ua, ud);
-    if (ua.kind == ast.TK.Param || ud.kind == ast.TK.Param) return true;
     if (ua.kind == ast.TK.Union && (numD || ud.kind == ast.TK.Union)) return true;
     return false;
 }

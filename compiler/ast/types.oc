@@ -113,6 +113,7 @@ struct Symbol {
     scope *Scope;           // resolution scope for local type declarations
     fixedVariant int;
     valueSyms []*Symbol;    // struct: value parameters visible to field dimensions
+    stackBuf bool;          // local var holding stack-allocated buffer
 }
 
 struct Scope {
@@ -149,6 +150,7 @@ struct Package {
     loading bool;
     syms []*Symbol;     // package-level declarations in order
     displayPath string;
+    harness bool;       // synthesized test harness package (isolated)
 }
 
 func NewScope(parent *Scope) *Scope {

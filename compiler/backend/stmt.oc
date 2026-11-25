@@ -190,7 +190,10 @@ func genFor(g *Gen, n *ast.Node) {
     label(g, body);
     if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
     pushLoop(g, loopNode(g, n), done, post);
+    scoped := n.d.kind != ast.NK.Block;
+    if (scoped) pushScope(g);
     genStmt(g, n.d);
+    if (scoped) popScope(g);
     popLoop(g);
     br(g, post);
     label(g, post);
@@ -204,8 +207,8 @@ func loopNode(g *Gen, n *ast.Node) *ast.Node { return n; }
 
 func genRange(g *Gen, n *ast.Node) {
     cv := genExpr(g, n.a);
-    if (isAgg(cv.t) && !cv.fresh) cv = copyV(g, cv);
     u := under(cv.t);
+    if ((isAgg(cv.t) || u.kind == ast.TK.Dyn || u.kind == ast.TK.String || (u.kind == ast.TK.Array && u.len < 0)) && !cv.fresh) cv = copyV(g, cv);
     idx := alloca(g, check.TInt());
     emit(g, "store i64 0, ptr " + idx);
     keys := ""; vals := "";
@@ -249,7 +252,10 @@ func genRange(g *Gen, n *ast.Node) {
         storeReplace(g, vt, p, copyV(g, load(g, vt, src)));
     }
     pushLoop(g, n, done, post);
+    scoped := n.d.kind != ast.NK.Block;
+    if (scoped) pushScope(g);
     genStmt(g, n.d);
+    if (scoped) popScope(g);
     popLoop(g);
     br(g, post);
     label(g, post);
@@ -469,6 +475,7 @@ func genDefer(g *Gen, n *ast.Node) {
         mem := memberOf(c);
         iv := genExpr(g, mem.a);
         if (iv.t.kind == ast.TK.Ptr) iv = load(g, iv.t.elem, iv.r);
+        iv = copyV(g, iv);
         items.append(iv);
         ft = sub(g, mem.ty);
         if (c.a.kind == ast.NK.Inst) ft = sub(g, c.a.ty);
@@ -491,17 +498,22 @@ func genDefer(g *Gen, n *ast.Node) {
         items.append(mkV(lvalueAddr(g, c.list[0]), check.PtrTo(typeOf(g, c.list[0]))));
     }
     else if (kind == 7) {
-        // free/delete: capture the operand value(s); the map/array header is shared
+        // free/delete: for lvalue maps, track the variable slot so map growth stays visible
         for (i, a := range c.list) {
+            if (c.text == "delete" && i == 0 && isLvalue(a)) { items.append(mkV(lvalueAddr(g, a), check.PtrTo(typeOf(g, a)))); continue; }
             if (c.text == "delete" && i == 1) { items.append(genAs(g, a, under(typeOf(g, c.list[0])).key)); continue; }
             items.append(genExpr(g, a));
         }
     } else if (kind == 3) {
-        // extern: evaluate arguments as values
+        // extern: copy owned values at defer time before converting string data in the thunk
         for (i, a := range c.list) {
+            if (i < len(c.sym.ty.params) && a.kind == ast.NK.Member && a.sem == ast.Sem.ArrayData && under(typeOf(g, a.a)).kind == ast.TK.String) {
+                items.append(copyV(g, genExpr(g, a.a)));
+                continue;
+            }
             v := genExpr(g, a);
             if (i < len(c.sym.ty.params)) v = conv(g, v, c.sym.ty.params[i]);
-            else v = promoteVariadic(g, v);
+            v = copyV(g, v);
             items.append(v);
         }
     } else if (kind != 4) {
@@ -607,6 +619,11 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
                 v := vals[i];
                 if (c.flag && i == len(vals) - 1) {
                     emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + index + ", ptr " + arrayDataPtr(g, v) + ", i64 " + collectionLen(g, v) + ", ptr " + desc(g, elem) + ", i64 " + st + ")");
+                    if (g.trackTemps && owned(g, items[i].t)) {
+                        sp := gep(g, "%rec", 16 + i * 16);
+                        if (isAgg(items[i].t)) { h := tmp(g); emit(g, h + " = load ptr, ptr " + sp); sp = h; }
+                        emit(g, "call void @oc_drop(ptr " + sp + ", ptr " + desc(g, items[i].t) + ")");
+                    }
                     continue;
                 }
                 p := tmp(g);
@@ -629,8 +646,16 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
                 emit(g, "call void @oc_free_ptr(ptr " + vals[0].r + ", ptr " + pd + ")");
             }
         } else {
-            slot := spill(g, vals[0]);
-            emit(g, "call void @oc_map_delete(ptr " + slot + ", ptr " + spill(g, vals[1]) + ", ptr " + desc(g, u.key) + ")");
+            slot := "";
+            mt := u;
+            if (u.kind == ast.TK.Ptr) { slot = vals[0].r; mt = under(u.elem); }
+            else slot = spill(g, vals[0]);
+            kslot := gep(g, "%rec", 32);
+            if (isAgg(items[1].t) || (under(items[1].t).kind == ast.TK.Int && under(items[1].t).bits > 128)) {
+                h := tmp(g); emit(g, h + " = load ptr, ptr " + kslot); kslot = h;
+            }
+            emit(g, "call void @oc_map_delete(ptr " + slot + ", ptr " + kslot + ", ptr " + desc(g, mt.key) + ")");
+            if (g.trackTemps && owned(g, mt.key)) emit(g, "call void @oc_drop(ptr " + kslot + ", ptr " + desc(g, mt.key) + ")");
         }
     } else if (kind == 3) {
         s := c.sym;
@@ -641,12 +666,34 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
         if (eft.variadic) sig += len(eft.params) > 0 ? ", ..." : "...";
         sig += ")";
         args := "";
-        for (i, v := range vals) {
-            if (i > 0) args += ", ";
-            if (i < len(eft.params)) args += cParam(eft.params[i]) + " " + v.r;
-            else args += ll(v.t) + " " + v.r;
+        for (i, v0 := range vals) {
+            v := v0;
+            if (i < len(eft.params)) {
+                if (c.list[i].kind == ast.NK.Member && c.list[i].sem == ast.Sem.ArrayData && under(v.t).kind == ast.TK.String) {
+                    p := tmp(g); emit(g, p + " = call ptr @oc_str_cdata(ptr " + v.r + ")");
+                    if (args != "") args += ", ";
+                    args += cParam(eft.params[i]) + " " + p;
+                    continue;
+                }
+                if (args != "") args += ", ";
+                args += cParam(eft.params[i]) + " " + v.r;
+            } else {
+                v = promoteVariadic(g, v);
+                if (args != "") args += ", ";
+                args += ll(v.t) + " " + v.r;
+            }
         }
         emit(g, "call " + sig + " @\"" + s.name + "\"(" + args + ")");
+        if (!g.fn.terminated && g.trackTemps) {
+            for (i, it := range items) {
+                if (!owned(g, it.t)) continue;
+                sp := gep(g, "%rec", 16 + i * 16);
+                if (isAgg(it.t) || (under(it.t).kind == ast.TK.Int && under(it.t).bits > 128)) {
+                    h := tmp(g); emit(g, h + " = load ptr, ptr " + sp); sp = h;
+                }
+                emit(g, "call void @oc_drop(ptr " + sp + ", ptr " + desc(g, it.t) + ")");
+            }
+        }
     } else {
         results := make([]*ast.Type);
         for (_, r := range ft.results) results.append(sub(g, r));
@@ -680,6 +727,9 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
         }
         if (rl == "void") emit(g, "call void " + fn + call);
         else { r := tmp(g); emit(g, r + " = call " + rl + " " + fn + call); }
+        if (kind == 2 && !g.fn.terminated && g.trackTemps) {
+            emit(g, "call void @oc_drop(ptr " + gep(g, "%rec", 16) + ", ptr " + desc(g, items[0].t) + ")");
+        }
     }
     if (!g.fn.terminated) { for (_, h := range shells) emit(g, "call void @oc_free(ptr " + h + ")"); }
     term(g, "ret void");
@@ -758,12 +808,14 @@ func genAsm(g *Gen, n *ast.Node) {
         cons += ",~{dirflag},~{fpsr},~{flags}";
     }
     if (n.name == "aarch64") {
-        for (k := 0; k <= 30; k++) { if (k != 18 && k != 29 && !(k >= 9 && k <= 15)) cons += ",~{x" + itoa(k) + "}"; }
+        noOps := len(order) == 0;
+        for (k := 0; k <= 30; k++) { if (k != 18 && k != 29 && (noOps || !(k >= 9 && k <= 15))) cons += ",~{x" + itoa(k) + "}"; }
         for (k := 0; k < 32; k++) cons += ",~{v" + itoa(k) + "}";
         cons += ",~{cc}";
     }
     if (n.name == "riscv64") {
-        for (k := 1; k < 28; k++) { if (k != 2 && k != 3 && k != 4 && k != 8) cons += ",~{x" + itoa(k) + "}"; }
+        lim := len(order) == 0 ? 32 : 28;
+        for (k := 1; k < lim; k++) { if (k != 2 && k != 3 && k != 4 && k != 8) cons += ",~{x" + itoa(k) + "}"; }
         for (k := 0; k < 32; k++) cons += ",~{f" + itoa(k) + "}";
     }
     args := "";

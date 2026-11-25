@@ -153,3 +153,47 @@ func TestSyntaxErrors(t *testing.T) {
 func TestReturnBeforeBrace(t *testing.T) {
     expectBody(t, "if (a) { return x }", "(if (id a) (block [(return [(id x)])]))");
 }
+
+func TestHardeningAndEdgeCases(t *testing.T) {
+    // LOW-3: recovery mode must report ok=false when errors occur.
+    dRec := diag.NewList(); dRec.live = false;
+    srcRec := new(ast.Source); srcRec.path = "t.oc"; srcRec.text = "package p; func f() { x := 1 +; }";
+    toksRec, _ := scanner.Scan("t.oc", srcRec.text, dRec, true);
+    srcRec.tokens = toksRec;
+    _, pokRec := ParseFile(srcRec, dRec, true);
+    if (pokRec) t.Error("recover mode reported ok on syntax error");
+
+    // LOW-2 & LOW-3: interface method name validation, func type in interface type list, enum map, labeled indexing, make(map).
+    expectError(t, "package p; interface I { func 123(); }", "Expected interface method name");
+    expectBody(t, "L: a[0] = 1;", "(label L (expr (assign = (index (id a) (int 0)) (int 1))))");
+    expectBody(t, "make(map);", "(expr (call (id make) [(id map)]))");
+    _, dEnum, okEnum := parse("package p; interface N { func(int); } enum E { A(map[string]int) }");
+    if (!okEnum) t.Error("enum map / func interface failed: ", dEnum.items[0].message);
+
+    // HIGH-8 & HIGH-9: ParseForFix must not loop on int[3][ or corrupt a < b * c.
+    known: map[string]bool; known["Box"] = true;
+    dFix := diag.NewList(); dFix.live = false;
+    srcMal := new(ast.Source); srcMal.path = "m.oc"; srcMal.text = "package p; func f() { x := int[3][; }";
+    srcMal.tokens, _ = scanner.Scan("m.oc", srcMal.text, dFix, true);
+    rwMal := ParseForFix(srcMal, dFix, known);
+    if (len(rwMal) != 1 || rwMal[0].text != "[3]int") t.Error("malformed fix rewrite unexpected: ", len(rwMal));
+
+    srcMod := new(ast.Source); srcMod.path = "ok.oc"; srcMod.text = "package p; func f() { x := a < Box * c; y := a < arr[0]; }";
+    srcMod.tokens, _ = scanner.Scan("ok.oc", srcMod.text, dFix, true);
+    rwMod := ParseForFix(srcMod, dFix, known);
+    if (len(rwMod) != 0) t.Error("speculative fix rewrite leaked: ", len(rwMod));
+
+    // HIGH-11: deep recursion limit and nested sizeof(...) must fail cleanly in bounded time.
+    deep := "package p; func f() { x := ";
+    for (i := 0; i < 450; i++) deep += "- ";
+    deep += "1; }";
+    _, _, okDeep := parse(deep);
+    if (okDeep) t.Error("expected deep recursion error");
+
+    nestedSizeof := "package p; func f() int { return ";
+    for (i := 0; i < 60; i++) nestedSizeof += "sizeof([";
+    nestedSizeof += "x";
+    for (i := 0; i < 60; i++) nestedSizeof += "])";
+    nestedSizeof += "; }";
+    parse(nestedSizeof);
+}

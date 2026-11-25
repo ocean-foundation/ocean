@@ -171,17 +171,19 @@ func frameName(inst *Inst) string {
 }
 
 // frameOff gives the offset of an OcFrame field (core.c) for the target's
-// pointer size: {prev, name, i64 site, defers, jb, locals}.
+// pointer size: {prev, name, i64 site, defers, jb, locals, i64 in_defer}.
 func frameOff(g *Gen, field string) int {
     p := g.c.PtrSize();
     site := p == 8 ? 16 : 8;
+    base := (site + 8 + 3 * p + 7) / 8 * 8;
     switch (field) {
     case "name": return p;
     case "site": return site;
     case "defers": return site + 8;
     case "jb": return site + 8 + p;
     case "locals": return site + 8 + 2 * p;
-    case "size": return (site + 8 + 3 * p + 7) / 8 * 8;
+    case "in_defer": return base;
+    case "size": return base + 8;
     }
     return 0;
 }
@@ -198,6 +200,9 @@ func prologue(g *Gen, displayName string) {
     emit(g, "store ptr null, ptr " + gep(g, f.frame, frameOff(g, "jb")));
     // owned locals, released by the runtime when a panic unwinds this frame
     emit(g, "store ptr %loctab, ptr " + gep(g, f.frame, frameOff(g, "locals")));
+    ind := tmp(g);
+    emit(g, ind + " = load i64, ptr @oc_in_defer");
+    emit(g, "store i64 " + ind + ", ptr " + gep(g, f.frame, frameOff(g, "in_defer")));
     emit(g, "store ptr " + f.frame + ", ptr @oc_top");
     if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
 }
@@ -347,7 +352,8 @@ func emitLocalTable(g *Gen) {
         f.allocas.Add("  ").Add(e).Add(" = getelementptr inbounds {ptr, ptr}, ptr %loctab, i64 ").AddInt(i).Add("\n");
         f.allocas.Add("  store ptr ").Add(l.slot).Add(", ptr ").Add(e).Add("\n");
         f.allocas.Add("  ").Add(e).Add(".t = getelementptr inbounds i8, ptr ").Add(e).Add(", i64 ").AddInt(g.c.PtrSize()).Add("\n");
-        f.allocas.Add("  store ptr ").Add(desc(g, l.t)).Add(", ptr ").Add(e).Add(".t\n");
+        tyDesc := l.isBufList ? "@oc_type_buflist" : desc(g, l.t);
+        f.allocas.Add("  store ptr ").Add(tyDesc).Add(", ptr ").Add(e).Add(".t\n");
     }
     f.allocas.Add("  %loctab.end = getelementptr inbounds {ptr, ptr}, ptr %loctab, i64 ").AddInt(n).Add("\n");
     f.allocas.Add("  store {ptr, ptr} zeroinitializer, ptr %loctab.end\n");

@@ -75,6 +75,8 @@ func detailOf(a *Analysis, s *ast.Symbol) string {
 
 func completion(a *Analysis, off int) string {
     text := a.doc.text;
+    if (off < 0) off = 0;
+    if (off > len(text)) off = len(text);
     start := off;
     for (start > 0 && identByte(text[start - 1])) start--;
     items := new(Items);
@@ -129,7 +131,8 @@ func typeItems(a *Analysis, items *Items, t *ast.Type) {
 
 func valueItems(a *Analysis, items *Items, t0 *ast.Type) {
     t := t0;
-    for (t.kind == ast.TK.Ptr) t = t.elem;
+    for (!nilT(t) && t.kind == ast.TK.Ptr) t = t.elem;
+    if (nilT(t)) return;
     u := check.Underlying(t);
     if (u.kind == ast.TK.Struct) { for (_, f := range a.checker.FieldsOf(u)) add(items, f.name, 5, check.TypeString(f.ty)); }
     if (t.kind == ast.TK.Struct || t.kind == ast.TK.Enum || t.kind == ast.TK.Named) {
@@ -253,13 +256,14 @@ func candidates(a *Analysis) []*Candidate {
                 candidateDir(&out, root, name, 0, &budget, true);
             }
         }
-        cache, ok := util.Getenv("OCEAN_MOD_CACHE");
-        if (!ok) { home, hok := util.Getenv("HOME"); cache = (hok ? home : "/tmp") + "/.cache/ocean/modules"; }
-        for (name, v := range m.requires) {
-            _, replaced := m.replaces[name];
-            if (replaced) continue;
-            dir := cache + "/" + name + "@" + (v == "" ? "latest" : v);
-            if (util.IsDir(dir)) candidateDir(&out, dir, name, 0, &budget, true);
+        cache, ok := loader.ModuleCacheDir();
+        if (ok) {
+            for (name, v := range m.requires) {
+                _, replaced := m.replaces[name];
+                if (replaced) continue;
+                dir := cache + "/" + name + "@" + (v == "" ? "latest" : v);
+                if (util.IsDir(dir)) candidateDir(&out, dir, name, 0, &budget, true);
+            }
         }
     }
     return out;

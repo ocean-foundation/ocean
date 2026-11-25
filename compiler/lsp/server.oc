@@ -41,13 +41,16 @@ func fill(s *Server) bool {
 
 func readLine(s *Server) (string, bool) {
     for (;;) {
-        for (i := s.inpos; i < len(s.inbuf); i++) {
+        maxEnd := s.inpos + 8192;
+        if (maxEnd > len(s.inbuf)) maxEnd = len(s.inbuf);
+        for (i := s.inpos; i < maxEnd; i++) {
             if (s.inbuf[i] == '\n') {
                 line := s.inbuf[s.inpos:i + 1];
                 s.inpos = i + 1;
                 return line, true;
             }
         }
+        if (len(s.inbuf) - s.inpos >= 8192) return "", false;
         if (!fill(s)) return "", false;
     }
     return "", false;
@@ -90,6 +93,9 @@ func uriPath(uri string) string {
         } else b.Addc(s[i]);
     }
     path := b.String();
+    if (len(path) >= 3 && path[0] == '/' && ((path[1] >= 'A' && path[1] <= 'Z') || (path[1] >= 'a' && path[1] <= 'z')) && path[2] == ':') {
+        path = path[1:];
+    }
     r, ok := util.Realpath(path);
     if (ok) return r;
     dir, dok := util.Realpath(filepath.Dir(path));
@@ -120,15 +126,17 @@ func findDoc(s *Server, uri string) int {
 func Main() int {
     s := new(Server);
     for (;;) {
-        length := -1; bad := false;
+        length := -1; bad := false; headers := 0;
         for (;;) {
             line, ok := readLine(s);
             if (!ok) { if (len(s.inbuf) - s.inpos == 0) break; bad = true; break; }
             if (line == "\r\n" || line == "\n") break;
+            headers++;
+            if (headers > 64) { bad = true; break; }
             if (strings.HasPrefix(lower(line), "content-length:")) {
                 parsed := strconv.Atoi(strings.TrimSpace(line[15:]));
                 v := parsed.unwrapOrZero();
-                if (parsed.hasError() || length >= 0 || v <= 0 || v > 16777216) { bad = true; break; }
+                if (parsed.hasError() || length >= 0 || v <= 0 || v > 33554432) { bad = true; break; }
                 length = v;
             }
         }
@@ -165,6 +173,7 @@ func Main() int {
             uri := td.Get("uri").Str();
             if (uri == "") continue;
             i := findDoc(s, uri);
+            changedDoc := zero(*Document);
             if (method == "textDocument/didOpen") {
                 text := td.Get("text");
                 path := uriPath(uri);
@@ -172,6 +181,7 @@ func Main() int {
                     d := zero(*Document);
                     if (i < 0) { d = new(Document); d.uri = uri; s.docs.append(d); } else d = s.docs[i];
                     d.path = path; d.text = text.Str(); d.version = td.Get("version").Int(0);
+                    changedDoc = d;
                 }
             } else if (i >= 0 && method == "textDocument/didClose") {
                 d := s.docs[i];
@@ -188,8 +198,11 @@ func Main() int {
                     }
                     d.version = v;
                 }
+                changedDoc = d;
+            } else if (i >= 0 && method == "textDocument/didSave") {
+                changedDoc = s.docs[i];
             }
-            for (_, d := range s.docs) publish(s, d);
+            if ((changedDoc -> int) != 0) publish(s, changedDoc);
             continue;
         }
         if (!nilJ(id)) replyError(id, -32601, "Method not found");

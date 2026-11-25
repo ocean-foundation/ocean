@@ -87,3 +87,63 @@ func TestPaths(t *testing.T) {
     if (RelativeSourcePath(filepath.Dir(cwd) + "/z.oc") != "../z.oc") t.Error("rel3 ", RelativeSourcePath(filepath.Dir(cwd) + "/z.oc"));
     if (!TargetSource("a.oc") || !TargetSource("a_native.oc") || TargetSource("a_wasm_test.oc")) t.Error("target");
 }
+
+func TestHarnessIsolatedFromParentOceanMod(t *testing.T) {
+    root := writeTree(t, []string{
+        "ocean.mod", "module hijacked.example/evil\n",
+        "evilpkg/evil.oc", "package evilpkg;",
+        "work/mod/ocean.mod", "module example.com/app\n",
+        "work/mod/p/p.oc", "package p;",
+        "work/mod/p/p_test.oc", "package p; import \"testing\"; func TestOk(t *testing.T) {}"});
+    b := NewBuild(quiet());
+    ok := b.LoadTestPackage(root + "/work/mod/p", root + "/harness");
+    if (!ok) { t.Fatal("load test failed: ", b.diags.items[0].message); }
+    if (!b.root.harness) t.Error("expected harness flag on test runner package");
+    if (!NilModule(b.root.module)) t.Error("harness must not bind parent ocean.mod");
+    // A harness referencing a package outside stdlib/__ocean_test_* must fail.
+    b2 := NewBuild(quiet());
+    b2.AddOverlay(root + "/harness/runner.oc", "package main; import \"evilpkg\"; func main() int { return 0; }");
+    b2.harnessDirectory = root + "/harness";
+    b2.LoadPackage(root + "/harness");
+    if (b2.errors == 0) t.Error("harness should reject parent-module import");
+    util.RemoveAll(root);
+}
+
+func TestEmptyReplaceAndSumVerification(t *testing.T) {
+    root := writeTree(t, []string{
+        "bad/ocean.mod", "module m\nreplace example.com/dep => \"\"\n",
+        "bad/main.oc", "package main; import \"example.com/dep\"; func main() {}",
+        "cache/example.com/dep@v1.0.0/ocean.mod", "module example.com/dep\n",
+        "cache/example.com/dep@v1.0.0/dep.oc", "package dep; func X() int { return 7; }",
+        "app/ocean.mod", "module example.com/app\nrequire example.com/dep v1.0.0\n",
+        "app/main.oc", "package main; import \"example.com/dep\"; func main() {}"});
+    // 1. Empty replace target must be rejected at manifest parse time without panic.
+    dBad := quiet();
+    bBad := NewBuild(dBad);
+    if (bBad.LoadPackage(root + "/bad")) t.Error("empty replace target should fail");
+
+    // 2. Uncached module without ocean.sum must fail without auto-cloning.
+    prevCache, hadCache := util.Getenv("OCEAN_MOD_CACHE");
+    util.Setenv("OCEAN_MOD_CACHE", root + "/cache");
+    dNoSum := quiet();
+    if (NewBuild(dNoSum).LoadPackage(root + "/app")) t.Error("missing ocean.sum must fail");
+
+    // 3. Valid ocean.sum passes verification.
+    digest, hok := util.HashDir(root + "/cache/example.com/dep@v1.0.0");
+    if (!hok) t.Fatal("hash failed");
+    e: SumEntry; e.module = "example.com/dep"; e.version = "v1.0.0"; e.hash = digest;
+    if (!WriteSum(root + "/app", []SumEntry{e})) t.Fatal("write sum failed");
+    dOk := quiet();
+    if (!NewBuild(dOk).LoadPackage(root + "/app")) t.Fatal("verified load failed: ", dOk.items[0].message);
+
+    // 4. Tampering cached file causes checksum mismatch failure.
+    util.WriteFile(root + "/cache/example.com/dep@v1.0.0/dep.oc", "package dep; func X() int { return 999; }");
+    dTamper := quiet();
+    if (NewBuild(dTamper).LoadPackage(root + "/app")) t.Error("tampered cache should fail");
+    if (len(dTamper.items) == 0 || !strings.Contains(dTamper.items[0].message, "checksum mismatch")) {
+        t.Error("expected checksum mismatch error");
+    }
+
+    if (hadCache) util.Setenv("OCEAN_MOD_CACHE", prevCache); else util.Unsetenv("OCEAN_MOD_CACHE");
+    util.RemoveAll(root);
+}

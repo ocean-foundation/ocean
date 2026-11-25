@@ -212,10 +212,14 @@ func genericCall(c *Checker, n *ast.Node, inst *ast.Node, s *ast.Symbol) *ast.Ty
     if (len(args) != len(s.typeParams)) { err(c, inst, "type argument count mismatch"); return tInvalid; }
     for (i, a := range args) {
         if (!satisfies(c, a, s.typeParams[i].constraint)) { err(c, inst, "type argument does not satisfy its constraint"); return tInvalid; }
+        c.CheckLayoutSize(inst, a);
+        checkInstanceBitfields(c, inst, a);
     }
     n.targs = args;
     inst.targs = args;
     ft := Subst(s.ty, makeEnv(s.typeParams, args));
+    c.CheckLayoutSize(n, ft);
+    checkInstanceBitfields(c, n, ft);
     inst.ty = ft;
     checkArgs(c, n, ft, n.list, n.flag, false);
     return resultType(c, ft);
@@ -260,10 +264,14 @@ func methodCall(c *Checker, n *ast.Node, f *ast.Node, mem *ast.Node, ft *ast.Typ
         for (i, a := range args) {
             resolveConstraints(c, m.typeParams);
             if (!satisfies(c, a, m.typeParams[i].constraint)) { err(c, f, "type argument does not satisfy its constraint"); return tInvalid; }
+            c.CheckLayoutSize(f, a);
+            checkInstanceBitfields(c, f, a);
         }
         n.targs = args;
         ft = Subst(ft, makeEnv(m.typeParams, args));
     } else if (f.kind == ast.NK.Inst) { err(c, f, "this type does not accept type arguments"); return tInvalid; }
+    c.CheckLayoutSize(n, ft);
+    checkInstanceBitfields(c, n, ft);
     checkArgs(c, n, ft, n.list, n.flag, false);
     return resultType(c, ft);
 }
@@ -369,7 +377,11 @@ func builtinCall(c *Checker, n *ast.Node, name string) *ast.Type {
         u := Underlying(t);
         if (u.kind != ast.TK.Dyn && u.kind != ast.TK.String && u.kind != ast.TK.Ptr && t.kind != ast.TK.Invalid) { err(c, n, "free requires a dynamic array or pointer"); return tVoid; }
         a := n.list[0];
-        if ((u.kind == ast.TK.Dyn || u.kind == ast.TK.String) && a.kind == ast.NK.Ident && a.sem == ast.Sem.LocalVar && !nilS(a.sym) && !nilF(c.fn) && a.sym.depth == c.fn.level) a.sym.freed = true;
+        if (u.kind == ast.TK.Ptr && isStackOrGlobalAddr(a)) {
+            err(c, a, "cannot free address of a local or global variable");
+            return tVoid;
+        }
+        if ((u.kind == ast.TK.Dyn || u.kind == ast.TK.String || u.kind == ast.TK.Ptr) && a.kind == ast.NK.Ident && a.sem == ast.Sem.LocalVar && !nilS(a.sym) && !nilF(c.fn) && a.sym.depth == c.fn.level) a.sym.freed = true;
         return tVoid;
     }
     if (name == "delete") {
@@ -474,6 +486,7 @@ func indexExpr(c *Checker, n *ast.Node) *ast.Type {
         if (nilT(u.elem)) { err(c, n, "narrow buffer to an element type before indexing"); return tInvalid; }
         return u.elem;
     }
+    if (u.kind == ast.TK.Ptr && !nilT(u.elem) && Underlying(u.elem).kind == ast.TK.Buffer) return u.elem;
     if (u.kind == ast.TK.Struct) { err(c, n, "value is not indexable"); return tInvalid; }
     if (u.kind == ast.TK.Param) {
         terms := constraintTerms(c, u);
@@ -585,7 +598,36 @@ func assignExpr(c *Checker, n *ast.Node) *ast.Type {
     expr(c, n.b, tt);
     coerce(c, n.b, tt, n);
     freedReassign(c, target);
+    if (target.kind == ast.NK.Ident && !nilS(target.sym)) target.sym.stackBuf = isStackBufferExpr(n.b);
     return tt;
+}
+
+func isStackOrGlobalAddr(n *ast.Node) bool {
+    if (nilN(n) || n.kind != ast.NK.Unary || n.op != scanner.Kind.Amp) return false;
+    cur := n.a;
+    for (!nilN(cur)) {
+        switch (cur.kind) {
+        case ast.NK.Ident:
+            return cur.sem == ast.Sem.LocalVar || cur.sem == ast.Sem.GlobalVar;
+        case ast.NK.Member:
+            if (cur.sem == ast.Sem.PkgMember) return true;
+            if (cur.sem == ast.Sem.Field) {
+                if (!nilN(cur.a) && !nilT(cur.a.ty) && Underlying(cur.a.ty).kind == ast.TK.Ptr) return false;
+                cur = cur.a;
+                continue;
+            }
+            return false;
+        case ast.NK.Index:
+            if (!nilN(cur.a) && !nilT(cur.a.ty)) {
+                au := Underlying(cur.a.ty);
+                if (au.kind == ast.TK.Array && au.len >= 0) { cur = cur.a; continue; }
+            }
+            return false;
+        default:
+            return false;
+        }
+    }
+    return false;
 }
 
 func freedReassign(c *Checker, target *ast.Node) {

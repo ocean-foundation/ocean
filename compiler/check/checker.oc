@@ -61,6 +61,7 @@ struct Checker {
     layoutMemo map[string]*StructLayout;
     sizeMemo map[string]int;
     alignMemo map[string]int;
+    layoutOverflow map[string]bool;
 }
 
 func newSym(c *Checker, k ast.SK, name string, node *ast.Node) *ast.Symbol {
@@ -262,10 +263,27 @@ func collectPackage(c *Checker, p *ast.Package) {
     }
 }
 
-func sameTypeSyntax(a *ast.Node, b *ast.Node) bool {
-    if (nilN(a) || nilN(b)) return nilN(a) && nilN(b);
-    return ast.Dump(a) == ast.Dump(b);
+func sameSyntaxList(xs []*ast.Node, ys []*ast.Node, depth int) bool {
+    if (len(xs) != len(ys)) return false;
+    for (i := 0; i < len(xs); i++) {
+        if (!sameSyntax(xs[i], ys[i], depth)) return false;
+    }
+    return true;
 }
+
+func sameSyntax(a *ast.Node, b *ast.Node, depth int) bool {
+    if (nilN(a) || nilN(b)) return nilN(a) && nilN(b);
+    if (depth > 64) return false;
+    if (a.kind != b.kind || a.name != b.name || a.text != b.text || a.text2 != b.text2) return false;
+    if (a.op != b.op || a.flag != b.flag || a.flag2 != b.flag2 || a.flag3 != b.flag3 || a.ival != b.ival) return false;
+    if (!sameSyntax(a.a, b.a, depth + 1) || !sameSyntax(a.b, b.b, depth + 1) ||
+        !sameSyntax(a.c, b.c, depth + 1) || !sameSyntax(a.d, b.d, depth + 1)) return false;
+    if (!sameSyntaxList(a.list, b.list, depth + 1) || !sameSyntaxList(a.list2, b.list2, depth + 1) ||
+        !sameSyntaxList(a.list3, b.list3, depth + 1) || !sameSyntaxList(a.list4, b.list4, depth + 1)) return false;
+    return true;
+}
+
+func sameTypeSyntax(a *ast.Node, b *ast.Node) bool { return sameSyntax(a, b, 0); }
 func sameExtern(a *ast.Node, b *ast.Node) bool {
     if (len(a.list) != len(b.list) || a.flag != b.flag || !sameTypeSyntax(a.a, b.a)) return false;
     for (i := 0; i < len(a.list); i++) { if (!sameTypeSyntax(a.list[i].a, b.list[i].a)) return false; }
@@ -423,6 +441,7 @@ func resolveDecls(c *Checker, p *ast.Package) {
         c.src = s.src;
         resolveSymType(c, s);
     }
+    checkValueCycles(c, p.syms);
     for (_, src := range p.files) {
         c.src = src;
         for (_, ex := range src.externs) resolveExtern(c, ex);
@@ -431,6 +450,63 @@ func resolveDecls(c *Checker, p *ast.Package) {
         if (s.kind == ast.SK.Struct || s.kind == ast.SK.Enum || s.kind == ast.SK.TypeDef) {
             for (_, m := range s.methodList) { c.src = m.src; resolveFuncSig(c, m); }
             checkMethodNames(c, s);
+        }
+    }
+    checkPackageDeclsLayout(c, p);
+}
+
+func checkPackageDeclsLayout(c *Checker, p *ast.Package) {
+    for (_, s := range p.syms) {
+        c.src = s.src;
+        switch (s.kind) {
+        case ast.SK.Struct:
+            if (len(s.typeParams) == 0) {
+                c.CheckLayoutSize(s.node, s.ty);
+                checkInstanceBitfields(c, s.node, s.ty);
+            } else {
+                for (_, f := range s.fields) {
+                    if (!f.valueParam && !HasParams(f.ty)) {
+                        c.CheckLayoutSize(f.node, f.ty);
+                        checkInstanceBitfields(c, f.node, f.ty);
+                    }
+                }
+            }
+        case ast.SK.Enum:
+            if (len(s.typeParams) == 0) {
+                c.CheckLayoutSize(s.node, s.ty);
+                checkInstanceBitfields(c, s.node, s.ty);
+            }
+        case ast.SK.TypeDef, ast.SK.Alias:
+            if (!nilT(s.ty) && s.ty.kind != ast.TK.Family) {
+                c.CheckLayoutSize(s.node, s.ty);
+                checkInstanceBitfields(c, s.node, s.ty);
+            }
+        case ast.SK.Var:
+            c.CheckLayoutSize(s.node, s.ty);
+            checkInstanceBitfields(c, s.node, s.ty);
+        case ast.SK.Func:
+            if (!nilT(s.ty) && s.ty.kind == ast.TK.Func) {
+                for (_, pt := range s.ty.params) { c.CheckLayoutSize(s.node, pt); checkInstanceBitfields(c, s.node, pt); }
+                for (_, rt := range s.ty.results) { c.CheckLayoutSize(s.node, rt); checkInstanceBitfields(c, s.node, rt); }
+            }
+        }
+        if (s.kind == ast.SK.Struct || s.kind == ast.SK.Enum || s.kind == ast.SK.TypeDef) {
+            for (_, m := range s.methodList) {
+                c.src = m.src;
+                if (!nilT(m.ty) && m.ty.kind == ast.TK.Func) {
+                    for (_, pt := range m.ty.params) { c.CheckLayoutSize(m.node, pt); checkInstanceBitfields(c, m.node, pt); }
+                    for (_, rt := range m.ty.results) { c.CheckLayoutSize(m.node, rt); checkInstanceBitfields(c, m.node, rt); }
+                }
+            }
+        }
+    }
+    for (_, src := range p.files) {
+        c.src = src;
+        for (_, ex := range src.externs) {
+            if (!nilT(ex.ty) && ex.ty.kind == ast.TK.Func) {
+                for (_, pt := range ex.ty.params) { c.CheckLayoutSize(ex.node, pt); checkInstanceBitfields(c, ex.node, pt); }
+                for (_, rt := range ex.ty.results) { c.CheckLayoutSize(ex.node, rt); checkInstanceBitfields(c, ex.node, rt); }
+            }
         }
     }
 }

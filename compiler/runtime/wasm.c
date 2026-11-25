@@ -126,7 +126,17 @@ void *malloc(size_t n) {
     if (!n) n = 16;
     for (OcBlock **link = &free_blocks; *link; link = &(*link)->next) {
         OcBlock *b = *link;
-        if (b->size >= n && (n > (SIZE_MAX - 64) / 2 || b->size <= 2 * n + 64)) { *link = b->next; return (unsigned char *)b + OC_HEADER; }
+        if (b->size >= n) {
+            *link = b->next;
+            if (b->size >= n + OC_HEADER + 16) {
+                OcBlock *rem = (OcBlock *)((unsigned char *)b + OC_HEADER + n);
+                rem->size = b->size - n - OC_HEADER;
+                rem->next = free_blocks;
+                free_blocks = rem;
+                b->size = n;
+            }
+            return (unsigned char *)b + OC_HEADER;
+        }
     }
     return carve(n);
 }
@@ -155,7 +165,18 @@ void *realloc(void *p, size_t n) {
 /* ---- output ---- */
 __attribute__((import_module("env"), import_name("ocean_write")))
 extern int ocean_host_write(int fd, const void *data, int n);
-ssize_t write(int fd, const void *data, size_t n) { return ocean_host_write(fd, data, (int)n); }
+ssize_t write(int fd, const void *data, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        size_t rem = n - done;
+        int chunk = rem > 0x7fffffffu ? 0x7fffffff : (int)rem;
+        int w = ocean_host_write(fd, (const unsigned char *)data + done, chunk);
+        if (w <= 0) return done ? (ssize_t)done : w;
+        done += (size_t)w;
+        if (w < chunk) break;
+    }
+    return (ssize_t)done;
+}
 
 static void put_char(char *out, size_t size, size_t *len, char c) {
     if (*len + 1 < size) out[*len] = c;
@@ -166,26 +187,37 @@ int vsnprintf(char *out, size_t size, const char *f, va_list args) {
     for (; *f; f++) {
         if (*f != '%') { put_char(out, size, &len, *f); continue; }
         f++;
+        while (*f == '-' || *f == '+' || *f == ' ' || *f == '#' || *f == '0') f++;
+        if (*f == '*') { (void)va_arg(args, int); f++; }
+        else while (*f >= '0' && *f <= '9') f++;
+        if (*f == '.') {
+            f++;
+            if (*f == '*') { (void)va_arg(args, int); f++; }
+            else while (*f >= '0' && *f <= '9') f++;
+        }
         int longs = 0;
-        while (*f == 'l' || *f == 'z') { longs++; f++; }
+        if (*f == 'h') { f++; if (*f == 'h') f++; }
+        else if (*f == 'j' || *f == 't') { longs = 2; f++; }
+        else { while (*f == 'l' || *f == 'z') { longs++; f++; } }
         if (*f == '%') { put_char(out, size, &len, '%'); continue; }
         if (*f == 's') { const char *s = va_arg(args, const char *); if (!s) s = "(null)"; while (*s) put_char(out, size, &len, *s++); continue; }
         if (*f == 'c') { put_char(out, size, &len, (char)va_arg(args, int)); continue; }
-        if (*f == 'd' || *f == 'i' || *f == 'u' || *f == 'x' || *f == 'p') {
+        if (*f == 'd' || *f == 'i' || *f == 'u' || *f == 'x' || *f == 'X' || *f == 'o' || *f == 'p') {
             unsigned long long v; int neg = 0;
             if (*f == 'p') v = (uintptr_t)va_arg(args, void *);
             else if (*f == 'd' || *f == 'i') {
                 long long s = longs >= 2 ? va_arg(args, long long) : longs == 1 ? va_arg(args, long) : va_arg(args, int);
                 if (s < 0) { neg = 1; v = 0ull - (unsigned long long)s; } else v = (unsigned long long)s;
             } else v = longs >= 2 ? va_arg(args, unsigned long long) : longs == 1 ? va_arg(args, unsigned long) : va_arg(args, unsigned);
-            unsigned base = (*f == 'x' || *f == 'p') ? 16 : 10;
+            unsigned base = (*f == 'x' || *f == 'X' || *f == 'p') ? 16 : (*f == 'o' ? 8 : 10);
+            const char *digits_hex = *f == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
             char digits[24]; int k = 0;
-            do { digits[k++] = "0123456789abcdef"[v % base]; v /= base; } while (v);
+            do { digits[k++] = digits_hex[v % base]; v /= base; } while (v);
             if (neg) put_char(out, size, &len, '-');
             while (k) put_char(out, size, &len, digits[--k]);
             continue;
         }
-        if (!*f) break;
+        break;
     }
     if (size) out[len < size ? len : size - 1] = 0;
     return (int)len;

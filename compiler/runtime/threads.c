@@ -1,6 +1,9 @@
 // Native thread backend embedded in the compiler and linked only when needed.
 // All calls into Ocean use explicit C ABI bridges emitted in the support module.
 #if !defined(_WIN32)
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include <stdint.h>
@@ -13,12 +16,25 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-// Ocean's diagnostic runtime uses dprintf; the Windows CRT exposes vfprintf
-// instead. Keep the compatibility symbol local to threading-enabled programs.
+#include <io.h>
+// Ocean's diagnostic runtime uses dprintf; the Windows CRT exposes vsnprintf
+// and _write instead. Keep the compatibility symbol local to threading-enabled programs.
 int dprintf(int descriptor, const char *format, ...) {
-    va_list arguments; va_start(arguments, format);
-    int result = vfprintf(descriptor == 2 ? stderr : stdout, format, arguments);
-    va_end(arguments); return result;
+    va_list arguments;
+    va_start(arguments, format);
+    va_list copy;
+    va_copy(copy, arguments);
+    int need = vsnprintf(NULL, 0, format, copy);
+    va_end(copy);
+    if (need < 0) { va_end(arguments); return -1; }
+    char stack_buf[256];
+    char *buf = (size_t)need + 1 <= sizeof(stack_buf) ? stack_buf : malloc((size_t)need + 1);
+    if (!buf) { va_end(arguments); return -1; }
+    int len = vsnprintf(buf, (size_t)need + 1, format, arguments);
+    va_end(arguments);
+    int written = len > 0 ? _write(descriptor, buf, (unsigned int)len) : 0;
+    if (buf != stack_buf) free(buf);
+    return written;
 }
 typedef CRITICAL_SECTION Lock;
 typedef CONDITION_VARIABLE Cond;
@@ -43,15 +59,38 @@ static void checked(int status) { if (status) abort(); }
 static void lock_init(Lock *p) { checked(pthread_mutex_init(p, NULL)); }
 static void lock(Lock *p) { checked(pthread_mutex_lock(p)); }
 static void unlock(Lock *p) { checked(pthread_mutex_unlock(p)); }
-static void cond_init(Cond *p) { checked(pthread_cond_init(p, NULL)); }
+static void cond_init(Cond *p) {
+#if !defined(__APPLE__) && defined(CLOCK_MONOTONIC)
+    pthread_condattr_t attr;
+    checked(pthread_condattr_init(&attr));
+    checked(pthread_condattr_setclock(&attr, CLOCK_MONOTONIC));
+    checked(pthread_cond_init(p, &attr));
+    pthread_condattr_destroy(&attr);
+#else
+    checked(pthread_cond_init(p, NULL));
+#endif
+}
 static void broadcast(Cond *p) { checked(pthread_cond_broadcast(p)); }
 static void cond_wait(Cond *p, Lock *m) {
+#ifdef __APPLE__
+    struct timespec rel = { 0, 10000000 };
+    int status = pthread_cond_timedwait_relative_np(p, m, &rel);
+    if (status && status != ETIMEDOUT) abort();
+#elif defined(CLOCK_MONOTONIC)
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline)) abort();
+    deadline.tv_nsec += 10000000;
+    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
+    int status = pthread_cond_timedwait(p, m, &deadline);
+    if (status && status != ETIMEDOUT) abort();
+#else
     struct timespec deadline;
     if (clock_gettime(CLOCK_REALTIME, &deadline)) abort();
     deadline.tv_nsec += 10000000;
     if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
     int status = pthread_cond_timedwait(p, m, &deadline);
     if (status && status != ETIMEDOUT) abort();
+#endif
 }
 static void join(Handle h) { checked(pthread_join(h, NULL)); }
 #endif
@@ -65,6 +104,9 @@ typedef struct Thread Thread;
 struct Thread {
     int64_t id;
     Handle handle;
+#if defined(_WIN32)
+    DWORD tid;
+#endif
     void *code, *environment;
     int done, yielded, joining, joined;
     _Atomic int cancelled;
@@ -74,11 +116,57 @@ struct Thread {
 static Lock registry;
 static Cond changed;
 static Thread main_thread;
-static Thread *tail = &main_thread;
+static Thread **buckets;
+static size_t nbuckets;
+static size_t nthreads;
 static int64_t next_id = 1;
 static int shutting_down;
 static _Thread_local Thread *self;
 static _Thread_local int returning;
+
+static size_t hash_thread_id(int64_t id) {
+    uint64_t h = (uint64_t)id * 11400714819323198485ULL;
+    return (size_t)(h ^ (h >> 30));
+}
+static void table_insert(Thread *t) {
+    if (!buckets || (nthreads + 1) * 2 >= nbuckets) {
+        size_t ncap = nbuckets ? nbuckets * 2 : 64;
+        Thread **nb = calloc(ncap, sizeof(*nb));
+        if (!nb) abort();
+        for (size_t i = 0; i < nbuckets; i++) {
+            Thread *cur = buckets[i];
+            while (cur) {
+                Thread *nxt = cur->next;
+                size_t b = hash_thread_id(cur->id) & (ncap - 1);
+                cur->next = nb[b];
+                nb[b] = cur;
+                cur = nxt;
+            }
+        }
+        free(buckets);
+        buckets = nb;
+        nbuckets = ncap;
+    }
+    size_t b = hash_thread_id(t->id) & (nbuckets - 1);
+    t->next = buckets[b];
+    buckets[b] = t;
+    nthreads++;
+}
+static void table_remove(int64_t id) {
+    if (id <= 0 || !nbuckets) return;
+    size_t b = hash_thread_id(id) & (nbuckets - 1);
+    Thread **link = &buckets[b];
+    while (*link) {
+        Thread *cur = *link;
+        if (cur->id == id) {
+            *link = cur->next;
+            cur->next = NULL;
+            nthreads--;
+            return;
+        }
+        link = &cur->next;
+    }
+}
 
 static void cleanup_sync(void);
 static void shutdown_threads(void);
@@ -102,7 +190,10 @@ static void ensure(void) { checked(pthread_once(&once, initialize)); }
 #endif
 
 static Thread *find(int64_t id) {
-    for (Thread *t = &main_thread; t; t = t->next) if (t->id == id) return t;
+    if (id == 0) return &main_thread;
+    if (id < 0 || !nbuckets) return NULL;
+    size_t b = hash_thread_id(id) & (nbuckets - 1);
+    for (Thread *t = buckets[b]; t; t = t->next) if (t->id == id) return t;
     return NULL;
 }
 static int cancelled(void) {
@@ -146,6 +237,7 @@ static void *start(void *argument) {
         ocean_threads_checkpoint();
         ocean_runtime_thread_invoke(t->code, t->environment);
     }
+    self = NULL;
     complete(t);
 #if defined(_WIN32)
     return 0;
@@ -154,6 +246,7 @@ static void *start(void *argument) {
 #endif
 }
 int64_t ocean_threads_spawn(void *code, void *environment) {
+    if (!code) return -1;
     ensure();
     Thread *t = calloc(1, sizeof(*t));
     if (!t) return -1;
@@ -164,7 +257,7 @@ int64_t ocean_threads_spawn(void *code, void *environment) {
     t->id = next_id;
     atomic_init(&t->cancelled, 0);
 #if defined(_WIN32)
-    t->handle = CreateThread(NULL, 0, start, t, 0, NULL);
+    t->handle = CreateThread(NULL, 0, start, t, 0, &t->tid);
     int failed = t->handle == NULL;
 #else
     // Darwin defaults new pthreads to 512 KiB, which is too small for native
@@ -183,8 +276,7 @@ int64_t ocean_threads_spawn(void *code, void *environment) {
 #endif
     if (failed) { unlock(&registry); free(t); return -1; }
     next_id++;
-    tail->next = t;
-    tail = t;
+    table_insert(t);
     int64_t id = t->id;
     unlock(&registry);
     return id;
@@ -203,14 +295,19 @@ int32_t ocean_threads_await(int64_t id) {
     while (!t->done || t->joining) {
         if (cancelled()) { unlock(&registry); ocean_runtime_thread_return(); }
         cond_wait(&changed, &registry);
+        t = find(id);
+        if (!t) { unlock(&registry); ocean_threads_checkpoint(); return -1; }
     }
-    if (t->joined || t == &main_thread) { unlock(&registry); ocean_threads_checkpoint(); return 0; }
+    if (t == &main_thread) { unlock(&registry); ocean_threads_checkpoint(); return 0; }
     t->joining = 1;
+    table_remove(id);
+    Handle h = t->handle;
     unlock(&registry);
-    join(t->handle);
+    join(h);
+    free(t);
     lock(&registry);
-    t->joining = 0; t->joined = 1;
-    broadcast(&changed); unlock(&registry);
+    broadcast(&changed);
+    unlock(&registry);
     ocean_threads_checkpoint(); return 0;
 }
 void ocean_threads_yield(void) {
@@ -239,6 +336,15 @@ int32_t ocean_threads_kill(int64_t id) {
     unlock(&registry);
     ocean_threads_checkpoint(); return 0;
 }
+static int is_current_os_thread(const Thread *t) {
+    if (!t) return 0;
+    if (t == self) return 1;
+#if defined(_WIN32)
+    return t != &main_thread && t->tid == GetCurrentThreadId();
+#else
+    return t != &main_thread && pthread_equal(t->handle, pthread_self());
+#endif
+}
 static void shutdown_threads(void) {
     lock(&registry);
     if (self != &main_thread && !main_thread.done) {
@@ -248,21 +354,36 @@ static void shutdown_threads(void) {
     shutting_down = 1;
     main_thread.done = 1;
     broadcast(&changed);
-    Thread *t = main_thread.next;
-    unlock(&registry);
     returning = 1;
-    for (; t; t = t->next) if (t != self) ocean_threads_await(t->id);
-    // IDs remain valid throughout execution. Retire native handles and records
-    // only after every worker has stopped and no Ocean code can observe them.
-    t = main_thread.next;
-    while (t) {
-        Thread *next = t->next;
-#if defined(_WIN32)
-        if (t == self && !t->joined) CloseHandle(t->handle);
-#endif
-        free(t); t = next;
+    for (;;) {
+        int64_t next_worker = -1;
+        for (size_t b = 0; b < nbuckets; b++) {
+            for (Thread *t = buckets[b]; t; t = t->next) {
+                if (!is_current_os_thread(t)) { next_worker = t->id; break; }
+            }
+            if (next_worker >= 0) break;
+        }
+        if (next_worker < 0) break;
+        unlock(&registry);
+        ocean_threads_await(next_worker);
+        lock(&registry);
     }
-    main_thread.next = NULL;
+    for (size_t b = 0; b < nbuckets; b++) {
+        Thread *t = buckets[b];
+        while (t) {
+            Thread *next = t->next;
+            if (is_current_os_thread(t)) self = NULL;
+#if defined(_WIN32)
+            if (!t->joined) CloseHandle(t->handle);
+#endif
+            free(t); t = next;
+        }
+    }
+    free(buckets);
+    buckets = NULL;
+    nbuckets = 0;
+    nthreads = 0;
+    unlock(&registry);
     cleanup_sync();
 }
 
@@ -271,7 +392,7 @@ static void shutdown_threads(void) {
 typedef struct Sync Sync;
 static Sync *sync_head;
 struct Sync {
-    Sync *next;
+    Sync *prev, *next;
     Lock gate;
     Cond changed;
     int locked;
@@ -293,8 +414,35 @@ static Sync *synchronizer(void *slot) {
 #endif
         free(value); return (Sync *)empty;
     }
-    lock(&registry); value->next = sync_head; sync_head = value; unlock(&registry);
+    lock(&registry);
+    value->prev = NULL;
+    value->next = sync_head;
+    if (sync_head) sync_head->prev = value;
+    sync_head = value;
+    unlock(&registry);
     return value;
+}
+static void destroy_sync_slot(void *slot) {
+    if (!slot) return;
+    ensure();
+    _Atomic(uintptr_t) *location = slot;
+    uintptr_t present = atomic_exchange_explicit(location, 0, memory_order_acq_rel);
+    if (!present) return;
+    Sync *s = (Sync *)present;
+    lock(&registry);
+    if (s->prev) s->prev->next = s->next;
+    else if (sync_head == s) sync_head = s->next;
+    if (s->next) s->next->prev = s->prev;
+    s->prev = NULL;
+    s->next = NULL;
+    unlock(&registry);
+#if defined(_WIN32)
+    DeleteCriticalSection(&s->gate);
+#else
+    checked(pthread_mutex_destroy(&s->gate));
+    checked(pthread_cond_destroy(&s->changed));
+#endif
+    free(s);
 }
 void ocean_threads_mutex_lock(void *slot) {
     ensure();
@@ -320,6 +468,8 @@ int32_t ocean_threads_mutex_unlock(void *slot) {
     if (!s->locked) { unlock(&s->gate); return -1; }
     s->locked = 0; broadcast(&s->changed); unlock(&s->gate); return 0;
 }
+void ocean_threads_mutex_destroy(void *slot) { destroy_sync_slot(slot); }
+void ocean_threads_mutex_close(void *slot) { destroy_sync_slot(slot); }
 int32_t ocean_threads_group_add(void *slot, int64_t delta) {
     ensure(); Sync *s = synchronizer(slot); lock(&s->gate);
     if (delta < -s->count) { unlock(&s->gate); return -1; }
@@ -343,6 +493,8 @@ void ocean_threads_group_wait(void *slot) {
     }
     unlock(&s->gate); ocean_threads_checkpoint();
 }
+void ocean_threads_group_destroy(void *slot) { destroy_sync_slot(slot); }
+void ocean_threads_group_close(void *slot) { destroy_sync_slot(slot); }
 
 static void cleanup_sync(void) {
     while (sync_head) {

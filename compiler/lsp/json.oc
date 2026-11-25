@@ -61,6 +61,7 @@ func parseValue(r *reader, depth int) *J {
             else if (e == 'u') {
                 code := hex4(r);
                 if (!r.ok) return j;
+                if (code >= 56320 && code <= 57343) { r.ok = false; return j; }
                 if (code >= 55296 && code <= 56319) {
                     if (r.i + 2 > len(r.s) || r.s[r.i] != '\\' || r.s[r.i + 1] != 'u') { r.ok = false; return j; }
                     r.i += 2;
@@ -108,7 +109,23 @@ func parseValue(r *reader, depth int) *J {
         j.kind = 'n';
         if (r.s[r.i] == '-') r.i++;
         if (r.i >= len(r.s) || !unicode.IsDigit(r.s[r.i])) { r.ok = false; return j; }
-        for (r.i < len(r.s) && (unicode.IsDigit(r.s[r.i]) || r.s[r.i] == '.' || r.s[r.i] == 'e' || r.s[r.i] == 'E' || r.s[r.i] == '+' || r.s[r.i] == '-')) r.i++;
+        if (r.s[r.i] == '0') {
+            r.i++;
+            if (r.i < len(r.s) && unicode.IsDigit(r.s[r.i])) { r.ok = false; return j; }
+        } else {
+            for (r.i < len(r.s) && unicode.IsDigit(r.s[r.i])) r.i++;
+        }
+        if (r.i < len(r.s) && r.s[r.i] == '.') {
+            r.i++;
+            if (r.i >= len(r.s) || !unicode.IsDigit(r.s[r.i])) { r.ok = false; return j; }
+            for (r.i < len(r.s) && unicode.IsDigit(r.s[r.i])) r.i++;
+        }
+        if (r.i < len(r.s) && (r.s[r.i] == 'e' || r.s[r.i] == 'E')) {
+            r.i++;
+            if (r.i < len(r.s) && (r.s[r.i] == '+' || r.s[r.i] == '-')) r.i++;
+            if (r.i >= len(r.s) || !unicode.IsDigit(r.s[r.i])) { r.ok = false; return j; }
+            for (r.i < len(r.s) && unicode.IsDigit(r.s[r.i])) r.i++;
+        }
     }
     j.raw = r.s[start:r.i];
     return j;

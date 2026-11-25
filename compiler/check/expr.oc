@@ -109,7 +109,10 @@ func identExpr(c *Checker, n *ast.Node) *ast.Type {
         if (s.global) { n.sem = ast.Sem.GlobalVar; return resolveSymType(c, s); }
         n.sem = ast.Sem.LocalVar;
         markCapture(c, s);
-        if (s.freed && !c.assignTarget) err(c, n, "dynamic array has been freed; re-create it before use");
+        if (s.freed && !c.assignTarget) {
+            if (!nilT(s.ty) && Underlying(s.ty).kind == ast.TK.Ptr) err(c, n, "pointer has been freed; re-assign it before use");
+            else err(c, n, "dynamic array has been freed; re-create it before use");
+        }
         return s.ty;
     case ast.SK.Func:
         n.sem = ast.Sem.FuncValue;
@@ -675,8 +678,8 @@ func comparable(c *Checker, n *ast.Node, ta *ast.Type, tb *ast.Type) bool {
     if (Identical(ta, tb)) return true;
     if (ta.kind == ast.TK.Null && tb.kind == ast.TK.Named) return comparable(c, n, ta, Underlying(tb));
     if (tb.kind == ast.TK.Null && ta.kind == ast.TK.Named) return comparable(c, n, Underlying(ta), tb);
-    if (ta.kind == ast.TK.Null) return tb.kind == ast.TK.Ptr || tb.kind == ast.TK.Interface || IsOptional(tb) || tb.kind == ast.TK.Buffer || tb.kind == ast.TK.Union || tb.kind == ast.TK.Null;
-    if (tb.kind == ast.TK.Null) return ta.kind == ast.TK.Ptr || ta.kind == ast.TK.Interface || IsOptional(ta) || ta.kind == ast.TK.Buffer || ta.kind == ast.TK.Union;
+    if (ta.kind == ast.TK.Null) return tb.kind == ast.TK.Interface || IsOptional(tb) || tb.kind == ast.TK.Union || tb.kind == ast.TK.Null;
+    if (tb.kind == ast.TK.Null) return ta.kind == ast.TK.Interface || IsOptional(ta) || ta.kind == ast.TK.Union;
     if (ta.kind == ast.TK.Enum || tb.kind == ast.TK.Enum || ta.kind == ast.TK.Family || tb.kind == ast.TK.Family) {
         ea := ta; eb := tb;
         if (ea.kind == ast.TK.Family || eb.kind == ast.TK.Family) {
@@ -773,14 +776,16 @@ func checkWritable(c *Checker, n *ast.Node, msg string) bool {
             if (!nilT(n.a.ty) && n.a.ty.kind == ast.TK.Ptr) return true;
             return checkWritable(c, n.a, msg);
         }
-        if (n.sem == ast.Sem.ArrayData) return true;
+        if (n.sem == ast.Sem.ArrayData) {
+            if (!nilT(n.a.ty) && n.a.ty.kind == ast.TK.Ptr) return true;
+            return checkWritable(c, n.a, msg);
+        }
         if (n.sem == ast.Sem.ArrayLength || n.sem == ast.Sem.ArrayCapacity || n.sem == ast.Sem.ArraySize) { err(c, n, "cannot modify immutable struct parameter or field"); return false; }
         err(c, n, msg); return false;
     case ast.NK.Index:
         at := n.a.ty;
         if (!nilT(at) && Underlying(at).kind == ast.TK.String) { err(c, n, "strings are immutable; reassign the string instead"); return false; }
-        if (!nilT(at) && (at.kind == ast.TK.Buffer || at.kind == ast.TK.Map)) return true;
-        if (!nilT(at) && at.kind == ast.TK.Ptr) return true;
+        if (!nilT(at) && (at.kind == ast.TK.Buffer || at.kind == ast.TK.Ptr)) return true;
         return checkWritable(c, n.a, msg);
     case ast.NK.Unary:
         if (n.op == scanner.Kind.Star) return true;
@@ -791,30 +796,55 @@ func checkWritable(c *Checker, n *ast.Node, msg string) bool {
 
 func checkAddressable(c *Checker, n *ast.Node, mutable bool) bool {
     switch (n.kind) {
-    case ast.NK.Ident: return true;
+    case ast.NK.Ident:
+        if (n.sem == ast.Sem.LocalVar || n.sem == ast.Sem.GlobalVar) return true;
+        err(c, n, "cannot take the address of this expression");
+        return false;
     case ast.NK.Member:
         if (n.sem == ast.Sem.BitField) { err(c, n, "cannot take the address of a bitfield"); return false; }
         if (n.sem == ast.Sem.ArrayData) { err(c, n, "array.data is inline storage; use array.data directly as its buffer address"); return false; }
-        if (n.sem == ast.Sem.ArraySize || n.sem == ast.Sem.ArrayLength || n.sem == ast.Sem.ArrayCapacity) { err(c, n, "cannot take a mutable address of an immutable struct parameter or field"); return false; }
+        if (n.sem == ast.Sem.ArraySize || n.sem == ast.Sem.ArrayLength || n.sem == ast.Sem.ArrayCapacity || n.sem == ast.Sem.EnumRecordField) {
+            err(c, n, "cannot take a mutable address of an immutable struct parameter or field");
+            return false;
+        }
         if (n.sem == ast.Sem.Field) {
             bt := n.a.ty;
             if (!nilT(bt) && bt.kind == ast.TK.Ptr) bt = bt.elem;
             if (!nilT(bt) && Underlying(bt).kind == ast.TK.Struct) {
-                fs := c.FieldsOf(Underlying(bt));
+                u := Underlying(bt);
+                fs := c.FieldsOf(u);
                 if (n.ival < len(fs) && fs[n.ival].valueParam) { err(c, n, "cannot take a mutable address of an immutable struct parameter or field"); return false; }
+                if (!nilS(u.sym) && u.sym.immutable) { err(c, n, "cannot take a mutable address of an immutable struct parameter or field"); return false; }
             }
-            return true;
+            if (!nilT(n.a.ty) && n.a.ty.kind == ast.TK.Ptr) return true;
+            return checkAddressable(c, n.a, mutable);
         }
-        if (n.sem == ast.Sem.PkgMember) return true;
-        return true;
+        if (n.sem == ast.Sem.PkgMember && !nilS(n.sym) && n.sym.kind == ast.SK.Var) return true;
+        err(c, n, "cannot take the address of this expression");
+        return false;
     case ast.NK.Index:
         at := n.a.ty;
         if (!nilT(at) && at.kind == ast.TK.Map) { err(c, n, "cannot take the address of a map entry"); return false; }
         if (!nilT(at) && Underlying(at).kind == ast.TK.String) { err(c, n, "cannot take a mutable address of an immutable struct parameter or field"); return false; }
+        if (!nilT(at) && Underlying(at).kind == ast.TK.Array) return checkAddressable(c, n.a, mutable);
+        if (n.a.kind == ast.NK.Member && n.a.sem == ast.Sem.Field && !nilT(n.a.a.ty)) {
+            bt := n.a.a.ty;
+            if (!nilT(bt) && bt.kind == ast.TK.Ptr) bt = bt.elem;
+            if (!nilT(bt) && Underlying(bt).kind == ast.TK.Struct) {
+                u := Underlying(bt);
+                fs := c.FieldsOf(u);
+                if ((n.a.ival < len(fs) && fs[n.a.ival].valueParam) || (!nilS(u.sym) && u.sym.immutable)) {
+                    err(c, n, "cannot take a mutable address of an immutable struct parameter or field");
+                    return false;
+                }
+            }
+        }
         return true;
-    case ast.NK.Unary: return n.op == scanner.Kind.Star;
+    case ast.NK.Unary:
+        if (n.op == scanner.Kind.Star) return true;
     }
-    return true;
+    err(c, n, "cannot take the address of this expression");
+    return false;
 }
 
 // ---- instantiation as expression ----

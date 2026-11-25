@@ -3,6 +3,7 @@ package util;
 import "os";
 import "path" as filepath;
 import "strings";
+import "time";
 
 // The compiler's file-system conventions over the standard library: canonical
 // paths use '/' on every host, and operations report success as a bool (or a
@@ -34,7 +35,11 @@ func WriteFd(fd int, s string) bool {
     off := 0;
     for (off < len(b)) {
         n := native_write((fd)->int, ((&b[off]) -> (buffer<i8>))->int, (len(b) - off)->int);
-        if (n <= 0) return false;
+        if (n < 0) {
+            if (!Windows() && native_errno() == 4) continue;
+            return false;
+        }
+        if (n == 0) return false;
         off += n;
     }
     return true;
@@ -44,7 +49,11 @@ func WriteBytesFd(fd int, b *[]i8) bool {
     off := 0;
     for (off < len(*b)) {
         n := native_write((fd)->int, ((&(*b)[off]) -> (buffer<i8>))->int, (len(*b) - off)->int);
-        if (n <= 0) return false;
+        if (n < 0) {
+            if (!Windows() && native_errno() == 4) continue;
+            return false;
+        }
+        if (n == 0) return false;
         off += n;
     }
     return true;
@@ -55,9 +64,82 @@ func Stderr(s string) { WriteFd(2->i32, s); }
 
 func WriteFile(path string, s string) bool { return !os.WriteFile(path, s).hasError(); }
 
-// WriteFileMode writes s to path and then sets its permission bits.
+stageSeq := 0;
+
+func oWrOnly() int { return Windows() ? 32769 : 1; }
+func oCreat() int { return Windows() ? 256 : (MacOS() ? 512 : 64); }
+func oExcl() int { return Windows() ? 1024 : (MacOS() ? 2048 : 128); }
+func oNoFollow() int {
+    if (Windows()) return 0;
+    if (MacOS()) return 256;
+    if (os.Arch() == "aarch64") return 32768;
+    return 131072;
+}
+
+func uniqueToken(attempt int) string {
+    stageSeq++;
+    t := time.Monotonic();
+    v := ((Pid() -> uint) * 1099511628211->uint) ^ (t -> uint) ^ ((stageSeq + attempt * 131) -> uint);
+    return Hex(v, 16);
+}
+
+// CreateTempInDir creates a unique file inside dir using O_CREAT | O_EXCL | O_NOFOLLOW.
+func CreateTempInDir(dir string, prefix string, mode int) (string, int, bool) {
+    cleanDir := dir == "" ? "." : dir;
+    perm := mode & 511;
+    flags := oWrOnly() | oCreat() | oExcl() | oNoFollow();
+    for (i := 0; i < 64; i++) {
+        cand := JoinPath(cleanDir, prefix + uniqueToken(i));
+        c := CStr(cand);
+        fd := native_open((c.data)->int, flags, perm) -> int;
+        if (fd >= 0) return cand, fd, true;
+    }
+    return "", -1, false;
+}
+
+// CreateStagingPath creates a unique staging file path inside target's directory
+// without following symlinks and closes its descriptor cleanly.
+func CreateStagingPath(target string, mode int) (string, bool) {
+    dir := Dir(target);
+    prefix := "." + Base(target) + ".ocean-tmp-";
+    cand, fd, ok := CreateTempInDir(dir, prefix, mode & 511);
+    if (!ok) return "", false;
+    Close(fd);
+    return cand, true;
+}
+
+// MakeTempDirIn creates a unique private directory directly inside base.
+func MakeTempDirIn(base string, prefix string) (string, bool) {
+    cleanBase := base == "" ? "." : base;
+    for (i := 0; i < 64; i++) {
+        cand := JoinPath(cleanBase, prefix + uniqueToken(i));
+        if (Mkdir(cand)) {
+            if (!Windows()) Chmod(cand, 448);
+            return NormalizePath(cand), true;
+        }
+    }
+    return "", false;
+}
+
+// WriteFileAtomic atomically writes s to path using an exclusive staging file
+// in the same directory with permission bits masked to 0777.
+func WriteFileAtomic(path string, s string, mode int) bool {
+    perm := mode & 511;
+    dir := Dir(path);
+    prefix := "." + Base(path) + ".ocean-tmp-";
+    tmp, fd, ok := CreateTempInDir(dir, prefix, perm);
+    if (!ok) return false;
+    wrote := WriteFd(fd, s);
+    closed := Close(fd);
+    if (!wrote || !closed) { Remove(tmp); return false; }
+    if (!Windows() && (StatMode(tmp) & 511) != perm) Chmod(tmp, perm);
+    if (!Rename(tmp, path)) { Remove(tmp); return false; }
+    return true;
+}
+
+// WriteFileMode writes s to path safely with permission bits masked to 0777.
 func WriteFileMode(path string, s string, mode int) bool {
-    return WriteFile(path, s) && !os.Chmod(path, mode).hasError();
+    return WriteFileAtomic(path, s, mode & 511);
 }
 
 func WriteBufFile(path string, b *Buf) bool { return WriteFile(path, b.String()); }
@@ -172,7 +254,10 @@ func Abs(path string) string {
 func Rel(base string, path string) string {
     b := Clean(base); p := Clean(path);
     if (p == b) return ".";
-    if (b == "/") return p[1:];
+    if (b == "/") {
+        if (len(p) > 0 && p[0] == '/') return p[1:];
+        return p;
+    }
     if (strings.HasPrefix(p, b + "/")) return p[len(b) + 1:];
     return p;
 }

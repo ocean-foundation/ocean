@@ -16,6 +16,7 @@ func Hex(n uint, width int) string {
 
 // FormatFixed formats v with the given number of decimals (round half up).
 func FormatFixed(v float, decimals int) string {
+    if (v != v) return "NaN";
     neg := v < 0.0;
     if (neg) v = -v;
     scale := 1.0;

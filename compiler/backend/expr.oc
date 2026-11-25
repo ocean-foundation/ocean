@@ -22,7 +22,12 @@ func numConv(g *Gen, val string, from *ast.Type, to *ast.Type) string {
     if (f.kind == ast.TK.Int && t.kind == ast.TK.Int) return intConv(g, val, f, t);
     r := tmp(g);
     if (f.kind == ast.TK.Int && t.kind == ast.TK.Float) { emit(g, r + " = " + (f.signed ? "sitofp " : "uitofp ") + ll(f) + " " + val + " to " + ll(t)); return r; }
-    if (f.kind == ast.TK.Float && t.kind == ast.TK.Int) { emit(g, r + " = " + (t.signed ? "fptosi " : "fptoui ") + ll(f) + " " + val + " to " + ll(t)); return r; }
+    if (f.kind == ast.TK.Float && t.kind == ast.TK.Int) {
+        fnName := "llvm." + (t.signed ? "fptosi" : "fptoui") + ".sat." + ll(t) + ".f" + itoa(f.bits);
+        declareSat(g, fnName, ll(t), ll(f));
+        emit(g, r + " = call " + ll(t) + " @" + fnName + "(" + ll(f) + " " + val + ")");
+        return r;
+    }
     if (f.kind == ast.TK.Float && t.kind == ast.TK.Float) {
         if (f.bits == t.bits) return val;
         emit(g, r + " = " + (f.bits < t.bits ? "fpext " : "fptrunc ") + ll(f) + " " + val + " to " + ll(t));
@@ -36,8 +41,6 @@ func numConv(g *Gen, val string, from *ast.Type, to *ast.Type) string {
     if (f.kind == ast.TK.Bool && t.kind == ast.TK.Bool) return val;
     return val;
 }
-
-func nullPtr() string { return "inttoptr (i64 1 to ptr)"; }
 
 // box converts a concrete value to an interface pair (deep copy into a box).
 func box(g *Gen, v V) V {
@@ -72,13 +75,14 @@ func conv(g *Gen, v V, dest0 *ast.Type) V {
     ud := under(dest); ut := under(t);
     if (t.kind == ast.TK.Null) {
         if (isPair(ud)) return mkV("zeroinitializer", dest);
-        if (ud.kind == ast.TK.Enum) return zeroV(g, dest);
-        return mkV(nullPtr(), dest);
+        return zeroV(g, dest);
     }
     if (isBoxed(ud)) {
         if (isBoxed(ut)) {
-            // interface to interface: check the dynamic type when not implied
-            if (ud.kind == ast.TK.Interface && ut.kind == ast.TK.Interface && !check.IsAny(ud) && !g.c.Implements(ut, ud)) {
+            // interface or union narrowing: check the dynamic type when not statically assignable
+            needCheck := (ud.kind == ast.TK.Interface && ut.kind == ast.TK.Interface && !check.IsAny(ud) && !g.c.Implements(ut, ud)) ||
+                (ud.kind == ast.TK.Union && ut.kind == ast.TK.Union && !g.c.Assignable(ut, ud));
+            if (needCheck) {
                 d := extract(g, v.r, 0);
                 isNull := tmp(g); emit(g, isNull + " = icmp eq ptr " + d + ", null");
                 ok := typeTest(g, d, dest);
@@ -116,14 +120,39 @@ func conv(g *Gen, v V, dest0 *ast.Type) V {
     }
     if (ut.kind == ast.TK.Array && ud.kind == ast.TK.Array) {
         if (!check.Identical(ut.elem, ud.elem) && ud.len < 0) return convertBlock(g, v, dest);
+        if (!check.Identical(ut.elem, ud.elem) && ut.len >= 0 && ud.len >= 0) {
+            p := alloca(g, dest);
+            zeroInto(g, dest, p);
+            bytes := ud.len * sizeOf(g, ud.elem);
+            memcpy(g, gep(g, p, g.c.ArrayDataOffset(ud.elem)), gep(g, v.r, g.c.ArrayDataOffset(ut.elem)), bytes);
+            return freshV(g, p, dest);
+        }
         if (ut.len >= 0 && ud.len < 0) {
             r := tmp(g);
             emit(g, r + " = call ptr @oc_block_copy(ptr " + v.r + ", ptr " + desc(g, ud.elem) + ")");
             return freshV(g, r, dest);
         }
         if (ut.len < 0 && ud.len >= 0) {
+            req := ud.len * sizeOf(g, ud.elem);
+            if (req > 0) {
+                nn := tmp(g); emit(g, nn + " = icmp ne ptr " + v.r + ", null");
+                chkHdr := newLabel(g, "arrnn"); bad := newLabel(g, "arrbad"); ok := newLabel(g, "arrok");
+                condBr(g, nn, chkHdr, bad);
+                label(g, chkHdr);
+                hdr := tmp(g); emit(g, hdr + " = load i64, ptr " + v.r);
+                ge := tmp(g); emit(g, ge + " = icmp sge i64 " + hdr + ", " + itoa(req));
+                condBr(g, ge, ok, bad);
+                label(g, bad);
+                term(g, "call void @llvm.trap()\n  unreachable");
+                label(g, ok);
+            }
             p := alloca(g, dest);
-            memcpy(g, p, v.r, sizeOf(g, dest));
+            zeroInto(g, dest, p);
+            memcpy(g, gep(g, p, g.c.ArrayDataOffset(ud.elem)), gep(g, v.r, g.c.ArrayDataOffset(ut.elem)), req);
+            if (owned(g, dest)) {
+                emit(g, "call void @oc_copy(ptr " + p + ", ptr " + p + ", ptr " + desc(g, dest) + ")");
+                return freshV(g, p, dest);
+            }
             return mkV(p, dest);
         }
         v.t = dest; return v;
@@ -249,7 +278,7 @@ func genExpr(g *Gen, n *ast.Node) V {
     case ast.NK.IntLit: return intLitV(g, n, t);
     case ast.NK.FloatLit: return mkV(floatConst(g, n.text, t), t);
     case ast.NK.StrLit: return mkV(strConst(g, n.text), t);
-    case ast.NK.Null: return mkV(nullPtr(), t);
+    case ast.NK.Null: return zeroV(g, t);
     case ast.NK.Ident: return genIdent(g, n, t);
     case ast.NK.Member: return genMember(g, n, t);
     case ast.NK.Unary: return genUnary(g, n, t);
@@ -337,7 +366,6 @@ func structBase(g *Gen, base *ast.Node) (string, *ast.Type) {
     bt := typeOf(g, base);
     if (bt.kind == ast.TK.Ptr) {
         v := derefChain(g, genExpr(g, base));
-        checkNullPtr(g, v.r);
         return v.r, v.t.elem;
     }
     if (isLvalue(base)) return addrOf(g, base), bt;
@@ -370,7 +398,6 @@ func addrOf(g *Gen, n *ast.Node) string {
     case ast.NK.Unary:
         if (n.op == scanner.Kind.Star) {
             v := genExpr(g, n.a);
-            checkNullPtr(g, v.r);
             return v.r;
         }
     }
@@ -591,7 +618,6 @@ func genUnary(g *Gen, n *ast.Node, t *ast.Type) V {
         return mkV(r, t);
     case scanner.Kind.Star:
         v := genExpr(g, n.a);
-        checkNullPtr(g, v.r);
         return load(g, t, v.r);
     case scanner.Kind.Amp:
         return mkV(addrOf(g, n.a), t);
@@ -626,22 +652,11 @@ func genInc(g *Gen, n *ast.Node, target *ast.Node, post bool) V {
     nv := tmp(g);
     u := under(t);
     if (u.kind == ast.TK.Ptr) {
-        checkNullPtr(g, old.r);
         emit(g, nv + " = getelementptr inbounds i8, ptr " + old.r + ", i64 " + (up ? "" : "-") + itoa(sizeOf(g, u.elem)));
     } else if (u.kind == ast.TK.Float) emit(g, nv + " = " + (up ? "fadd " : "fsub ") + ll(t) + " " + old.r + ", 1.0");
     else emit(g, nv + " = " + (up ? "add " : "sub ") + ll(t) + " " + old.r + ", 1");
     store(g, t, p, mkV(nv, t));
     return post ? old : mkV(nv, t);
-}
-
-func checkNullPtr(g *Gen, p string) {
-    c := tmp(g);
-    emit(g, c + " = icmp eq ptr " + p + ", " + nullPtr());
-    bad := newLabel(g, "null"); ok := newLabel(g, "nonnull");
-    condBr(g, c, bad, ok);
-    label(g, bad);
-    term(g, "call void @llvm.trap()\n  unreachable");
-    label(g, ok);
 }
 
 // lvalueAddr gives a writable address (map entries are inserted when absent).
@@ -717,10 +732,7 @@ func runtimeBuffer(g *Gen, elem *ast.Type, n string) string {
     blk := tmp(g);
     emit(g, blk + " = call ptr @oc_block_new(i64 " + n + ", ptr " + desc(g, elem) + ")");
     if (needsInit(g, elem)) emit(g, "call void @oc_init_block(ptr " + blk + ", ptr " + desc(g, elem) + ")");
-    blkT := check.ArrayOf(elem, -2);
-    hidden := alloca(g, blkT);
-    if (g.trackTemps) { emit(g, "call void @oc_drop(ptr " + hidden + ", ptr " + desc(g, blkT) + ")"); ownLocal(g, hidden, blkT); }
-    emit(g, "store ptr " + blk + ", ptr " + hidden);
+    emit(g, "call void @oc_buf_push(ptr " + scopeBufList(g) + ", ptr " + blk + ", ptr " + desc(g, elem) + ")");
     return gep(g, blk, g.c.ArrayDataOffset(elem));
 }
 

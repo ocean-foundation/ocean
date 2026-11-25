@@ -35,8 +35,11 @@ func kindName(k NK) string {
 }
 
 // Dump renders a compact S-expression for tests.
-func Dump(n *Node) string {
+func Dump(n *Node) string { return dumpDepth(n, 0); }
+
+func dumpDepth(n *Node, depth int) string {
     if (Nil(n)) return "nil";
+    if (depth > 128) return "(...)";
     out := "(" + kindName(n.kind);
     if (n.name != "") out += " " + n.name;
     if (n.kind == NK.IntLit || n.kind == NK.FloatLit) out += " " + n.text;
@@ -44,12 +47,12 @@ func Dump(n *Node) string {
     if (n.kind == NK.Binary || n.kind == NK.Unary || n.kind == NK.Assign || n.kind == NK.PostInc) out += " " + scanner.KindText(n.op);
     if (n.flag) out += " !";
     if (n.ival != 0 && n.kind != NK.IntLit) out += " #" + itoa(n.ival);
-    if (!Nil(n.a)) out += " " + Dump(n.a);
-    if (!Nil(n.b)) out += " " + Dump(n.b);
-    if (!Nil(n.c)) out += " " + Dump(n.c);
-    if (!Nil(n.d)) out += " " + Dump(n.d);
-    if (len(n.list) > 0) { out += " ["; for (i, x := range n.list) { if (i > 0) out += " "; out += Dump(x); } out += "]"; }
-    if (len(n.list2) > 0) { out += " {"; for (i, x := range n.list2) { if (i > 0) out += " "; out += Dump(x); } out += "}"; }
-    if (len(n.list3) > 0) { out += " <"; for (i, x := range n.list3) { if (i > 0) out += " "; out += Dump(x); } out += ">"; }
+    if (!Nil(n.a)) out += " " + dumpDepth(n.a, depth + 1);
+    if (!Nil(n.b)) out += " " + dumpDepth(n.b, depth + 1);
+    if (!Nil(n.c)) out += " " + dumpDepth(n.c, depth + 1);
+    if (!Nil(n.d)) out += " " + dumpDepth(n.d, depth + 1);
+    if (len(n.list) > 0) { out += " ["; for (i, x := range n.list) { if (i > 0) out += " "; out += dumpDepth(x, depth + 1); } out += "]"; }
+    if (len(n.list2) > 0) { out += " {"; for (i, x := range n.list2) { if (i > 0) out += " "; out += dumpDepth(x, depth + 1); } out += "}"; }
+    if (len(n.list3) > 0) { out += " <"; for (i, x := range n.list3) { if (i > 0) out += " "; out += dumpDepth(x, depth + 1); } out += ">"; }
     return out + ")";
 }

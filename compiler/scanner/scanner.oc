@@ -1,7 +1,6 @@
 package scanner;
 import "github.com/ocean-foundation/ocean/compiler/diag";
 import "github.com/ocean-foundation/ocean/compiler/util";
-import "unicode";
 
 enum Kind {
     EOF, Ident, Int, Float, Str, Blank, AsmBody,
@@ -150,7 +149,7 @@ func op(s *Scanner, k Kind, n int) {
 
 // DecodeUTF8 strictly decodes one scalar at s[i]; returns (value, length) or (0, 0).
 func DecodeUTF8(src string, i int) (int, int) {
-    if (i >= len(src)) return 0, 0;
+    if (i < 0 || i >= len(src)) return 0, 0;
     b0 := (src[i] -> int) & 255;
     if (b0 < 128) return b0, b0 == 0 ? 0 : 1;
     n := 0;
@@ -170,6 +169,7 @@ func DecodeUTF8(src string, i int) (int, int) {
 }
 
 func EncodeUTF8(b *util.Buf, c int) {
+    if (c < 0 || c > 1114111 || (c >= 55296 && c <= 57343)) return;
     if (c < 128) { b.Addc(c -> i8); return; }
     if (c < 2048) { b.Addc((192 | (c >> 6)) -> i8); }
     else if (c < 65536) { b.Addc((224 | (c >> 12)) -> i8); b.Addc((128 | ((c >> 6) & 63)) -> i8); }
@@ -184,7 +184,7 @@ func hexVal(c i8) int {
     return 99;
 }
 func isDigitBase(c i8, hex bool) bool { return (c >= '0' && c <= '9') || (hex && hexVal(c) < 16); }
-func isAlnum(c i8) bool { return unicode.IsLetter(c) || c == '_' || unicode.IsDigit(c); }
+func isAlnum(c i8) bool { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
 
 // scanNum reads between minn and maxn digits of base starting at the current char.
 // The scanner is left on the last digit. Returns -1 after reporting an error.
@@ -246,8 +246,9 @@ func scanString(s *Scanner) {
     b: util.Buf;
     for (;;) {
         advance(s);
+        if (s.pos >= len(s.src)) { errHere(s, "End of file inside string literal"); return; }
         c := cur(s);
-        if (c == 0 && s.pos >= len(s.src) || c == 0) { errHere(s, "End of file inside string literal"); return; }
+        if (c == 0) { errHere(s, "Invalid NUL byte inside string literal"); advance(s); return; }
         if (c == '\n') { errHere(s, "Unescaped newline inside string literal"); return; }
         if (c == '"') break;
         utf8 := ((c -> int) & 255) >= 128 || (c == '\\' && (peek(s) == 'u' || peek(s) == 'U'));
@@ -264,8 +265,9 @@ func scanRaw(s *Scanner) {
     start := s.pos + 1;
     for (;;) {
         advance(s);
+        if (s.pos >= len(s.src)) { errAt(s, s.tline, s.tcol, "Unterminated raw string"); return; }
         c := cur(s);
-        if (c == 0) { errAt(s, s.tline, s.tcol, "Unterminated raw string"); return; }
+        if (c == 0) { errHere(s, "Invalid NUL byte inside raw string"); advance(s); return; }
         if (c == '`') break;
     }
     text := s.src[start:s.pos];
@@ -274,7 +276,23 @@ func scanRaw(s *Scanner) {
     t.raw = true;
 }
 
-func numberError(s *Scanner) {
+func advanceBadNumber(s *Scanner, at int) {
+    for (at < len(s.src)) {
+        c := s.src[at];
+        if (isAlnum(c)) { at++; continue; }
+        if (((c -> int) & 255) >= 128) {
+            v, n := DecodeUTF8(s.src, at);
+            if (n > 0 && IsIdentContinue(v)) { at += n; continue; }
+        }
+        if (c == '.' && at + 1 < len(s.src) && isAlnum(s.src[at + 1])) { at++; continue; }
+        break;
+    }
+    for (s.pos < at) advance(s);
+    if (s.pos < len(s.src) && s.pos == s.toff) advance(s);
+}
+
+func numberErrorAt(s *Scanner, at int) {
+    advanceBadNumber(s, at);
     errAt(s, s.tline, s.tcol, "invalid numeric digit, exponent, or integer literal exceeding 8388608 bits");
 }
 
@@ -290,25 +308,29 @@ func scanNumber(s *Scanner) {
     }
     digits := at;
     for (isDigitBase(charAt(s, at), base == 16)) {
-        if (hexVal(charAt(s, at)) >= base) { numberError(s); return; }
+        if (hexVal(charAt(s, at)) >= base) { numberErrorAt(s, at + 1); return; }
         at++;
     }
-    if (at == digits) { numberError(s); return; }
+    if (at == digits) { numberErrorAt(s, at); return; }
     intDigits := at - digits;
     if (charAt(s, at) == '.' && isDigitBase(charAt(s, at + 1), base == 16)) {
         floating = true; at++;
         for (isDigitBase(charAt(s, at), base == 16)) {
-            if (hexVal(charAt(s, at)) >= base) { numberError(s); return; }
+            if (hexVal(charAt(s, at)) >= base) { numberErrorAt(s, at + 1); return; }
             at++;
         }
     }
     if (base == 10 && (charAt(s, at) == 'e' || charAt(s, at) == 'E')) {
         floating = true; at++;
         if (charAt(s, at) == '+' || charAt(s, at) == '-') at++;
-        if (!unicode.IsDigit(charAt(s, at))) { numberError(s); return; }
-        for (unicode.IsDigit(charAt(s, at))) at++;
+        if (!(charAt(s, at) >= '0' && charAt(s, at) <= '9')) { numberErrorAt(s, at); return; }
+        for (charAt(s, at) >= '0' && charAt(s, at) <= '9') at++;
     }
-    if (isAlnum(charAt(s, at))) { numberError(s); return; }
+    if (isAlnum(charAt(s, at))) { numberErrorAt(s, at + 1); return; }
+    if (((charAt(s, at) -> int) & 255) >= 128) {
+        nv, nn := DecodeUTF8(src, at);
+        if (nn > 0 && IsIdentContinue(nv)) { numberErrorAt(s, at + nn); return; }
+    }
     // Magnitude limit: 8388608 bits.
     if (!floating) {
         bits := 0;
@@ -316,13 +338,11 @@ func scanNumber(s *Scanner) {
         else bits = (intDigits * 3322) / 1000;
         if (bits > 8388608 + 4) {
             // Precise check for values right at the boundary is done by the literal parser.
-            numberError(s); return;
+            numberErrorAt(s, at); return;
         }
     }
     text := src[start:at];
-    if (floating && (base == 10 || base == 16)) {
-        if (!FloatFinite(text)) { numberError(s); return; }
-    }
+    if (floating && !FloatFinite(text)) { numberErrorAt(s, at); return; }
     for (s.pos < at) advance(s);
     push(s, floating ? Kind.Float : Kind.Int, text);
 }
@@ -341,7 +361,7 @@ func scanAsm(s *Scanner) {
     start := s.pos + 1;
     depth := 1; quote: i8 = 0; lineC := false; blockC := false;
     advance(s);
-    for (s.pos < len(s.src) && cur(s) != 0) {
+    for (s.pos < len(s.src)) {
         c := cur(s); nx := peek(s);
         if (lineC) { if (c == '\n') lineC = false; advance(s); continue; }
         if (blockC) {
@@ -375,8 +395,8 @@ func scanAsm(s *Scanner) {
 func blockComment(s *Scanner) {
     depth := 0;
     for (;;) {
+        if (s.pos >= len(s.src)) { errAt(s, s.tline, s.tcol, "Unterminated block comment"); return; }
         c := cur(s);
-        if (c == 0) { errAt(s, s.tline, s.tcol, "Unterminated block comment"); return; }
         if (c == '/' && peek(s) == '*') { advance(s); depth++; }
         else if (c == '*' && peek(s) == '/') {
             advance(s);
@@ -435,7 +455,7 @@ func next(s *Scanner) {
     }
     if (c == '/') {
         if (p == '=') { op(s, Kind.SlashEq, 2); return; }
-        if (p == '/') { for (cur(s) != '\n' && cur(s) != 0) advance(s); return; }
+        if (p == '/') { for (s.pos < len(s.src) && cur(s) != '\n') advance(s); return; }
         if (p == '*') { blockComment(s); return; }
         op(s, Kind.Slash, 1); return;
     }
@@ -453,7 +473,7 @@ func next(s *Scanner) {
     if (c == '\'') {
         advance(s);
         f := cur(s);
-        if (f == 0 || f == '\n' || f == '\'') { errAt(s, s.tline, s.tcol, "Invalid character literal"); return; }
+        if (s.pos >= len(s.src) || f == 0 || f == '\n' || f == '\'') { errAt(s, s.tline, s.tcol, "Invalid character literal"); return; }
         v, _ := scanChar(s);
         if (s.failed) return;
         advance(s);
@@ -464,7 +484,7 @@ func next(s *Scanner) {
         return;
     }
     if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { advance(s); return; }
-    if (unicode.IsDigit(c)) { scanNumber(s); return; }
+    if (c >= '0' && c <= '9') { scanNumber(s); return; }
     v, n := DecodeUTF8(s.src, s.pos);
     if (n == 0 || !IsIdentStart(v)) {
         errHere(s, "Unexpected or invalid character or UTF-8 encoding in identifier");
@@ -490,7 +510,7 @@ func Scan(file string, src string, diags *diag.List, recover bool) ([]*Token, bo
     s.src = src; s.file = file; s.line = 1; s.col = 1; s.diags = diags; s.recover = recover;
     anyError := false;
     for (;;) {
-        if (s.pos >= len(src) || cur(s) == 0) {
+        if (s.pos >= len(src)) {
             s.tline = s.line; s.tcol = s.col; s.toff = s.pos;
             push(s, Kind.EOF, "EOF");
             break;
@@ -499,7 +519,11 @@ func Scan(file string, src string, diags *diag.List, recover bool) ([]*Token, bo
         next(s);
         if (s.failed) {
             anyError = true;
-            if (!recover) break;
+            if (!recover) {
+                s.tline = s.line; s.tcol = s.col; s.toff = s.pos;
+                push(s, Kind.EOF, "EOF");
+                break;
+            }
             s.failed = false;
             if (s.pos == before) advance(s);
         }

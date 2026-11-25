@@ -11,6 +11,7 @@ struct Parser {
     split int;
     diags *diag.List;
     failed bool;
+    anyError bool;
     trial int;
     funcDepth int;
     depth int;
@@ -21,13 +22,17 @@ struct Parser {
     rewrites []*FixRewrite;
     known map[string]bool;
     typeParamNames []string;
+    failedTrials map[int]bool;
 }
+
+func trialKey(pos int, split int, kind int) int { return (pos << 8) | ((split & 15) << 4) | kind; }
 
 // FixRewrite replaces source bytes [start, end) with text (ocean fix).
 struct FixRewrite { start int; end int; text string; }
 
 // recordFix records a legacy span starting at token start and skips past it.
 func recordFix(p *Parser, start int, r legacy.Rewrite) {
+    if (p.trial > 1) return;
     w := new(FixRewrite);
     w.start = p.toks[start].off;
     w.end = p.toks[start + r.consumed - 1].end;
@@ -97,6 +102,7 @@ func errTok(p *Parser, t *scanner.Token, col int, msg string) {
     if (p.failed) return;
     p.failed = true;
     if (p.trial > 0) return;
+    p.anyError = true;
     p.diags.Error(p.src.path, t.line, col, "syntax", msg);
 }
 func err(p *Parser, msg string) { t := tok(p); errTok(p, t, t.col + p.split, msg); }
@@ -104,6 +110,7 @@ func errNode(p *Parser, n *ast.Node, msg string) {
     if (p.failed) return;
     p.failed = true;
     if (p.trial > 0) return;
+    p.anyError = true;
     p.diags.Error(p.src.path, n.line, n.col, "syntax", msg);
 }
 func expect(p *Parser, k scanner.Kind, msg string) bool {
@@ -112,9 +119,12 @@ func expect(p *Parser, k scanner.Kind, msg string) bool {
     return false;
 }
 
-struct mark { pos int; split int; }
-func save(p *Parser) mark { m: mark; m.pos = p.pos; m.split = p.split; return m; }
-func restore(p *Parser, m mark) { p.pos = m.pos; p.split = m.split; p.failed = false; }
+struct mark { pos int; split int; rewritesLen int; }
+func save(p *Parser) mark { m: mark; m.pos = p.pos; m.split = p.split; m.rewritesLen = len(p.rewrites); return m; }
+func restore(p *Parser, m mark) {
+    p.pos = m.pos; p.split = m.split; p.failed = false;
+    for (len(p.rewrites) > m.rewritesLen) p.rewrites.pop();
+}
 
 func node(p *Parser, k ast.NK) *ast.Node {
     t := tok(p);
@@ -183,12 +193,13 @@ func ParseFile(src *ast.Source, diags *diag.List, recover bool) (*ast.Node, bool
         start := p.pos;
         topLevel(p, f);
         if (p.failed) {
+            p.anyError = true;
             if (!p.recover) return f, false;
             p.failed = false;
             recoverTop(p, start);
         }
     }
-    return f, !p.failed;
+    return f, !p.anyError && !p.failed;
 }
 
 func recoverTop(p *Parser, start int) {
@@ -504,15 +515,27 @@ func funcDecl(p *Parser) *ast.Node {
     for (_, rp := range n.list4) p.typeParamNames.append(rp.name);
     for (_, tp := range n.list3) {
         for (_, rp := range n.list4) {
-            if (rp.name == tp.name) { errNode(p, tp, "Method type parameter redeclares a receiver type parameter"); return n; }
+            if (rp.name == tp.name) {
+                errNode(p, tp, "Method type parameter redeclares a receiver type parameter");
+                for (len(p.typeParamNames) > savedTP) p.typeParamNames.pop();
+                return n;
+            }
         }
     }
-    if (!is(p, scanner.Kind.LParen)) { err(p, "Expected function parameter list"); return n; }
+    if (!is(p, scanner.Kind.LParen)) {
+        err(p, "Expected function parameter list");
+        for (len(p.typeParamNames) > savedTP) p.typeParamNames.pop();
+        return n;
+    }
     n.list = paramList(p, true, "parameter");
     if (len(n.list) > 0 && n.list[len(n.list) - 1].flag) n.flag = true;
     n.list2 = results(p);
     checkDuplicateNames(p, n);
-    if (!is(p, scanner.Kind.LBrace)) { err(p, "Expected function body"); return n; }
+    if (!is(p, scanner.Kind.LBrace)) {
+        err(p, "Expected function body");
+        for (len(p.typeParamNames) > savedTP) p.typeParamNames.pop();
+        return n;
+    }
     p.funcDepth++;
     n.b = block(p);
     p.funcDepth--;
@@ -651,7 +674,7 @@ func enumDecl(p *Parser) *ast.Node {
         if (accept(p, scanner.Kind.LParen)) {
             v.ival = 1;
             for (!is(p, scanner.Kind.RParen) && !is(p, scanner.Kind.EOF)) {
-                if (is(p, scanner.Kind.Ident) && namedParamFollows(p) && peek(p, 1) != scanner.Kind.Dot) { err(p, "Enum tuple payloads require unnamed types"); return n; }
+                if (is(p, scanner.Kind.Ident) && namedParamFollows(p) && peek(p, 1) != scanner.Kind.Dot && !unnamedMapParam(p)) { err(p, "Enum tuple payloads require unnamed types"); return n; }
                 v.list.append(typeChecked(p));
                 if (!accept(p, scanner.Kind.Comma)) break;
             }
@@ -701,7 +724,7 @@ func enumDecl(p *Parser) *ast.Node {
 }
 
 func methodSpecStart(p *Parser) bool {
-    if (is(p, scanner.Kind.KwFunc)) return true;
+    if (is(p, scanner.Kind.KwFunc)) return peek(p, 1) != scanner.Kind.LParen;
     if (!is(p, scanner.Kind.Ident)) return false;
     if (peek(p, 1) == scanner.Kind.LParen) return true;
     if (peek(p, 1) == scanner.Kind.Lt || peek(p, 1) == scanner.Kind.LBrack) {
@@ -736,6 +759,7 @@ func interfaceBody(p *Parser, n *ast.Node) {
         if (!methodSpecStart(p)) { err(p, "Interface must contain methods or one type list"); return; }
         accept(p, scanner.Kind.KwFunc);
         if (is(p, scanner.Kind.LParen)) { err(p, "Interface methods have an implied receiver"); return; }
+        if (!is(p, scanner.Kind.Ident)) { err(p, "Expected interface method name"); return; }
         m := node(p, ast.NK.MethodSpec);
         m.name = tok(p).text;
         _, dup := seen[m.name];
@@ -798,11 +822,32 @@ func isDeclStart(p *Parser) bool {
     if (i > 1) return true;
     m := save(p);
     for (j := 0; j <= i; j++) next(p);
+    typeStart := p.pos;
     p.trial++;
     typ(p);
-    ok := !p.failed && (is(p, scanner.Kind.Semi) || is(p, scanner.Kind.Assign) || is(p, scanner.Kind.Lt) && false);
-    // a legacy postfix suffix still indicates a declaration (reported later)
-    if (!p.failed && (is(p, scanner.Kind.LBrack) || is(p, scanner.Kind.Star))) ok = true;
+    ok := !p.failed && (is(p, scanner.Kind.Semi) || is(p, scanner.Kind.Assign));
+    // a legacy postfix suffix still indicates a declaration when unambiguous
+    if (!p.failed && (is(p, scanner.Kind.LBrack) || is(p, scanner.Kind.Star))) {
+        r := legacy.TypeRewrite(&p.toks, typeStart, p.src.text, true);
+        if (r.ok && typeStart + r.consumed < len(p.toks)) {
+            ak := p.toks[typeStart + r.consumed].kind;
+            t0 := p.toks[typeStart].text;
+            knownT := false;
+            if (p.toks[typeStart].kind == scanner.Kind.Ident) {
+                if (t0 == "buffer" || t0 == "int" || t0 == "i8" || t0 == "i16" || t0 == "i32" || t0 == "i64" ||
+                    t0 == "uint" || t0 == "u8" || t0 == "u16" || t0 == "u32" || t0 == "u64" ||
+                    t0 == "float" || t0 == "f32" || t0 == "f64" || t0 == "bool" || t0 == "string") knownT = true;
+                else { kv, kok := p.known[t0]; if (kok && kv) knownT = true; }
+            }
+            emptySlice := is(p, scanner.Kind.LBrack) && peek(p, 1) == scanner.Kind.RBrack;
+            if (ak == scanner.Kind.Semi && (knownT || emptySlice || (r.kinds & legacy.PointerKind()) != 0 || (r.kinds & legacy.BufferKind()) != 0)) {
+                ok = true;
+            } else if (ak == scanner.Kind.Assign) {
+                nextAfterEq := typeStart + r.consumed + 1 < len(p.toks) ? p.toks[typeStart + r.consumed + 1].kind : scanner.Kind.EOF;
+                if (knownT || emptySlice || nextAfterEq == scanner.Kind.LBrace || (r.kinds & legacy.BufferKind()) != 0) ok = true;
+            }
+        }
+    }
     p.trial--;
     restore(p, m);
     return ok;

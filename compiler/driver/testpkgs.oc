@@ -182,14 +182,27 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
             o1, o2, ok1 := util.Pipe();
             e1, e2, ok2 := util.Pipe();
             g1, g2, ok3 := util.Pipe();
-            if (!ok1 || !ok2 || !ok3) { util.Stderr("ocean test: pipe\n"); return 1; }
+            if (!ok1 || !ok2 || !ok3) {
+                if (ok1) { util.CloseFd(o1); util.CloseFd(o2); }
+                if (ok2) { util.CloseFd(e1); util.CloseFd(e2); }
+                if (ok3) { util.CloseFd(g1); util.CloseFd(g2); }
+                stopDisplay(ui, util.MonoSeconds() - start, 1);
+                if (tmpDir != "") util.RemoveAll(tmpDir);
+                util.Stderr("ocean test: pipe\n"); return 1;
+            }
+            util.SetCloexec(o1); util.SetCloexec(e1); util.SetCloexec(g2);
             args := make([]string);
             args.append(childArgs...);
             args.append(list[next]);
             maps := []int{o2, 1, e2, 2, g1, 199};
             pid := util.SpawnMapped(args.array(), maps, true, true);
             util.CloseFd(o2); util.CloseFd(e2); util.CloseFd(g1);
-            if (pid < 0) { util.CloseFd(o1); util.CloseFd(e1); util.CloseFd(g2); return 1; }
+            if (pid < 0) {
+                util.CloseFd(o1); util.CloseFd(e1); util.CloseFd(g2);
+                stopDisplay(ui, util.MonoSeconds() - start, 1);
+                if (tmpDir != "") util.RemoveAll(tmpDir);
+                return 1;
+            }
             p.started = util.MonoSeconds(); p.pid = pid; p.out = o1; p.errs = e1; p.grant = g2;
             // show the package while it is still compiling
             if (p.r.displayFD >= 0 && !p.r.displayStarted) { displaySend(p.r, "start", "", "", 0.0); p.r.displayStarted = true; }
@@ -215,7 +228,7 @@ func testPackages(flags []string, list []string, reportPath string, jsonPath str
             }
             if (!p.exited) {
                 done, st := util.WaitNoHang(p.pid);
-                if (done) { p.exited = true; p.status = st.Code; util.KillGroup(p.pid, 9); }
+                if (done) { p.exited = true; p.status = st.Code; }
             }
             if (p.exited && p.out < 0 && p.errs < 0) {
                 if (p.buffer != "") packageLine(p, p.buffer);
