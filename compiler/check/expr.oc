@@ -109,10 +109,7 @@ func identExpr(c *Checker, n *ast.Node) *ast.Type {
         if (s.global) { n.sem = ast.Sem.GlobalVar; return resolveSymType(c, s); }
         n.sem = ast.Sem.LocalVar;
         markCapture(c, s);
-        if (s.freed && !c.assignTarget) {
-            if (!nilT(s.ty) && Underlying(s.ty).kind == ast.TK.Ptr) err(c, n, "pointer has been freed; re-assign it before use");
-            else err(c, n, "dynamic array has been freed; re-create it before use");
-        }
+        if (s.freed && !c.assignTarget) err(c, n, "dynamic array has been freed; re-create it before use");
         return s.ty;
     case ast.SK.Func:
         n.sem = ast.Sem.FuncValue;

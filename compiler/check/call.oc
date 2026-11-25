@@ -381,7 +381,10 @@ func builtinCall(c *Checker, n *ast.Node, name string) *ast.Type {
             err(c, a, "cannot free address of a local or global variable");
             return tVoid;
         }
-        if (n != c.deferredCall && u.kind != ast.TK.Invalid && a.kind == ast.NK.Ident && a.sem == ast.Sem.LocalVar && !nilS(a.sym) && !nilF(c.fn) && a.sym.depth == c.fn.level) a.sym.freed = true;
+        if (n != c.deferredCall && (u.kind == ast.TK.Dyn || u.kind == ast.TK.String) &&
+            a.kind == ast.NK.Ident && a.sem == ast.Sem.LocalVar && !nilS(a.sym) && !nilF(c.fn) && a.sym.depth == c.fn.level) {
+            a.sym.freed = true;
+        }
         return tVoid;
     }
     if (name == "delete") {

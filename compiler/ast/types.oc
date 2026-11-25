@@ -101,7 +101,7 @@ struct Symbol {
     id int;
     builtin bool;           // Result/Optional and their methods
     used bool;
-    freed bool;
+    freed bool;             // local dynamic array or string explicitly released
     depth int;
     scopeLevel int;
     declIndex int;

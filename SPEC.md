@@ -1478,7 +1478,7 @@ mixed []I{…}, []interface{…}{…}, map[K]V{…}
 | `zero(T)` | zero value (§7.6) |
 | `new(T)` | allocate zeroed heap storage, initialize to `zero(T)`, return `*T`; each call returns a distinct allocation; `void` and `array<T>` rejected; allocation failure traps |
 | `make([]T)`, `make(map[K]V)` | empty dynamic array / map; other types rejected |
-| `free(x)` | release a dynamic array/string's storage, or a pointer's allocation (after releasing the pointee's owned contents, without following nested pointers); rejects `free(&local)`/`free(&global)` and same-scope use-after-`free` on local `*T` before reassignment without zeroing `x`; exactly one argument |
+| `free(x)` | release a dynamic array/string's storage, or a pointer's allocation (after releasing the pointee's owned contents, without following nested pointers); rejects `free(&local)` and `free(&global)`; exactly one argument |
 | `delete(m, k)` | remove map entry |
 | `recover()` | §11.4; returns `any`; no arguments |
 | `[n]T` (expression) | new dynamic array of `n` zero elements (`n ≥ 0`, evaluated once) |
@@ -1834,8 +1834,9 @@ Ocean has no garbage collector and no reference counting; ownership is static.
 - **Pointers and unsized buffers are non-owning**: copying copies the address;
   scope exit never frees a pointee. Memory from `new` must be released with
   `free(p)` or it leaks. Calling `free(&local)` or `free(&global)` is a compile
-  error, and using a local `*T` variable in the same scope after `free(p)`
-  before reassignment is a compile error (`free(p)` does not zero `p`).
+  error. `free(p)` leaves the pointer value intact and invalidates all aliases
+  to that allocation. The compiler does not track freed raw pointers. The
+  caller must avoid using or freeing them again.
 - Runtime `buffer<T, n>` allocations and `buffer<T>{…}` literals are
   **block-scoped** stack views (released on block exit; repeated evaluations in
   a loop do not invalidate earlier live views in the same block). Directly

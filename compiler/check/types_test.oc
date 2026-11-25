@@ -31,16 +31,44 @@ func TestUseBeforeDeferredFree(t *testing.T) {
     if (*p != 7) t.Error("pointer was not usable before deferred free");
 }
 
-func TestInvalidRecursiveLayouts(t *testing.T) {
-    dir, ok := util.MakeTempDir("ocean-type-cycles-");
+func freeOnFailure(failed bool) int {
+    p := new(int);
+    if (failed) {
+        free(p);
+        return -1;
+    }
+    *p = 1;
+    value := *p;
+    free(p);
+    return value;
+}
+
+func TestPointerFreeOnReturningBranch(t *testing.T) {
+    if (freeOnFailure(true) != -1 || freeOnFailure(false) != 1) {
+        t.Error("pointer cleanup on a returning branch");
+    }
+}
+
+func checkFixture(t *testing.T, source string) *diag.List {
+    dir, ok := util.MakeTempDir("ocean-check-fixture-");
     if (!ok) t.Fatal("create fixture directory");
     defer util.RemoveAll(dir);
     d := diag.NewList(); d.live = false;
     b := loader.NewBuild(d);
-    source := "package p; struct Bad(self Bad) {} " +
-        "struct Chain<T> { next []Chain<[]T>; } func f() { value: Chain<int>; }";
-    if (!util.WriteFile(dir + "/main.oc", source) || !b.LoadPackage(dir)) t.Fatal("load recursion fixture");
+    if (!util.WriteFile(dir + "/main.oc", source) || !b.LoadPackage(dir)) t.Fatal("load checker fixture");
     NewChecker(d).Check(b.Order(), b.StandardSource());
+    return d;
+}
+
+func TestCheckerDoesNotTrackFreedPointers(t *testing.T) {
+    // Check the diagnostics only. This function must never be executed.
+    d := checkFixture(t, "package p; func f() { p := new(int); free(p); free(p); }");
+    if (d.errors != 0) t.Error("the checker tracked a freed raw pointer");
+}
+
+func TestInvalidRecursiveLayouts(t *testing.T) {
+    d := checkFixture(t, "package p; struct Bad(self Bad) {} " +
+        "struct Chain<T> { next []Chain<[]T>; } func f() { value: Chain<int>; }");
     cycle := false;
     expansion := false;
     for (_, diagnostic := range d.items) {
