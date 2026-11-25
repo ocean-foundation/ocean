@@ -1,0 +1,44 @@
+package runtime;
+import "testing";
+
+struct DeferredPayload { message string; parts []string; }
+interface DeferredAction { func AddTo(*int); }
+
+func (value DeferredPayload) AddTo(total *int) {
+    *total += len(value.message) + len(value.parts[0]);
+}
+
+func addDeferredArguments(total *int, payload DeferredPayload, extra ...string) {
+    *total += len(payload.message) + len(extra[0]);
+}
+
+func captureDeferredValues(total *int, p *int, skip bool) int {
+    payload := DeferredPayload{message: "message", parts: []string{"part"}};
+    receiver: DeferredAction = payload;
+    defer receiver.AddTo(total);
+    defer addDeferredArguments(total, payload, payload.message);
+    if (skip) {
+        defer free(p);
+        return panic "skip deferred calls";
+    }
+    return 1;
+}
+
+func recoverSkippedDefers(total *int, p *int) (caught bool) {
+    defer func() { caught = recover() != null; }();
+    captureDeferredValues(total, p, true);
+    return;
+}
+
+func TestSkippedDefersPreserveBorrowedPointers(t *testing.T) {
+    total := 0;
+    p := new(int);
+    *p = 5;
+    if (!recoverSkippedDefers(&total, p) || total != 0 || *p != 5) {
+        t.Error("a skipped defer ran or destroyed borrowed data");
+    }
+    if (captureDeferredValues(&total, p, false) != 1 || total != 25) {
+        t.Error("deferred calls lost their captured values");
+    }
+    free(p);
+}

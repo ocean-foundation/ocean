@@ -413,8 +413,11 @@ func genReturn(g *Gen, n *ast.Node) {
 
 // ---- defer ----
 
-// deferItem is one value captured at the defer site.
-struct deferItem { ty string; size int; agg bool; ot *ast.Type; }
+// Aggregate and wide integer captures use separately allocated storage.
+func indirectDeferCapture(t *ast.Type) bool {
+    u := under(t);
+    return isAgg(t) || (u.kind == ast.TK.Int && u.bits > 128);
+}
 
 // genDefer captures the callee and arguments now and registers a thunk record.
 func genDefer(g *Gen, n *ast.Node) {
@@ -526,7 +529,7 @@ func genDefer(g *Gen, n *ast.Node) {
     emit(g, rec + " = call ptr @oc_alloc(i64 " + itoa(16 + nslots * 16) + ")");
     for (i, v := range items) {
         slot := gep(g, rec, 16 + i * 16);
-        if (isAgg(v.t) || (under(v.t).kind == ast.TK.Int && under(v.t).bits > 128)) {
+        if (indirectDeferCapture(v.t)) {
             h := tmp(g);
             emit(g, h + " = call ptr @oc_alloc(i64 " + itoa(sizeOf(g, v.t)) + ")");
             store(g, v.t, h, v);
@@ -583,11 +586,32 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
     f := newFn(g, saved.inst, name);
     f.cur = "entry";
     g.fn = f;
+    run := newLabel(g, "defer.run");
+    discard := newLabel(g, "defer.discard");
+    invoke := tmp(g);
+    emit(g, invoke + " = icmp ne i32 %invoke, 0");
+    condBr(g, invoke, run, discard);
+    label(g, discard);
+    for (i, v := range items) {
+        drop := g.trackTemps && v.fresh && owned(g, v.t);
+        indirect := indirectDeferCapture(v.t);
+        if (!drop && !indirect) continue;
+        slot := gep(g, "%rec", 16 + i * 16);
+        if (indirect) {
+            h := tmp(g);
+            emit(g, h + " = load ptr, ptr " + slot);
+            slot = h;
+        }
+        if (drop) emit(g, "call void @oc_drop(ptr " + slot + ", ptr " + desc(g, v.t) + ")");
+        if (indirect) emit(g, "call void @oc_free(ptr " + slot + ")");
+    }
+    term(g, "ret void");
+    label(g, run);
     vals := make([]V);
     shells := make([]string); // heap copies of aggregate arguments, freed after the call
     for (i, v := range items) {
         slot := gep(g, "%rec", 16 + i * 16);
-        if (isAgg(v.t) || (under(v.t).kind == ast.TK.Int && under(v.t).bits > 128)) {
+        if (indirectDeferCapture(v.t)) {
             h := tmp(g); emit(g, h + " = load ptr, ptr " + slot);
             shells.append(h);
             vals.append(load(g, v.t, h));
@@ -650,7 +674,7 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
             if (u.kind == ast.TK.Ptr) { slot = vals[0].r; mt = under(u.elem); }
             else slot = spill(g, vals[0]);
             kslot := gep(g, "%rec", 32);
-            if (isAgg(items[1].t) || (under(items[1].t).kind == ast.TK.Int && under(items[1].t).bits > 128)) {
+            if (indirectDeferCapture(items[1].t)) {
                 h := tmp(g); emit(g, h + " = load ptr, ptr " + kslot); kslot = h;
             }
             emit(g, "call void @oc_map_delete(ptr " + slot + ", ptr " + kslot + ", ptr " + desc(g, mt.key) + ")");
@@ -687,7 +711,7 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
             for (i, it := range items) {
                 if (!owned(g, it.t)) continue;
                 sp := gep(g, "%rec", 16 + i * 16);
-                if (isAgg(it.t) || (under(it.t).kind == ast.TK.Int && under(it.t).bits > 128)) {
+                if (indirectDeferCapture(it.t)) {
                     h := tmp(g); emit(g, h + " = load ptr, ptr " + sp); sp = h;
                 }
                 emit(g, "call void @oc_drop(ptr " + sp + ", ptr " + desc(g, it.t) + ")");
@@ -732,7 +756,7 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
     }
     if (!g.fn.terminated) { for (_, h := range shells) emit(g, "call void @oc_free(ptr " + h + ")"); }
     term(g, "ret void");
-    g.mod.Add("define internal void ").Add(name).Add("(ptr %rec) {\nentry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
+    g.mod.Add("define internal void ").Add(name).Add("(ptr %rec, i32 %invoke) {\nentry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
     g.fn = saved;
     return name;
 }

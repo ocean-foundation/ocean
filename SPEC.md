@@ -1763,6 +1763,8 @@ dispatches dynamically.
   a `forward panic` block. Declarations inside a forwarded single statement
   remain visible in the enclosing scope.
 - The first non-forwarding caller runs its deferred calls and can `recover`.
+- The runtime releases owned arguments and receivers captured by skipped
+  deferred calls.
 
 ### 11.6 `extern` functions
 

@@ -35,7 +35,10 @@ enum { F_SIGNED = 1, F_OWNED = 2, F_VARW = 4, F_MIXED = 8, F_NAMED = 16 };
 typedef struct OcArr { int64_t len, cap; char *data; } OcArr;
 typedef struct { const OcType *t; void *data; } OcAny;
 typedef struct { const char *file; int64_t line, col; const char *text; } OcSite;
-typedef struct OcDefer { struct OcDefer *next; void (*thunk)(struct OcDefer *); } OcDefer;
+typedef struct OcDefer {
+    struct OcDefer *next;
+    void (*thunk)(struct OcDefer *, int32_t invoke);
+} OcDefer;
 typedef struct OcLocal { void *slot; const struct OcType *t; } OcLocal;
 /* locals: the frame's owned locals (null-slot terminated), released when a
  * panic unwinds past the frame. */
@@ -1306,7 +1309,7 @@ void oc_run_defers(OcFrame *f) {
         OcDefer *d = f->defers;
         f->defers = d->next;
         oc_in_defer++;
-        d->thunk(d);
+        d->thunk(d, 1);
         oc_in_defer--;
         free(d);
     }
@@ -1315,10 +1318,11 @@ void oc_run_defers(OcFrame *f) {
 static void drop_locals(OcFrame *f) {
     if (f->locals) for (const OcLocal *l = f->locals; l->slot; l++) oc_drop(l->slot, l->t);
 }
-static void free_defers(OcFrame *f) {
+static void discard_defers(OcFrame *f) {
     while (f->defers) {
         OcDefer *d = f->defers;
         f->defers = d->next;
+        d->thunk(d, 0);
         free(d);
     }
 }
@@ -1366,7 +1370,7 @@ static void unwind(OcArr *msg, int64_t site, OcFrame *start, OcFrame *traceFrom)
                     free(old->header);
                     old->header = NULL;
                 }
-                free_defers(f);
+                discard_defers(f);
                 oc_in_defer = f->in_defer;
                 oc_top = f;
                 _longjmp(*(jmp_buf *)f->jb, 1);
@@ -1397,7 +1401,7 @@ void oc_return_panic(OcArr *msg, int64_t site) {
     while (target->prev && target->prev->name && (target->site & FORWARD_BIT)) target = target->prev;
     int can_rec = recovery_possible(target);
     for (OcFrame *s = f; s && s != target; s = s->prev) {
-        free_defers(s);
+        discard_defers(s);
         if (can_rec) drop_locals(s);
     }
     unwind(msg, target->site & ~FORWARD_BIT, target, f);

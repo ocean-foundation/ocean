@@ -382,7 +382,8 @@ func ffiCapture(g *Gen, n *ast.Node) []V {
         store(g, anyT, slot, bv);
     }
     ex := tmp(g); emit(g, ex + " = load ptr, ptr " + extras);
-    out.append(mkV(ex, check.DynOf(anyT)));
+    // ffiCall normally drops this fresh array directly. A skipped defer owns it.
+    out.append(freshNoTemp(ex, check.DynOf(anyT)));
     return out;
 }
 
