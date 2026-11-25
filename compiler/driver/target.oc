@@ -12,13 +12,7 @@ func targetMain(args []string) int {
         return 0;
     }
     if (len(args) == 1 && args[0] == "--list") {
-        util.Stdout("TARGET           OCOS     OCARCH\n");
-        for (_, target := range util.KnownTargets()) {
-            name := target.Name();
-            util.Stdout(name + strings.Repeat(" ", 17 - len(name)) +
-                target.system + strings.Repeat(" ", 9 - len(target.system)) + target.arch + "\n");
-        }
-        return 0;
+        return listTargets();
     }
     remove := args[0] == "--remove";
     if (remove) args = args[1:];
@@ -55,6 +49,42 @@ func targetMain(args []string) int {
         } else if (!installTarget(root, target)) failed = true;
     }
     return failed ? 1 : 0;
+}
+
+func listTargets() int {
+    dir, ok := util.MakeTempDir("ocean-target-list-");
+    if (!ok) {
+        util.Stderr("ocean target: could not create a temporary directory to check targets\n");
+        return 1;
+    }
+    defer util.RemoveAll(dir);
+    _, noColor := util.Getenv("NO_COLOR");
+    force, _ := util.Getenv("CLICOLOR_FORCE");
+    color := !noColor && (util.IsTerminal(1) || (force != "" && force != "0"));
+    util.Stdout("TARGET           OCOS     OCARCH    READY\n");
+    for (_, target := range util.KnownTargets()) {
+        name := target.Name();
+        ready := targetReady(target, dir);
+        mark := ready ? "✓" : "✗";
+        if (color) mark = (ready ? "\x1b[32m" : "\x1b[31m") + mark + "\x1b[0m";
+        util.Stdout(name + strings.Repeat(" ", 17 - len(name)) +
+            target.system + strings.Repeat(" ", 9 - len(target.system)) +
+            target.arch + strings.Repeat(" ", 10 - len(target.arch)) + mark + "\n");
+    }
+    return 0;
+}
+
+func targetReady(target util.Target, dir string) bool {
+    args := clangTargetArgs(target);
+    if (!target.Wasm()) args.append(ffiCompileFlags(target)...);
+    if (!appendTargetProbe(target, dir, &args)) return false;
+    if (!target.Wasm() && !appendDependencyLinkFlags(target, &args, true, true, false)) return false;
+    status, _ := util.RunCapture(args.array());
+    if (status.Failed || status.Code != 0) return false;
+    if (target.system == "windows") {
+        status, _ = util.RunCapture([]string{targetTool(managedTargetRoot(target), "llvm-ar"), "--version"}.array());
+    }
+    return !status.Failed && status.Code == 0;
 }
 
 func targetRoot() string {
@@ -157,9 +187,16 @@ func unpackTargetBundle(stage string, destination string, target util.Target) bo
     url := "https://github.com/ocean-foundation/ocean-c/releases/download/" + bundleRelease() + "/" + asset;
     archive := stage + "/" + asset;
     util.Stdout("Downloading " + asset + "\n");
-    if (!targetCommand([]string{"curl", "--fail", "--location", "--silent", "--show-error", "--retry", "2",
-        "--connect-timeout", "15", "--proto", "=https", "--proto-redir", "=https", "--output", archive, url})) return false;
+    progress := util.IsTerminal(2) ? "--progress-bar" : "--silent";
+    status := util.Run([]string{"curl", "--fail", "--location", progress, "--show-error", "--retry", "2",
+        "--connect-timeout", "15", "--proto", "=https", "--proto-redir", "=https", "--output", archive, url}.array());
+    if (status.Failed || status.Code != 0) {
+        util.Stderr("ocean target: curl failed\n");
+        return false;
+    }
+    util.Stdout("Verifying download...");
     if (!verifyTargetArchive(archive, digest) || !util.Mkdir(destination)) return false;
+    util.Stdout("Extracting package...");
     if (!targetCommand([]string{"tar", "-xf", archive, "-C", destination})) return false;
     return util.Remove(archive);
 }
@@ -228,16 +265,20 @@ func installTarget(root string, target util.Target) bool {
 
 // Probe the SDK and bundled libraries before making a target visible to builds.
 func probeTarget(root string, target util.Target, stage string, payload string, sdk string) bool {
+    args := managedClangArgs(root, target, payload, sdk);
+    if (!appendTargetProbe(target, stage, &args)) return false;
+    if (!target.Wasm()) args.append("-lffi", "-lcurl");
+    return targetCommand(args);
+}
+
+func appendTargetProbe(target util.Target, stage string, args *[]string) bool {
     source := stage + "/probe.c";
     program := "#include <stdlib.h>\n#include <ffi.h>\n#include <curl/curl.h>\nint main(void) { return curl_version() == NULL || ffi_type_void.size != 1; }\n";
     if (target.Wasm()) program = "int main(void) { return 0; }\n";
     if (!util.WriteFile(source, program)) return false;
-    args := managedClangArgs(root, target, payload, sdk);
-    if (len(args) == 0) return false;
-    args.append(source, "-o", stage + "/probe" + target.ExeSuffix());
-    if (target.Wasm()) args.append("-nostdlib", "-Wl,--no-entry", "-Wl,--export=main");
-    else args.append("-lffi", "-lcurl");
-    return targetCommand(args);
+    (*args).append(source, "-o", stage + "/" + target.Name() + target.ExeSuffix());
+    if (target.Wasm()) (*args).append("-nostdlib", "-Wl,--no-entry", "-Wl,--export=main");
+    return true;
 }
 
 func managedTargetRoot(target util.Target) string {
@@ -246,21 +287,34 @@ func managedTargetRoot(target util.Target) string {
     sysroot, _ := util.Getenv("OCEAN_SYSROOT");
     if (clang != "" || sysroot != "") return "";
     root := targetRoot();
-    return root != "" && targetInstalled(targetPath(root, target)) ? root : "";
+    if (root == "") return "";
+    if (targetInstalled(targetPath(root, target))) return root;
+    // WebAssembly only needs the shared host tools and the bundled runtime.
+    if (target.Wasm() && (targetTool(root, "clang") != "clang" || targetTool(root, "wasm-ld") != "wasm-ld")) return root;
+    return "";
+}
+
+func targetTool(root string, name string) string {
+    if (root != "") {
+        path := hostToolPath(root) + "/bin/" + name + os.ExeSuffix();
+        if (util.IsExecutable(path)) return path;
+    }
+    return name;
 }
 
 func managedClangArgs(root string, target util.Target, payload string, sdk string) []string {
-    suffix := os.ExeSuffix();
     bin := hostToolPath(root) + "/bin/";
     if (target.system == "macos") {
         return []string{"/usr/bin/clang", "--target=" + target.Triple(), "-isysroot", sdk, "-iwithsysroot", "/usr/include/ffi"};
     }
-    args := []string{bin + "clang" + suffix, "--no-default-config", "--target=" + target.Triple()};
+    clang := targetTool(root, "clang");
+    args := []string{clang, "--target=" + target.Triple()};
+    if (clang != "clang") args.append("--no-default-config");
     if (target.Wasm()) {
         args.append("-B" + bin);
     } else {
         args.append("-I" + payload + "/include", "-L" + payload + "/lib",
-            "-fuse-ld=lld", "--ld-path=" + bin + "ld.lld" + suffix);
+            "-fuse-ld=lld", "--ld-path=" + targetTool(root, "ld.lld"));
         if (target.system == "linux") {
             sysroot := payload + "/sysroot";
             args.append("--sysroot=" + sysroot, "--gcc-toolchain=" + sysroot + "/usr",

@@ -67,7 +67,12 @@ func runtimeSources(p *Program, dir string) []string {
 
 // clangArgs applies the same target and sysroot to IR, runtime C, and linking.
 func clangArgs(options []string) []string {
-    target := util.BuildTarget();
+    args := clangTargetArgs(util.BuildTarget());
+    args.append(options...);
+    return args;
+}
+
+func clangTargetArgs(target util.Target) []string {
     root := managedTargetRoot(target);
     args := make([]string);
     if (root != "") {
@@ -83,17 +88,21 @@ func clangArgs(options []string) []string {
         if (sysroot != "" && !target.Wasm()) args.append("--sysroot=" + sysroot);
     }
     if (target.system == "windows") args.append("-D_longjmp=longjmp", "-D__USE_MINGW_SETJMP_NON_SEH");
-    args.append(options...);
     return args;
+}
+
+func ffiCompileFlags(target util.Target) []string {
+    flags, ok := targetPackageFlags(target, "libffi", "--cflags");
+    if (ok) return flags;
+    if (target.system == "macos") return []string{"-iwithsysroot", "/usr/include/ffi"};
+    return make([]string);
 }
 
 func clangRun(p *Program, args []string) bool {
     target := util.BuildTarget();
     for (_, arg := range args) {
         if (strings.HasSuffix(arg, "/ocean_ffi.c")) {
-            flags, ok := packageFlags("libffi", "--cflags");
-            if (ok) args.append(flags...);
-            else if (target.system == "macos") args.append("-iwithsysroot", "/usr/include/ffi");
+            args.append(ffiCompileFlags(target)...);
             break;
         }
     }
@@ -182,31 +191,37 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
 
 // appendLinkFlags adds the system libraries and static flags of a final link.
 func appendLinkFlags(p *Program, args *[]string, staticLink bool) bool {
-    windows := util.BuildTarget().system == "windows";
+    target := util.BuildTarget();
+    windows := target.system == "windows";
     if (p.checker.UsesThreads() && !windows) (*args).append("-pthread");
     if (windows) {
         (*args).append("-Wl,--stack,8388608");
         if (usesPackage(p, "os/exec")) (*args).append("-lshell32");
     }
-    if (p.usesFFI) {
-        flags, ok := packageFlags("libffi", "--libs");
+    if (!appendDependencyLinkFlags(target, args, p.usesFFI, p.usesCurl, staticLink)) return false;
+    if (staticLink) (*args).append("-static");
+    return true;
+}
+
+func appendDependencyLinkFlags(target util.Target, args *[]string, ffi bool, curl bool, staticLink bool) bool {
+    if (ffi) {
+        flags, ok := targetPackageFlags(target, "libffi", "--libs");
         if (ok) (*args).append(flags...); else (*args).append("-lffi");
     }
-    if (p.usesCurl && !targetWasm()) {
+    if (curl && !target.Wasm()) {
         if (staticLink) {
-            flags, fok := packageFlags("libcurl", "--static", "--libs");
+            flags, fok := targetPackageFlags(target, "libcurl", "--static", "--libs");
             if (!fok) { util.Stderr("backend error: static HTTP linking requires pkg-config and the target libcurl static development dependencies (set PKG_CONFIG_LIBDIR for cross builds)\n"); return false; }
             (*args).append(flags...);
         } else {
             flags := []string{"-lcurl"};
-            if (!util.BuildTarget().IsHost()) {
-                targetFlags, ok := packageFlags("libcurl", "--libs");
+            if (!target.IsHost()) {
+                targetFlags, ok := targetPackageFlags(target, "libcurl", "--libs");
                 if (ok && len(targetFlags) > 0) flags = targetFlags;
             }
             (*args).append(flags...);
         }
     }
-    if (staticLink) (*args).append("-static");
     return true;
 }
 
@@ -370,20 +385,18 @@ func wasmCompileFlags(dir string) []string {
 func objectLinkArgs(output string) []string {
     target := util.BuildTarget();
     if (target.system == "windows") {
-        root := managedTargetRoot(target);
-        ar := root == "" ? "llvm-ar" : hostToolPath(root) + "/bin/llvm-ar" + os.ExeSuffix();
-        return []string{ar, "rcs", output};
+        return []string{targetTool(managedTargetRoot(target), "llvm-ar"), "rcs", output};
     }
     args := clangArgs([]string{"-r", "-nostdlib", "-o", output});
     if (target.system == "macos") args.append("-Wl,-keep_private_externs");
     return args;
 }
 
-func packageFlags(packageName string, options ...string) ([]string, bool) {
+func targetPackageFlags(target util.Target, packageName string, options ...string) ([]string, bool) {
     // Managed bundles supply target headers and libraries directly to Clang.
     // Static curl still needs pkg-config to describe its dependency closure.
-    if (managedTargetRoot(util.BuildTarget()) != "" && options[0] != "--static") return make([]string), false;
-    if (!util.BuildTarget().IsHost()) {
+    if (managedTargetRoot(target) != "" && options[0] != "--static") return make([]string), false;
+    if (!target.IsHost()) {
         libdir, _ := util.Getenv("PKG_CONFIG_LIBDIR");
         if (libdir == "") return make([]string), false;
     }

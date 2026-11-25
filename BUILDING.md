@@ -79,7 +79,10 @@ host target.
 OCOS=linux OCARCH=aarch64 ocean build -o app .
 ```
 
-Install managed toolchain components before building for an explicit target.
+Use `ocean target --list` to check which targets can compile and link with
+the toolchains on `PATH` or in the target installation directory. A green
+checkmark means the target is ready. A red cross means the toolchain check
+failed. Install managed components for targets you need.
 
 ```sh
 ocean target --list

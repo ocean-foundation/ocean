@@ -1874,8 +1874,9 @@ executable. File paths are relative to the compiler's working directory.
   `riscv64`. macOS and Windows support `x86_64` and `aarch64`.
   `OCOS=js OCARCH=wasm` selects `wasm32-unknown-unknown`.
   `run` and `test` require the host target.
-- `ocean target --list` prints the target names and their `OCOS` and `OCARCH`
-  values. `ocean target <target>...` installs toolchain components for the
+- `ocean target --list` prints the target names, their `OCOS` and `OCARCH`
+  values, and whether the available toolchain can compile and link for each
+  target. `ocean target <target>...` installs toolchain components for the
   named targets. `ocean target --remove <target>...` removes those targets.
   Builds use the installed components when the target is selected explicitly.
   `OCEAN_TARGET_DIR` overrides the per-user installation directory. macOS targets
