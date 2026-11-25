@@ -648,7 +648,8 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
         ffiCall(g, c.sym, vals, check.TVoid());
     } else if (kind == 8) {
         slot := vals[0].r;
-        elem := under(vals[0].t.elem).elem;
+        rt := under(vals[0].t.elem);
+        elem := rt.elem;
         es := sizeOf(g, elem);
         st := itoa(site(g, site0));
         if (c.text == "pop" || c.text == "remove") {
@@ -664,7 +665,8 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
             for (i := first; i < len(vals); i++) {
                 v := vals[i];
                 if (c.flag && i == len(vals) - 1) {
-                    emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + index + ", ptr " + arrayDataPtr(g, v) + ", i64 " + collectionLen(g, v) + ", ptr " + desc(g, elem) + ", i64 " + st + ")");
+                    // The defer already owns a snapshot of the source.
+                    insertArraySpread(g, rt, slot, index, freshNoTemp(v.r, v.t), st);
                     continue;
                 }
                 p := tmp(g);

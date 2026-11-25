@@ -551,41 +551,43 @@ func genBuiltin(g *Gen, n *ast.Node, t *ast.Type) V {
         if (homogeneous(rt)) homCheckSlot(g, rt, slot, index, itoa(len(vals)));
         if (hasSpread) { ni := tmp(g); emit(g, ni + " = add i64 " + index + ", " + itoa(len(vals))); index = ni; }
     }
-    if (hasSpread) {
-        su := under(spread.t);
-        se := su.kind == ast.TK.String ? check.TI8() : su.elem;
-        if (check.Identical(se, elem)) {
-            sd := arrayDataPtr(g, spread);
-            sn := collectionLen(g, spread);
-            emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + index + ", ptr " + sd + ", i64 " + sn + ", ptr " + desc(g, elem) + ", i64 " + itoa(site(g, n)) + ")");
-            if (homogeneous(rt)) homCheckSlot(g, rt, slot, index, sn);
-        } else {
-            if (!spread.fresh) spread = copyV(g, spread);
-            sd := arrayDataPtr(g, spread);
-            sn := collectionLen(g, spread);
-            dst := tmp(g);
-            emit(g, dst + " = call ptr @oc_arr_insert(ptr " + slot + ", i64 " + index + ", i64 " + sn + ", i64 " + itoa(es) + ", i64 " + itoa(site(g, n)) + ")");
-            idx := alloca(g, check.TInt());
-            emit(g, "store i64 0, ptr " + idx);
-            head := newLabel(g, "sp"); body := newLabel(g, "spb"); done := newLabel(g, "spd");
-            br(g, head);
-            label(g, head);
-            iv := tmp(g); emit(g, iv + " = load i64, ptr " + idx);
-            c := tmp(g); emit(g, c + " = icmp slt i64 " + iv + ", " + sn);
-            condBr(g, c, body, done);
-            label(g, body);
-            ep := gepDyn(g, sd, iv, sizeOf(g, se));
-            ev := copyV(g, conv(g, load(g, se, ep), elem));
-            store(g, elem, gepDyn(g, dst, iv, es), ev);
-            iv2 := tmp(g); emit(g, iv2 + " = add i64 " + iv + ", 1");
-            emit(g, "store i64 " + iv2 + ", ptr " + idx);
-            br(g, head);
-            label(g, done);
-            if (homogeneous(rt)) homCheckSlot(g, rt, slot, index, sn);
-        }
-    }
+    if (hasSpread) insertArraySpread(g, rt, slot, index, spread, itoa(site(g, n)));
     if (snap != "") writeBack(g, recv, snap, rt);
     return mkV("", t);
+}
+
+func insertArraySpread(g *Gen, rt *ast.Type, slot string, index string, spread V, siteID string) {
+    elem := rt.elem;
+    source := under(spread.t);
+    sourceElem := source.kind == ast.TK.String ? check.TI8() : source.elem;
+    same := check.Identical(sourceElem, elem);
+    if (!same && !spread.fresh) spread = copyV(g, spread);
+    data := arrayDataPtr(g, spread);
+    count := collectionLen(g, spread);
+    if (same) {
+        emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + index + ", ptr " + data + ", i64 " + count + ", ptr " + desc(g, elem) + ", i64 " + siteID + ")");
+    } else {
+        elemSize := sizeOf(g, elem);
+        dest := tmp(g);
+        emit(g, dest + " = call ptr @oc_arr_insert(ptr " + slot + ", i64 " + index + ", i64 " + count + ", i64 " + itoa(elemSize) + ", i64 " + siteID + ")");
+        idx := alloca(g, check.TInt());
+        emit(g, "store i64 0, ptr " + idx);
+        head := newLabel(g, "sp"); body := newLabel(g, "spb"); done := newLabel(g, "spd");
+        br(g, head);
+        label(g, head);
+        iv := tmp(g); emit(g, iv + " = load i64, ptr " + idx);
+        more := tmp(g); emit(g, more + " = icmp slt i64 " + iv + ", " + count);
+        condBr(g, more, body, done);
+        label(g, body);
+        src := gepDyn(g, data, iv, sizeOf(g, sourceElem));
+        value := copyV(g, conv(g, load(g, sourceElem, src), elem));
+        store(g, elem, gepDyn(g, dest, iv, elemSize), value);
+        next := tmp(g); emit(g, next + " = add i64 " + iv + ", 1");
+        emit(g, "store i64 " + next + ", ptr " + idx);
+        br(g, head);
+        label(g, done);
+    }
+    if (homogeneous(rt)) homCheckSlot(g, rt, slot, index, count);
 }
 
 func genEnumCall(g *Gen, n *ast.Node, t *ast.Type) V {

@@ -84,3 +84,30 @@ func TestActiveDefersDuringPanic(t *testing.T) {
     runInternallyRecoveredDefer(&total);
     if (total != 15) t.Error("recovery inside a defer disrupted its caller");
 }
+
+func deferArraySpreads(boxed *[]any, ints *[]int, source *[]int) {
+    defer boxed.append((*source)...);
+    defer boxed.prepend((*source)...);
+    defer boxed.add(1, 3, (*source)...);
+    defer ints.append((*source)...);
+    (*source)[0] = 99;
+}
+
+func TestDeferredArraySpreads(t *testing.T) {
+    boxed: []any;
+    boxed.append(1, 2);
+    ints := []int{1};
+    source := []int{4, 5};
+    deferArraySpreads(&boxed, &ints, &source);
+    expected := []int{4, 5, 1, 3, 4, 5, 2, 4, 5};
+    if (len(boxed) != len(expected)) {
+        t.Error("deferred spreads inserted the wrong number of interface values");
+        return;
+    }
+    for (i, value := range expected) {
+        if (boxed[i].(int) != value) t.Error("deferred spread lost a captured value or changed the insertion order");
+    }
+    if (len(ints) != 3 || ints[1] != 4 || ints[2] != 5 || source[0] != 99) {
+        t.Error("deferred spread did not preserve the source snapshot");
+    }
+}
