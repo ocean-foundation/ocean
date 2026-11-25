@@ -1,0 +1,46 @@
+name: Nightly release
+
+on:
+  schedule:
+    - cron: '48 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-main
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check deploy key configuration
+        env:
+          OCEAN_KEY: ${{ secrets.NIGHTLY_OCEAN_SSH_KEY }}
+          STDLIB_KEY: ${{ secrets.NIGHTLY_STDLIB_SSH_KEY }}
+        run: |
+          if [[ -z "$OCEAN_KEY" || -z "$STDLIB_KEY" ]]; then
+            echo 'Configure NIGHTLY_OCEAN_SSH_KEY and NIGHTLY_STDLIB_SSH_KEY before tagging.' >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.NIGHTLY_OCEAN_SSH_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          repository: ocean-foundation/ocean-src
+          ref: main
+          fetch-depth: 0
+          path: build/.nightly-stdlib
+          ssh-key: ${{ secrets.NIGHTLY_STDLIB_SSH_KEY }}
+      - name: Check whether a nightly is due and tag main snapshots
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly.py

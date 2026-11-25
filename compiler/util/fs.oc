@@ -85,11 +85,15 @@ func uniqueToken(attempt int) string {
 
 // CreateTempInDir creates a unique file inside dir using O_CREAT | O_EXCL | O_NOFOLLOW.
 func CreateTempInDir(dir string, prefix string, mode int) (string, int, bool) {
+    return createTempInDir(dir, prefix, "", mode);
+}
+
+func createTempInDir(dir string, prefix string, suffix string, mode int) (string, int, bool) {
     cleanDir := dir == "" ? "." : dir;
     perm := mode & 511;
     flags := oWrOnly() | oCreat() | oExcl() | oNoFollow();
     for (i := 0; i < 64; i++) {
-        cand := JoinPath(cleanDir, prefix + uniqueToken(i));
+        cand := JoinPath(cleanDir, prefix + uniqueToken(i) + suffix);
         c := CStr(cand);
         fd := native_open((c.data)->int, flags, perm) -> int;
         if (fd >= 0) return cand, fd, true;
@@ -98,13 +102,13 @@ func CreateTempInDir(dir string, prefix string, mode int) (string, int, bool) {
 }
 
 // CreateStagingPath creates a unique staging file path inside target's directory
-// without following symlinks and closes its descriptor cleanly.
-func CreateStagingPath(target string, mode int) (string, bool) {
+// with the requested toolchain suffix, without following symlinks.
+func CreateStagingPath(target string, mode int, suffix string) (string, bool) {
     dir := Dir(target);
     prefix := "." + Base(target) + ".ocean-tmp-";
-    cand, fd, ok := CreateTempInDir(dir, prefix, mode & 511);
+    cand, fd, ok := createTempInDir(dir, prefix, suffix, mode);
     if (!ok) return "", false;
-    Close(fd);
+    if (!Close(fd)) { Remove(cand); return "", false; }
     return cand, true;
 }
 

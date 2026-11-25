@@ -57,8 +57,7 @@ func packageMain(args []string) int {
 
 func buildPackage(o *BuildOptions) int {
     if (!validateTarget()) return 1;
-    cross, _ := util.Getenv("OCEAN_CROSS_TARGET");
-    if (cross != "" && !o.emit) { util.Stderr("ocean: OCEAN_CROSS_TARGET supports only build --emit-llvm\n"); return 1; }
+    if (o.run && !requireHostTarget("run")) return 1;
     diags := newDiags();
     prog := Frontend(o.location, false, "", diags);
     if (prog.fatal) return 1;
@@ -67,7 +66,6 @@ func buildPackage(o *BuildOptions) int {
     if (o.staticLink && prog.isLibrary) { util.Stderr("ocean: --static requires a main package executable\n"); return 1; }
     if (o.run && prog.isLibrary) { util.Stderr("ocean run: package " + prog.name + " is not main\n"); return 1; }
     if (!prog.ok) return 1;
-    if (o.run && targetWasm()) { util.Stderr("ocean run: WebAssembly output must be run by a WebAssembly host\n"); return 1; }
     if (o.check) {
         failed := checkBackend(prog);
         if (!failed && prog.build.HasTestSources(o.location)) {
@@ -85,15 +83,21 @@ func buildPackage(o *BuildOptions) int {
 }
 
 func ast_nil(p *Program) bool { return (p -> int) == 0; }
-func targetWasm() bool { system, _ := util.Getenv("OCOS"); arch, _ := util.Getenv("OCARCH"); return system == "js" && arch == "wasm"; }
+func targetWasm() bool { return util.BuildTarget().Wasm(); }
 
-// validateTarget checks the OCOS/OCARCH overrides (only js/wasm, together).
 func validateTarget() bool {
-    system, _ := util.Getenv("OCOS"); arch, _ := util.Getenv("OCARCH");
-    if (system == "js" || arch == "wasm") {
-        if (system != "js" || arch != "wasm") { util.Stderr("backend error: WebAssembly requires OCOS=js and OCARCH=wasm together\n"); return false; }
-    } else if (system != "" || arch != "") {
-        util.Stderr("backend error: target overrides currently support only OCOS=js OCARCH=wasm\n"); return false;
-    }
-    return true;
+    target := util.BuildTarget();
+    if (target.Supported()) return true;
+    util.Stderr("ocean: unsupported target OCOS=" + target.system + " OCARCH=" + target.arch + "\n" +
+        "Set both variables to a supported pair: linux with x86_64, aarch64 or riscv64; " +
+        "macos or windows with x86_64 or aarch64; js with wasm. Unset both to target the host.\n");
+    return false;
+}
+
+func requireHostTarget(command string) bool {
+    target := util.BuildTarget();
+    if (target.IsHost()) return true;
+    util.Stderr("ocean " + command + ": requires the host target. Use ocean build to produce an artifact for " +
+        target.system + "/" + target.arch + ".\n");
+    return false;
 }

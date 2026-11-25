@@ -1,0 +1,13 @@
+package main;
+
+import "os";
+
+// embed logo.ansi into driver package
+func main() {
+    file := os.Open("compiler/driver/logo.oc", os.FileMode.Write).unwrap();
+    file.Write("package driver;\n\n").unwrap();
+    file.Write("logo := `").unwrap();
+    logo := os.ReadFile("logo.ansi").unwrap();
+    file.Write(logo).unwrap();
+    file.Write("\n`;\n").unwrap();
+}

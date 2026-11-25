@@ -694,6 +694,8 @@ func addLocation(list *[]string, path string) bool {
 }
 
 func testMain(args []string) int {
+    if (!(len(args) == 3 && (args[2] == "--help" || args[2] == "-h")) &&
+        (!validateTarget() || !requireHostTarget("test"))) return 1;
     if (len(args) > 2 && args[2] == "--internal-test-package") return testOne(args[3:], true);
     rest := args[2:];
     flags := make([]string);

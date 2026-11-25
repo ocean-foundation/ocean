@@ -213,7 +213,7 @@ func setupDefer(g *Gen, recovered string) {
     jb := allocaBytes(g, 512, 16);
     emit(g, "store ptr " + jb + ", ptr " + gep(g, f.frame, frameOff(g, "jb")));
     r := tmp(g);
-    emit(g, r + " = call i32 @" + recoverySymbol() + "(ptr " + jb + (targetWindows() ? ", ptr null" : "") + ") returns_twice");
+    emit(g, r + " = call i32 @" + recoverySymbol() + "(ptr " + jb + (util.BuildTarget().system == "windows" ? ", ptr null" : "") + ") returns_twice");
     c := tmp(g);
     emit(g, c + " = icmp ne i32 " + r + ", 0");
     body := newLabel(g, "body");
@@ -458,5 +458,5 @@ func emitThunk(g *Gen, inst *Inst) {
 // Win64 passes the optional unwind frame explicitly. ARM64's CRT exports
 // _setjmpex; non-SEH recovery pairs it with MinGW's longjmp implementation.
 func recoverySymbol() string {
-    return targetWindows() && hostArch() == "aarch64" ? "_setjmpex" : "_setjmp";
+    return util.BuildTarget().system == "windows" && util.BuildTarget().arch == "aarch64" ? "_setjmpex" : "_setjmp";
 }
