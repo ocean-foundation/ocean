@@ -510,6 +510,7 @@ func genComposite(g *Gen, n *ast.Node, t *ast.Type) V {
         et := t;
         p := alloca(g, et);
         setTag(g, et, p, n.ival);
+        result := freshV(g, p, et);
         vs := g.c.VariantsOf(under(et));
         v := vs[n.ival];
         l := g.c.VariantLayout(under(et), n.ival);
@@ -518,13 +519,14 @@ func genComposite(g *Gen, n *ast.Node, t *ast.Type) V {
             f := v.fields[e.ival];
             store(g, f.ty, gep(g, base, l.places[e.ival].offset), genAs(g, e.b, f.ty));
         }
-        return freshV(g, p, et);
+        return result;
     }
     u := under(t);
     switch (u.kind) {
     case ast.TK.Struct:
         p := alloca(g, t);
         zeroInto(g, t, p);
+        result := freshV(g, p, t);
         fs := g.c.FieldsOf(u);
         l := g.c.StructLayoutOf(u);
         for (_, e := range n.list) {
@@ -538,29 +540,32 @@ func genComposite(g *Gen, n *ast.Node, t *ast.Type) V {
         for (len(inited) < len(fs)) inited.append(false);
         for (_, e := range n.list) inited[e.ival] = true;
         sizedFields(g, u, p, inited);
-        return freshV(g, p, t);
+        return result;
     case ast.TK.Array:
         if (u.len < 0) {
             blk := tmp(g);
             // a literal's length is its element count
             emit(g, blk + " = call ptr @oc_block_new(i64 " + itoa(len(n.list)) + ", ptr " + desc(g, u.elem) + ")");
+            result := freshV(g, blk, t);
             data := gep(g, blk, g.c.ArrayDataOffset(u.elem));
             for (i, e := range n.list) store(g, u.elem, gep(g, data, i * sizeOf(g, u.elem)), genAs(g, e.b, u.elem));
-            return freshV(g, blk, t);
+            return result;
         }
         p := alloca(g, t);
         zeroInto(g, t, p);
+        result := freshV(g, p, t);
         data := gep(g, p, g.c.ArrayDataOffset(u.elem));
         es := sizeOf(g, u.elem);
         for (i, e := range n.list) store(g, u.elem, gep(g, data, i * es), genAs(g, e.b, u.elem));
-        return freshV(g, p, t);
+        return result;
     case ast.TK.Buffer:
         es := sizeOf(g, u.elem);
         if (u.len > 0) {
             p := alloca(g, t);
             zeroInto(g, t, p);
+            result := freshV(g, p, t);
             for (i, e := range n.list) store(g, u.elem, gep(g, p, i * es), genAs(g, e.b, u.elem));
-            return freshV(g, p, t);
+            return result;
         }
         // literal storage behind an unsized buffer view: block-scoped (released at block exit)
         blk := tmp(g);
@@ -597,13 +602,15 @@ func genComposite(g *Gen, n *ast.Node, t *ast.Type) V {
     case ast.TK.Map:
         slot := alloca(g, t);
         emit(g, "store ptr null, ptr " + slot);
+        temp := trackTemp(g, slot, t);
         for (_, e := range n.list) {
             k := genAs(g, e.a, u.key);
             v := genAs(g, e.b, u.elem);
             emit(g, "call void @oc_map_set(ptr " + slot + ", ptr " + spill(g, k) + ", ptr " + spill(g, v) + ", ptr " + desc(g, u.key) + ", ptr " + desc(g, u.elem) + ")");
         }
-        r := tmp(g); emit(g, r + " = load ptr, ptr " + slot);
-        return freshV(g, r, t);
+        result := freshNoTemp(load(g, t, slot).r, t);
+        result.tmp = temp;
+        return result;
     }
     fail(g, n, "unsupported composite literal");
     return mkV("undef", t);

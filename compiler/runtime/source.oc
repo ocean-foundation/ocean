@@ -1329,7 +1329,13 @@ void oc_run_defers(OcFrame *f) {
 }
 
 static void drop_locals(OcFrame *f) {
-    if (f->locals) for (const OcLocal *l = f->locals; l->slot; l++) oc_drop(l->slot, l->t);
+    if (!f->locals) return;
+    const OcLocal *l = f->locals;
+    while (l->t) l++;
+    while (l != f->locals) {
+        l--;
+        if (l->slot) oc_drop(l->slot, l->t);
+    }
 }
 static void discard_defers(OcFrame *f) {
     while (f->defers) {
@@ -1394,6 +1400,7 @@ static void unwind(OcArr *msg, int64_t site, OcFrame *start, OcFrame *traceFrom)
                     old->header = NULL;
                 }
                 discard_defers(f);
+                drop_locals(f);
                 oc_in_defer = f->in_defer;
                 oc_top = f;
                 _longjmp(*(jmp_buf *)f->jb, 1);

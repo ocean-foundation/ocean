@@ -9,7 +9,7 @@ import "strconv";
 struct V { r string; t *ast.Type; fresh bool; tmp int; }
 
 // Temp is an owned temporary awaiting a move; Local an owned variable slot.
-struct Temp { slot string; t *ast.Type; dead bool; }
+struct Temp { slot string; t *ast.Type; unwindSlot string; dead bool; }
 struct Local { slot string; t *ast.Type; isBufList bool; }
 
 struct Inst {
@@ -350,17 +350,17 @@ func load(g *Gen, t *ast.Type, p string) V {
 // store writes v (already of type t) to p.
 // store moves v into the storage at p (a registered temporary is consumed).
 func store(g *Gen, t *ast.Type, p string, v V) {
-    consume(g, v);
     storeRaw(g, t, p, v);
+    consume(g, v);
 }
 func storeRaw(g *Gen, t *ast.Type, p string, v V) {
     if (isAgg(t)) { memcpy(g, p, v.r, sizeOf(g, t)); return; }
     emit(g, "store " + ll(t) + " " + v.r + ", ptr " + p);
 }
 func storeVolatile(g *Gen, t *ast.Type, p string, v V) {
+    if (isAgg(t)) memcpy(g, p, v.r, sizeOf(g, t));
+    else emit(g, "store volatile " + ll(t) + " " + v.r + ", ptr " + p);
     consume(g, v);
-    if (isAgg(t)) { memcpy(g, p, v.r, sizeOf(g, t)); return; }
-    emit(g, "store volatile " + ll(t) + " " + v.r + ", ptr " + p);
 }
 
 func mkV(r string, t *ast.Type) V { v: V; v.r = r; v.t = t; return v; }
@@ -376,11 +376,24 @@ func freshV(g *Gen, r string, t *ast.Type) V {
         slot = tempSlot(g, t);
         storeRaw(g, t, slot, v);
     }
+    v.tmp = trackTemp(g, slot, t);
+    return v;
+}
+
+// trackTemp registers storage whose contents remain owned until the next move
+// or drop. The unwind entry can be cleared independently of the value's bytes.
+func trackTemp(g *Gen, slot string, t *ast.Type) int {
+    if (!g.trackTemps || !owned(g, t)) return 0;
     tp := new(Temp);
     tp.slot = slot; tp.t = t;
+    if (g.fn.frame != "") {
+        tp.unwindSlot = "%loctab." + itoa(len(g.fn.allLocals));
+        l := new(Local); l.slot = "null"; l.t = t;
+        g.fn.allLocals.append(l);
+        emit(g, "store ptr " + slot + ", ptr " + tp.unwindSlot);
+    }
     g.fn.temps.append(tp);
-    v.tmp = len(g.fn.temps);
-    return v;
+    return len(g.fn.temps);
 }
 
 // tempSlot is a zero-initialized (at function entry) slot for a temporary.
@@ -392,7 +405,14 @@ func tempSlot(g *Gen, t *ast.Type) string {
 }
 
 func consume(g *Gen, v V) {
-    if (v.tmp > 0 && v.tmp <= len(g.fn.temps)) g.fn.temps[v.tmp - 1].dead = true;
+    if (v.tmp <= 0 || v.tmp > len(g.fn.temps)) return;
+    tp := g.fn.temps[v.tmp - 1];
+    tp.dead = true;
+    clearTempEntry(g, tp);
+}
+
+func clearTempEntry(g *Gen, tp *Temp) {
+    if (tp.unwindSlot != "") emit(g, "store ptr null, ptr " + tp.unwindSlot);
 }
 
 // dropTemps releases live temporaries registered at index mark or later.
@@ -400,7 +420,10 @@ func dropTemps(g *Gen, mark int, forget bool) {
     if (!g.fn.terminated) {
         for (i := len(g.fn.temps) - 1; i >= mark; i--) {
             tp := g.fn.temps[i];
-            if (!tp.dead) emit(g, "call void @oc_drop(ptr " + tp.slot + ", ptr " + desc(g, tp.t) + ")");
+            if (!tp.dead) {
+                emit(g, "call void @oc_drop(ptr " + tp.slot + ", ptr " + desc(g, tp.t) + ")");
+                clearTempEntry(g, tp);
+            }
         }
     }
     if (forget) { for (len(g.fn.temps) > mark) { g.fn.temps[len(g.fn.temps) - 1].dead = true; g.fn.temps.pop(); } }
@@ -434,6 +457,7 @@ func dropScopesTo(g *Gen, depth int) {
 func dropAllLocals(g *Gen) {
     for (k := len(g.fn.allLocals) - 1; k >= 0; k--) {
         l := g.fn.allLocals[k];
+        if (l.slot == "null") continue; // temporaries are dropped at statement boundaries
         if (l.isBufList) emit(g, "call void @oc_buf_drop(ptr " + l.slot + ")");
         else emit(g, "call void @oc_drop(ptr " + l.slot + ", ptr " + desc(g, l.t) + ")");
     }

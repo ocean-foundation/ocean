@@ -226,10 +226,11 @@ func genTernary(g *Gen, n *ast.Node, t *ast.Type) V {
     }
     label(g, yes);
     a := genAs(g, n.b, t);
+    consume(g, a);
     ya := g.fn.cur; br(g, done);
     label(g, no);
     b := genAs(g, n.c, t);
-    consume(g, a); consume(g, b);
+    consume(g, b);
     nb := g.fn.cur; br(g, done);
     label(g, done);
     r := tmp(g);

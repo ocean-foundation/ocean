@@ -111,3 +111,35 @@ func TestDeferredArraySpreads(t *testing.T) {
         t.Error("deferred spread did not preserve the source snapshot");
     }
 }
+
+func panicInRange(values *[]string) {
+    for (_, value := range (*values)) {
+        panic value + " in range";
+    }
+}
+
+func failWhileEvaluatingArgument() int { panic "argument"; }
+
+func usePayload(payload DeferredPayload, n int) int {
+    return len(payload.message) + len(payload.parts[0]) + n;
+}
+
+func recoverTemporaryPanic(values *[]string, inRange bool) (message string) {
+    defer func() { message = recover().(string); }();
+    if (inRange) panicInRange(values);
+    // This call completes and transfers its argument. Its original temporary
+    // entry must be inactive when the next call panics before transfer.
+    usePayload(DeferredPayload{message: "moved", parts: []string{"value"}}, 0);
+    usePayload(DeferredPayload{message: "live", parts: []string{"value"}}, failWhileEvaluatingArgument());
+    return;
+}
+
+func TestStatementTemporariesDuringPanic(t *testing.T) {
+    values := []string{"panic"};
+    if (recoverTemporaryPanic(&values, true) != "panic in range") {
+        t.Error("panic in range did not preserve the message through recovery");
+    }
+    if (recoverTemporaryPanic(&values, false) != "argument" || values[0] != "panic") {
+        t.Error("panic in an argument damaged live values");
+    }
+}

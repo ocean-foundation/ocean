@@ -51,11 +51,13 @@ func genStmt1(g *Gen, n *ast.Node) {
     case ast.NK.ReturnPanic:
         m := genAs(g, n.a, check.TString());
         setSite(g, n);
+        consume(g, m);
         emit(g, "call void @oc_return_panic(ptr " + m.r + ", i64 " + itoa(site(g, n)) + ")");
         term(g, "unreachable");
     case ast.NK.Panic:
         m := genAs(g, n.a, check.TString());
         setSite(g, n);
+        consume(g, m);
         emit(g, "call void @oc_panic(ptr " + m.r + ", i64 " + itoa(site(g, n)) + ")");
         term(g, "unreachable");
     case ast.NK.Forward:
@@ -556,40 +558,6 @@ func genDefer(g *Gen, n *ast.Node) {
     old := tmp(g); emit(g, old + " = load ptr, ptr " + fd);
     emit(g, "store ptr " + old + ", ptr " + rec);
     emit(g, "store ptr " + rec + ", ptr " + fd);
-}
-
-// argValues evaluates call arguments (packing variadics) as individual values.
-func argValues(g *Gen, n *ast.Node, ft *ast.Type) []V {
-    out := make([]V);
-    params := make([]*ast.Type);
-    for (_, p := range ft.params) params.append(sub(g, p));
-    fixed := len(params);
-    if (ft.variadic) fixed--;
-    if (n.flag2) {
-        tv := genExpr(g, n.list[0]);
-        rts := under(tv.t).results;
-        vals := make([]V);
-        for (i, rt := range rts) vals.append(load(g, rt, gep(g, tv.r, tupleOffset(g, rts, i))));
-        for (i := 0; i < fixed; i++) out.append(copyV(g, conv(g, vals[i], params[i])));
-        if (ft.variadic) {
-            extra := make([]V);
-            for (i := fixed; i < len(vals); i++) extra.append(vals[i]);
-            out.append(packVariadic(g, params[len(params) - 1], extra, zero(*ast.Node)));
-        }
-        return out;
-    }
-    for (i := 0; i < fixed && i < len(n.list); i++) out.append(argValue(g, n.list[i], params[i]));
-    if (ft.variadic) {
-        vt := params[len(params) - 1];
-        extra := make([]V);
-        spread := zero(*ast.Node);
-        for (i := fixed; i < len(n.list); i++) {
-            if (n.flag && i == len(n.list) - 1) { spread = n.list[i]; break; }
-            extra.append(genAs(g, n.list[i], under(vt).elem));
-        }
-        out.append(packVariadic(g, vt, extra, spread));
-    }
-    return out;
 }
 
 func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, ft *ast.Type, items []V) string {

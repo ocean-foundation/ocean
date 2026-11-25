@@ -200,7 +200,7 @@ func prologue(g *Gen, displayName string) {
     emit(g, "store ptr null, ptr " + gep(g, f.frame, frameOff(g, "defers")));
     emit(g, "store ptr null, ptr " + gep(g, f.frame, frameOff(g, "active_defers")));
     emit(g, "store ptr null, ptr " + gep(g, f.frame, frameOff(g, "jb")));
-    // owned locals, released by the runtime when a panic unwinds this frame
+    // Owned locals and live temporaries released during panic unwinding.
     emit(g, "store ptr %loctab, ptr " + gep(g, f.frame, frameOff(g, "locals")));
     ind := tmp(g);
     emit(g, ind + " = load i64, ptr @oc_in_defer");
@@ -332,7 +332,7 @@ func emitInst(g *Gen, inst *Inst) {
     if (f.hasDefer) emit(g, "call void @oc_run_defers(ptr " + f.frame + ")");
     dropAllLocals(g);
     br(g, "finish");
-    if (f.hasDefer) { g.fn.body.Add("recovered:\n"); f.terminated = false; dropAllLocals(g); br(g, "finish"); }
+    if (f.hasDefer) { label(g, recovered); br(g, "finish"); }
     label(g, "finish");
     prev := tmp(g);
     emit(g, prev + " = load ptr, ptr " + f.frame);
@@ -343,8 +343,8 @@ func emitInst(g *Gen, inst *Inst) {
     g.mod.Add("entry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
 }
 
-// emitLocalTable defines %loctab: {slot, type} pairs of the function's owned
-// locals, terminated by a null slot (the prologue stores it in the frame).
+// emitLocalTable defines %loctab: {slot, type} pairs for owned locals and
+// temporaries, terminated by a null type. Inactive temporaries have null slots.
 func emitLocalTable(g *Gen) {
     f := g.fn;
     n := len(f.allLocals);
