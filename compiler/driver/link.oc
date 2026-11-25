@@ -297,7 +297,8 @@ func hasPrefixAt(s string, i int, p string) bool {
 func isDarwinLocalLabel(line string, c int) bool {
     return hasPrefixAt(line, c, "L_") || hasPrefixAt(line, c, "Ltmp") || hasPrefixAt(line, c, "LBB") ||
         hasPrefixAt(line, c, "LCPI") || hasPrefixAt(line, c, "LJTI") || hasPrefixAt(line, c, "Lfunc_") ||
-        hasPrefixAt(line, c, "Lset") || hasPrefixAt(line, c, "l_");
+        hasPrefixAt(line, c, "Lset") || hasPrefixAt(line, c, "Lloh") ||
+        hasPrefixAt(line, c, "l_");
 }
 
 // selfContainedIR merges the runtime into the program module for --emit-llvm.

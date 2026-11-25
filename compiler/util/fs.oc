@@ -105,8 +105,7 @@ func createTempInDir(dir string, prefix string, suffix string, mode int) (string
 // with the requested toolchain suffix, without following symlinks.
 func CreateStagingPath(target string, mode int, suffix string) (string, bool) {
     dir := Dir(target);
-    prefix := "." + Base(target) + ".ocean-tmp-";
-    cand, fd, ok := createTempInDir(dir, prefix, suffix, mode);
+    cand, fd, ok := createTempInDir(dir, ".ocean-tmp-", suffix, mode);
     if (!ok) return "", false;
     if (!Close(fd)) { Remove(cand); return "", false; }
     return cand, true;
@@ -130,13 +129,18 @@ func MakeTempDirIn(base string, prefix string) (string, bool) {
 func WriteFileAtomic(path string, s string, mode int) bool {
     perm := mode & 511;
     dir := Dir(path);
-    prefix := "." + Base(path) + ".ocean-tmp-";
-    tmp, fd, ok := CreateTempInDir(dir, prefix, perm);
+    tmp, fd, ok := CreateTempInDir(dir, ".ocean-tmp-", perm);
     if (!ok) return false;
     wrote := WriteFd(fd, s);
     closed := Close(fd);
     if (!wrote || !closed) { Remove(tmp); return false; }
-    if (!Windows() && (StatMode(tmp) & 511) != perm) Chmod(tmp, perm);
+    if (!Windows()) {
+        actual := StatMode(tmp);
+        if ((actual < 0 || (actual & 511) != perm) && !Chmod(tmp, perm)) {
+            Remove(tmp);
+            return false;
+        }
+    }
     if (!Rename(tmp, path)) { Remove(tmp); return false; }
     return true;
 }

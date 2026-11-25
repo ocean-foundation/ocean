@@ -1835,8 +1835,9 @@ Ocean has no garbage collector and no reference counting; ownership is static.
   scope exit never frees a pointee. Memory from `new` must be released with
   `free(p)` or it leaks. Calling `free(&local)` or `free(&global)` is a compile
   error. `free(p)` leaves the pointer value intact and invalidates all aliases
-  to that allocation. The compiler does not track freed raw pointers. The
-  caller must avoid using or freeing them again.
+  to that allocation. The compiler does not track freed raw pointers.
+- Accessing a released allocation or releasing the same allocation twice is
+  undefined behavior. The programmer is responsible for avoiding both.
 - Runtime `buffer<T, n>` allocations and `buffer<T>{…}` literals are
   **block-scoped** stack views (released on block exit; repeated evaluations in
   a loop do not invalidate earlier live views in the same block). Directly

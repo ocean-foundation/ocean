@@ -77,3 +77,13 @@ func TestInvalidRecursiveLayouts(t *testing.T) {
     }
     if (!cycle || !expansion) t.Error("missing recursive-layout diagnostics");
 }
+
+func TestGenericFunctionValueChecksSubstitutedBitfields(t *testing.T) {
+    d := checkFixture(t, "package p; struct Flags<T> { bits T : 2; } " +
+        "func flags<T>() Flags<T> { return zero(Flags<T>); } " +
+        "func f() { flags<bool>; }");
+    for (_, diagnostic := range d.items) {
+        if (diagnostic.message == "bitfield size exceeds its type width") return;
+    }
+    t.Error("missing bitfield check on the substituted function signature");
+}

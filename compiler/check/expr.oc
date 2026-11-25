@@ -882,7 +882,10 @@ func instExpr(c *Checker, n *ast.Node) *ast.Type {
         }
         n.targs = args;
         n.sem = ast.Sem.FuncValue;
-        return Subst(fs.ty, makeEnv(fs.typeParams, args));
+        ft := Subst(fs.ty, makeEnv(fs.typeParams, args));
+        if (c.CheckLayoutSize(n, ft)) return tInvalid;
+        checkInstanceBitfields(c, n, ft);
+        return ft;
     }
     t, isType := typeOfExpr(c, n);
     if (isType) {

@@ -554,9 +554,16 @@ func hasOcSuffix(path string) bool {
     return path[n - 3] == '.' && (path[n - 2] == 'o' || path[n - 2] == 'O') && (path[n - 1] == 'c' || path[n - 1] == 'C');
 }
 
+func outputHasSourceSuffix(path string) bool {
+    if (path == "") return false;
+    if (hasOcSuffix(path)) return true;
+    resolved, ok := util.Realpath(path);
+    return ok && hasOcSuffix(resolved);
+}
+
 func outputOverwritesInput(outPath string, prog *Program) bool {
     if (outPath == "") return false;
-    if (hasOcSuffix(outPath)) return true;
+    if (outputHasSourceSuffix(outPath)) return true;
     if (!ast_nil(prog) && (prog.build -> int) != 0) {
         for (_, pk := range prog.build.Packages()) {
             for (_, src := range pk.files) {
@@ -744,7 +751,7 @@ func testMain(args []string) int {
         if (len(list) == 0) util.Stderr("ocean test: no packages matched\n");
         return 1;
     }
-    if ((report != "" && hasOcSuffix(report)) || (jsonFile != "" && hasOcSuffix(jsonFile))) {
+    if (outputHasSourceSuffix(report) || outputHasSourceSuffix(jsonFile)) {
         util.Stderr("ocean test: output would overwrite an Ocean source file\n"); return 1;
     }
     for (_, dirPath := range list) {
