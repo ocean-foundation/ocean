@@ -7,6 +7,7 @@ EXE := $(if $(filter Windows_NT,$(OS)),.exe,)
 OUT ?= build/ocean$(EXE)
 STAGE2 ?= build/ocean-stage2$(EXE)
 EMBED := build/embed-runtime$(EXE)
+LOGO := build/embed-logo$(EXE)
 PKG := github.com/ocean-foundation/ocean/compiler/driver
 COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 COMMIT_DATE ?= $(shell git log -1 --format=%cs 2>/dev/null || echo unknown)
@@ -16,8 +17,8 @@ LDFLAGS := -X $(PKG).version=$(VERSION) -X $(PKG).commit=$(COMMIT) \
 	-X $(PKG).commitDate=$(COMMIT_DATE) -X $(PKG).commitYear=$(COMMIT_YEAR) \
 	-X $(PKG).buildDate=$(BUILD_DATE)
 
-.PHONY: all test selfhost clean runtime crosscheck release
-all: runtime
+.PHONY: all test selfhost clean runtime logo crosscheck release
+all: runtime logo
 	mkdir -p "$(dir $(OUT))"
 	"$(OCEAN)" build -ldflags "$(LDFLAGS)" -o "$(OUT)" .
 
@@ -26,6 +27,12 @@ runtime:
 	mkdir -p build
 	"$(OCEAN)" build -o "$(EMBED)" tools/embedruntime
 	"$(EMBED)"
+
+# Embed logo.ansi in logo.oc for CLI printing of Ocean logo ASCII art
+logo:
+	mkdir -p build
+	"$(OCEAN)" build -o "$(LOGO)" tools/embedlogo
+	"$(LOGO)"
 
 test: all
 	"$(OUT)" test ./... --notty

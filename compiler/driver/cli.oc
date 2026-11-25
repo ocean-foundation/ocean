@@ -64,12 +64,7 @@ func Main(argv array<string>) int {
 }
 
 func versionText() string {
-    return `[38;2;121;184;255m    __    __   [38;2;229;237;249m _____  _____  _____  _____  _  _[0m
-[38;2;121;184;255m __/  \__/     [38;2;229;237;249m|  _  ||  ___||  ___||  _  || \| |[0m
-[38;2;121;184;255m    __    __   [38;2;229;237;249m| |_| || |___ |  __| |  _  ||    |[0m
-[38;2;121;184;255m __/  \__/     [38;2;229;237;249m|_____||_____||_____||_| |_||_|\_|[0m
-
-`+
+    return logo +
     "Ocean compiler (ocean) " + Version() + "\nCommit " + Commit() + " (" + CommitDate() + "), built " + BuildDate() + "\nCopyright Connor Egan " + CommitYear() + "\n";
 }
 
