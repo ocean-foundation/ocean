@@ -104,7 +104,10 @@ func resolveStruct(c *Checker, s *ast.Symbol) {
         refField(c, fd.src, fd.line, fd.col, s, fd.name, f.ty, true);
         if (f.ty.kind == ast.TK.Void) err(c, fd, "void is not a field storage type");
         if (f.ty.kind == ast.TK.Buffer && f.ty.len == -1) err(c, fd, "runtime-sized buffers cannot be used in type declarations");
-        if (f.bits > 0) checkBitfield(c, fd, f);
+        if (f.bits > 0 && !checkBitfield(c, fd, f)) {
+            f.bits = 0;
+            f.ty = tInvalid;
+        }
         s.fields.append(f);
     }
     // Field dimensions may use value parameters: struct M(n int) { data [n]int; }
@@ -134,18 +137,25 @@ func resolveStruct(c *Checker, s *ast.Symbol) {
     pop(c);
 }
 
-func checkBitfield(c *Checker, fd *ast.Node, f *ast.FieldInfo) {
-    u := Underlying(f.ty);
-    if (u.kind == ast.TK.Param) return;
-    if (u.kind == ast.TK.Bool) {
-        if (f.bits > 1) err(c, fd, "bitfield size exceeds its type width");
-        return;
+func checkBitfield(c *Checker, fd *ast.Node, f *ast.FieldInfo) bool {
+    if (f.bits > maxBitfieldWidth) {
+        err(c, fd, "bitfield size must be an integer literal from 1 through 64");
+        return false;
     }
-    if (u.kind != ast.TK.Int) { err(c, fd, "bitfield requires an integer or bool type"); return; }
-    if (f.bits > u.bits) { err(c, fd, "bitfield size exceeds its type width"); return; }
+    u := Underlying(f.ty);
+    if (u.kind == ast.TK.Param) return true;
+    if (u.kind != ast.TK.Int && u.kind != ast.TK.Bool) {
+        if (u.kind != ast.TK.Invalid) err(c, fd, "bitfield requires an integer or bool type");
+        return false;
+    }
+    if ((u.kind == ast.TK.Bool && f.bits > 1) || (u.kind == ast.TK.Int && f.bits > u.bits)) {
+        err(c, fd, "bitfield size exceeds its type width");
+        return false;
+    }
     if (!nilN(fd.a) && fd.a.kind == ast.NK.TVarint && f.bits < fd.a.ival) {
         warn(c, fd, "bitfield size " + itoa(f.bits) + " is smaller than explicit " + (fd.a.flag ? "varint(" : "varuint(") + itoa(fd.a.ival) + ")");
     }
+    return true;
 }
 
 func resolveEnum(c *Checker, s *ast.Symbol) {
@@ -427,7 +437,7 @@ func instantiate(c *Checker, n *ast.Node, s *ast.Symbol, args []*ast.Type) *ast.
     for (i, a := range args) {
         if (!satisfies(c, a, s.typeParams[i].constraint)) { err(c, n, "type argument does not satisfy its constraint"); break; }
     }
-    c.CheckLayoutSize(n, t);
+    if (c.CheckLayoutSize(n, t)) return tInvalid;
     checkInstanceBitfields(c, n, t);
     return t;
 }
@@ -632,8 +642,7 @@ func checkSymValueCycle(c *Checker, s *ast.Symbol, colors *map[int]int, active *
     switch (s.kind) {
     case ast.SK.Struct:
         for (_, f := range s.fields) {
-            if (f.valueParam) continue;
-            if (checkTypeValueCycle(c, f.node, f.ty, colors, active, done)) {
+            if (checkTypeValueCycle(c, f.node, f.ty, colors, active, done, 0)) {
                 err(c, s.node, "cyclic type declaration");
                 f.ty = tInvalid;
             }
@@ -641,25 +650,25 @@ func checkSymValueCycle(c *Checker, s *ast.Symbol, colors *map[int]int, active *
     case ast.SK.Enum:
         for (_, v := range s.variants) {
             for (i, pt := range v.types) {
-                if (checkTypeValueCycle(c, v.node, pt, colors, active, done)) {
+                if (checkTypeValueCycle(c, v.node, pt, colors, active, done, 0)) {
                     err(c, v.node, "cyclic type declaration");
                     v.types[i] = tInvalid;
                 }
             }
             for (i, pf := range v.fields) {
-                if (checkTypeValueCycle(c, pf.node, pf.ty, colors, active, done)) {
+                if (checkTypeValueCycle(c, pf.node, pf.ty, colors, active, done, 0)) {
                     err(c, pf.node, "cyclic type declaration");
                     v.fields[i].ty = tInvalid;
                 }
             }
-            if (!nilT(v.fixedType) && checkTypeValueCycle(c, v.node, v.fixedType, colors, active, done)) {
+            if (!nilT(v.fixedType) && checkTypeValueCycle(c, v.node, v.fixedType, colors, active, done, 0)) {
                 err(c, v.node, "cyclic type declaration");
                 v.fixedType = tInvalid;
             }
         }
     case ast.SK.TypeDef, ast.SK.Alias:
         if (!nilT(s.ty) && s.ty.kind != ast.TK.Family) {
-            if (checkTypeValueCycle(c, s.node, s.ty, colors, active, done)) {
+            if (checkTypeValueCycle(c, s.node, s.ty, colors, active, done, 0)) {
                 err(c, s.node, "cyclic type declaration");
                 s.ty = tInvalid;
             }
@@ -669,7 +678,7 @@ func checkSymValueCycle(c *Checker, s *ast.Symbol, colors *map[int]int, active *
     return false;
 }
 
-func checkTypeValueCycle(c *Checker, at *ast.Node, t *ast.Type, colors *map[int]int, active *map[string]bool, done *map[string]bool) bool {
+func checkTypeValueCycle(c *Checker, at *ast.Node, t *ast.Type, colors *map[int]int, active *map[string]bool, done *map[string]bool, depth int) bool {
     if (nilT(t)) return false;
     switch (t.kind) {
     case ast.TK.Invalid, ast.TK.Void, ast.TK.Bool, ast.TK.Int, ast.TK.Float, ast.TK.String, ast.TK.Null, ast.TK.Ptr, ast.TK.Func, ast.TK.Interface, ast.TK.Param, ast.TK.Family, ast.TK.UntypedInt, ast.TK.UntypedFloat, ast.TK.Union:
@@ -679,10 +688,10 @@ func checkTypeValueCycle(c *Checker, at *ast.Node, t *ast.Type, colors *map[int]
         return false;
     case ast.TK.Array, ast.TK.Buffer:
         if ((t.kind == ast.TK.Array && t.len < 0) || (t.kind == ast.TK.Buffer && t.len <= 0)) return false;
-        return !nilT(t.elem) && checkTypeValueCycle(c, at, t.elem, colors, active, done);
+        return !nilT(t.elem) && checkTypeValueCycle(c, at, t.elem, colors, active, done, depth);
     case ast.TK.Tuple:
         for (_, r := range t.results) {
-            if (checkTypeValueCycle(c, at, r, colors, active, done)) return true;
+            if (checkTypeValueCycle(c, at, r, colors, active, done, depth)) return true;
         }
         return false;
     case ast.TK.Named:
@@ -696,10 +705,12 @@ func checkTypeValueCycle(c *Checker, at *ast.Node, t *ast.Type, colors *map[int]
         if (dok && dv) return false;
         av, aok := (*active)[k];
         if (aok && av) return true;
+        depth++;
+        if (typeExpansionExceeded(c, at, depth, k)) return true;
         (*active)[k] = true;
         cyc := false;
         for (_, f := range c.FieldsOf(t)) {
-            if (!f.valueParam && checkTypeValueCycle(c, at, f.ty, colors, active, done)) { f.ty = tInvalid; cyc = true; break; }
+            if (checkTypeValueCycle(c, at, f.ty, colors, active, done, depth)) { f.ty = tInvalid; cyc = true; break; }
         }
         (*active)[k] = false;
         (*done)[k] = true;
@@ -712,14 +723,16 @@ func checkTypeValueCycle(c *Checker, at *ast.Node, t *ast.Type, colors *map[int]
         if (dok && dv) return false;
         av, aok := (*active)[k];
         if (aok && av) return true;
+        depth++;
+        if (typeExpansionExceeded(c, at, depth, k)) return true;
         (*active)[k] = true;
         cyc := false;
         for (_, v := range c.VariantsOf(t)) {
-            for (i, pt := range v.types) { if (checkTypeValueCycle(c, at, pt, colors, active, done)) { v.types[i] = tInvalid; cyc = true; break; } }
+            for (i, pt := range v.types) { if (checkTypeValueCycle(c, at, pt, colors, active, done, depth)) { v.types[i] = tInvalid; cyc = true; break; } }
             if (cyc) break;
-            for (i, pf := range v.fields) { if (checkTypeValueCycle(c, at, pf.ty, colors, active, done)) { v.fields[i].ty = tInvalid; cyc = true; break; } }
+            for (i, pf := range v.fields) { if (checkTypeValueCycle(c, at, pf.ty, colors, active, done, depth)) { v.fields[i].ty = tInvalid; cyc = true; break; } }
             if (cyc) break;
-            if (!nilT(v.fixedType) && checkTypeValueCycle(c, at, v.fixedType, colors, active, done)) { v.fixedType = tInvalid; cyc = true; break; }
+            if (!nilT(v.fixedType) && checkTypeValueCycle(c, at, v.fixedType, colors, active, done, depth)) { v.fixedType = tInvalid; cyc = true; break; }
         }
         (*active)[k] = false;
         (*done)[k] = true;

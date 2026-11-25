@@ -25,7 +25,10 @@ struct Parser {
     failedTrials map[int]bool;
 }
 
-func trialKey(pos int, split int, kind int) int { return (pos << 8) | ((split & 15) << 4) | kind; }
+func trialKey(p *Parser, kind int) int {
+    // Speculative syntax can fail because of the available nesting budget.
+    return (p.pos << 20) | (p.depth << 8) | (p.split << 4) | kind;
+}
 
 // FixRewrite replaces source bytes [start, end) with text (ocean fix).
 struct FixRewrite { start int; end int; text string; }

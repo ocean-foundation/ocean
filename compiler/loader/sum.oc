@@ -86,13 +86,20 @@ func setSumEntry(entries *[]SumEntry, modPath string, ver string, hash string) {
     (*entries).append(e);
 }
 
+// ModuleCachePath stores versions in one path component. Valid versions cannot
+// contain '%', so slash escaping is reversible and flat versions keep their paths.
+func ModuleCachePath(cacheDir string, modPath string, version string) string {
+    ver := version == "" ? "latest" : version;
+    return cacheDir + "/" + modPath + "@" + strings.ReplaceAll(ver, "/", "%2F");
+}
+
 // VerifyCachedModule ensures a dependency exists in the cache and matches ocean.sum.
 func VerifyCachedModule(modRoot string, modPath string, version string, cacheDir string) (string, string) {
     if (!ValidModulePath(modPath) || (version != "" && (!ValidModulePath(version) || version[0] == '-'))) {
         return "", "invalid module path or version";
     }
     ver := version == "" ? "latest" : version;
-    dest := cacheDir + "/" + modPath + "@" + ver;
+    dest := ModuleCachePath(cacheDir, modPath, ver);
     if (!util.IsDir(dest)) {
         spec := modPath + (version != "" ? "@" + version : "");
         return "", "module " + modPath + "@" + ver + " is not in cache; run `ocean fetch " + spec + "`";
@@ -121,7 +128,7 @@ func FetchModule(modRoot string, modPath string, version string) (string, string
     cacheDir, cok := ModuleCacheDir();
     if (!cok) return "", "", "cannot locate module cache; set OCEAN_MOD_CACHE or HOME";
     ver := version == "" ? "latest" : version;
-    dest := cacheDir + "/" + modPath + "@" + ver;
+    dest := ModuleCachePath(cacheDir, modPath, ver);
     base := filepath.Dir(dest);
     if (!util.MkdirAll(base)) return "", "", "cannot create module cache directory: " + base;
 

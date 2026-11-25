@@ -457,8 +457,8 @@ An import path `P` from a package in module `M` resolves to the first of:
    failing if neither is set rather than falling back to `/tmp`) and verified
    against the root project's `ocean.sum` (deterministic SHA-256 checksum over
    the sorted relative file paths and file contents, excluding `.git/`).
-   Compilation refuses to run
-   if any external dependency is missing from the cache, absent from
+   A slash in a version is encoded as `%2F` in the cache directory name.
+   Compilation refuses to run if any external dependency is missing from the cache, absent from
    `ocean.sum`, or modified since download. The fetched module must contain
    `ocean.mod` declaring the expected name (unless replaced).
 
@@ -783,7 +783,9 @@ FieldDecl   = identifier { ',' identifier } Type [ ':' int_lit ] ';' .
   parameters; a declaration of such a struct requires an initializer.
 - Value-embedding type cycles (through structs, enums, tuples, fixed arrays,
   sized buffers, or defined-type aliases) are rejected; recursion must go
-  through pointers, dynamic arrays, maps, or interfaces.
+  through pointers, dynamic arrays, maps, or interfaces. The compiler reports
+  an error if recursively expanding generic payloads exceed its expansion
+  limit. Pointer fields defer validation of the pointee layout until code uses it.
 - Static type layout sizes must not exceed signed pointer width (`isize::MAX`:
   `INT64_MAX` on 64-bit targets, `INT32_MAX` / 2 GiB on 32-bit/`wasm32`).
 - Runtime-sized buffers cannot be fields.
@@ -1959,8 +1961,9 @@ executable. File paths are relative to the compiler's working directory.
   `os.setArgs`) are recognized only when declared in
   the corresponding package located physically under the standard-library root;
   calls to the underlying `compilerReflect*`/`compilerThread*` names from any
-  other code are errors. In standard-library `threads`, awaited thread records
-  are reclaimed (subsequent `await`/`is_done` on that ID returns `-1`), and
+  other code are errors. In standard-library `threads`, repeated and concurrent
+  `Await` calls on a worker succeed. The runtime joins the native thread once,
+  and `IsDone` keeps reporting completion for that ID until process shutdown.
   `Mutex`/`WaitGroup` provide explicit `Destroy()`/`Close()` cleanup. Call them
   after all threads have finished using the object. Closing an already closed
   object or calling another operation on it panics.

@@ -1,4 +1,7 @@
 package check;
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/loader";
+import "github.com/ocean-foundation/ocean/compiler/util";
 import "testing";
 
 enum TreePayload { nodes([]RecursiveTree), empty }
@@ -19,4 +22,30 @@ func TestExpandingGenericPointer(t *testing.T) {
     chain := ExpandingChain<int>{next: &leaf, value: 2};
     boxed: any = chain;
     if (chain.next.value[0] != 7 || boxed == null) t.Error("expanding pointer instance");
+}
+
+func TestUseBeforeDeferredFree(t *testing.T) {
+    p := new(int);
+    defer free(p);
+    *p = 7;
+    if (*p != 7) t.Error("pointer was not usable before deferred free");
+}
+
+func TestInvalidRecursiveLayouts(t *testing.T) {
+    dir, ok := util.MakeTempDir("ocean-type-cycles-");
+    if (!ok) t.Fatal("create fixture directory");
+    defer util.RemoveAll(dir);
+    d := diag.NewList(); d.live = false;
+    b := loader.NewBuild(d);
+    source := "package p; struct Bad(self Bad) {} " +
+        "struct Chain<T> { next []Chain<[]T>; } func f() { value: Chain<int>; }";
+    if (!util.WriteFile(dir + "/main.oc", source) || !b.LoadPackage(dir)) t.Fatal("load recursion fixture");
+    NewChecker(d).Check(b.Order(), b.StandardSource());
+    cycle := false;
+    expansion := false;
+    for (_, diagnostic := range d.items) {
+        if (diagnostic.message == "cyclic type declaration") cycle = true;
+        if (diagnostic.message == "generic type expansion exceeds compiler limits") expansion = true;
+    }
+    if (!cycle || !expansion) t.Error("missing recursive-layout diagnostics");
 }

@@ -7,6 +7,8 @@ struct FieldPlace { offset int; unitBits int; bitOffset int; bits int; unit int;
 
 struct StructLayout { size int; align int; places []*FieldPlace; units []int; unitOffsets []int; overflow bool; }
 
+maxBitfieldWidth := 64;
+
 func maxStaticSize(c *Checker) int { return c.PtrSize() == 4 ? 2147483647 : 9223372036854775807; }
 
 func addCap(a int, b int, cap int) (int, bool) {
@@ -52,11 +54,11 @@ func structLayout(c *Checker, fields []*ast.FieldInfo) *StructLayout {
     i := 0;
     for (i < len(fields)) {
         f := fields[i];
-        if (f.bits > 0) {
+        if (f.bits > 0 && f.bits <= maxBitfieldWidth) {
             // gather a run of bitfields packed into one unit (<= 64 bits)
             total := 0;
             start := i;
-            for (i < len(fields) && fields[i].bits > 0 && total + fields[i].bits <= 64) { total += fields[i].bits; i++; }
+            for (i < len(fields) && fields[i].bits > 0 && fields[i].bits <= maxBitfieldWidth - total) { total += fields[i].bits; i++; }
             a := intAlign(total); sz := intSize(total);
             noff, ov1 := alignCap(off, a, cap);
             if (ov1) ov = true;
@@ -290,49 +292,64 @@ func alignOf1(c *Checker, t *ast.Type) int {
 func (c *Checker) PtrSize() int { return c.ptrSize > 0 ? c.ptrSize : 8; }
 func (c *Checker) SetPtrSize(n int) { c.ptrSize = n; }
 
-func layoutReady(c *Checker, t *ast.Type, seen *map[string]bool) bool {
+// Limit recursive generic expansion before building an unbounded layout or
+// descriptor graph. The key size also catches instances that grow in breadth.
+func typeExpansionExceeded(c *Checker, at *ast.Node, depth int, key string) bool {
+    if (depth <= 128 && (depth <= 1 || len(key) <= 65536)) return false;
+    id := nodeKey(at);
+    reported, _ := c.typeExpansionErrors[id];
+    if (!reported) {
+        c.typeExpansionErrors[id] = true;
+        err(c, at, "generic type expansion exceeds compiler limits");
+    }
+    return true;
+}
+
+func layoutReady(c *Checker, at *ast.Node, t *ast.Type, seen *map[string]bool, depth int) bool {
     if (nilT(t)) return true;
     switch (t.kind) {
     case ast.TK.Invalid, ast.TK.Void, ast.TK.Bool, ast.TK.Int, ast.TK.Float, ast.TK.String, ast.TK.Null, ast.TK.Param, ast.TK.Family, ast.TK.UntypedInt, ast.TK.UntypedFloat:
         return true;
     }
+    if (len(t.args) > 0) depth++;
     k := TypeKey(t);
     sv, sok := (*seen)[k];
     if (sok && sv) return true;
+    if (typeExpansionExceeded(c, at, depth, k)) return false;
     (*seen)[k] = true;
     switch (t.kind) {
     case ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
-        return nilT(t.elem) || layoutReady(c, t.elem, seen);
+        return nilT(t.elem) || layoutReady(c, at, t.elem, seen, depth);
     case ast.TK.Map:
-        return layoutReady(c, t.key, seen) && layoutReady(c, t.elem, seen);
+        return layoutReady(c, at, t.key, seen, depth) && layoutReady(c, at, t.elem, seen, depth);
     case ast.TK.Tuple, ast.TK.Func:
-        for (_, p := range t.params) { if (!layoutReady(c, p, seen)) return false; }
-        for (_, r := range t.results) { if (!layoutReady(c, r, seen)) return false; }
+        for (_, p := range t.params) { if (!layoutReady(c, at, p, seen, depth)) return false; }
+        for (_, r := range t.results) { if (!layoutReady(c, at, r, seen, depth)) return false; }
         return true;
     case ast.TK.Union:
-        for (_, term := range t.terms) { if (!layoutReady(c, term, seen)) return false; }
+        for (_, term := range t.terms) { if (!layoutReady(c, at, term, seen, depth)) return false; }
         return true;
     case ast.TK.Interface:
         if (!nilS(t.sym) && t.sym.state != 2) return false;
-        for (_, term := range t.terms) { if (!layoutReady(c, term, seen)) return false; }
+        for (_, term := range t.terms) { if (!layoutReady(c, at, term, seen, depth)) return false; }
         return true;
     case ast.TK.Named:
         if (!nilS(t.sym) && t.sym.state != 2) return false;
         u := Underlying(t);
-        if (u != t && !layoutReady(c, u, seen)) return false;
+        if (u != t && !layoutReady(c, at, u, seen, depth)) return false;
         return true;
     case ast.TK.Struct:
         if (!nilS(t.sym) && t.sym.state != 2) return false;
-        for (_, a := range t.args) { if (!layoutReady(c, a, seen)) return false; }
-        for (_, f := range c.FieldsOf(t)) { if (!f.valueParam && !layoutReady(c, f.ty, seen)) return false; }
+        for (_, a := range t.args) { if (!layoutReady(c, at, a, seen, depth)) return false; }
+        for (_, f := range c.FieldsOf(t)) { if (!layoutReady(c, at, f.ty, seen, depth)) return false; }
         return true;
     case ast.TK.Enum:
         if (!nilS(t.sym) && t.sym.state != 2) return false;
-        for (_, a := range t.args) { if (!layoutReady(c, a, seen)) return false; }
+        for (_, a := range t.args) { if (!layoutReady(c, at, a, seen, depth)) return false; }
         for (_, v := range c.VariantsOf(t)) {
-            for (_, pt := range v.types) { if (!layoutReady(c, pt, seen)) return false; }
-            for (_, pf := range v.fields) { if (!layoutReady(c, pf.ty, seen)) return false; }
-            if (!nilT(v.fixedType) && !layoutReady(c, v.fixedType, seen)) return false;
+            for (_, pt := range v.types) { if (!layoutReady(c, at, pt, seen, depth)) return false; }
+            for (_, pf := range v.fields) { if (!layoutReady(c, at, pf.ty, seen, depth)) return false; }
+            if (!nilT(v.fixedType) && !layoutReady(c, at, v.fixedType, seen, depth)) return false;
         }
         return true;
     }
@@ -374,7 +391,7 @@ func checkLayoutWalk(c *Checker, at *ast.Node, t *ast.Type, seen *map[string]boo
     case ast.TK.Struct:
         for (_, a := range t.args) { if (checkLayoutWalk(c, at, a, seen)) return true; }
         if (hasP) {
-            for (_, f := range c.FieldsOf(t)) { if (!f.valueParam && checkLayoutWalk(c, at, f.ty, seen)) return true; }
+            for (_, f := range c.FieldsOf(t)) { if (checkLayoutWalk(c, at, f.ty, seen)) return true; }
         }
     case ast.TK.Enum:
         for (_, a := range t.args) { if (checkLayoutWalk(c, at, a, seen)) return true; }
@@ -392,7 +409,10 @@ func checkLayoutWalk(c *Checker, at *ast.Node, t *ast.Type, seen *map[string]boo
 func (c *Checker) CheckLayoutSize(at *ast.Node, t *ast.Type) bool {
     if (nilT(t)) return false;
     readySeen: map[string]bool;
-    if (!layoutReady(c, t, &readySeen)) return false;
+    if (!layoutReady(c, at, t, &readySeen, 0)) {
+        failed, _ := c.typeExpansionErrors[nodeKey(at)];
+        return failed;
+    }
     seen: map[string]bool;
     return checkLayoutWalk(c, at, t, &seen);
 }

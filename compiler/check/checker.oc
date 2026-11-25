@@ -27,6 +27,7 @@ struct FuncCtx {
 struct Checker {
     ptrSize int;
     assignTarget bool;
+    deferredCall *ast.Node;
     litCache map[int]*BigNat;
     diags *diag.List;
     universe *ast.Scope;
@@ -62,6 +63,7 @@ struct Checker {
     sizeMemo map[string]int;
     alignMemo map[string]int;
     layoutOverflow map[string]bool;
+    typeExpansionErrors map[int]bool;
 }
 
 func newSym(c *Checker, k ast.SK, name string, node *ast.Node) *ast.Symbol {

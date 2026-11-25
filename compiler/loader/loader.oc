@@ -22,6 +22,7 @@ struct Build {
     noModule map[string]bool;
     byDir map[string]*ast.Package;
     root *ast.Package;
+    verifiedModules map[string]string;
     sumRoot string;              // module whose ocean.sum verifies external dependencies
     errors int;
     recover bool;
@@ -334,7 +335,7 @@ func resolveImport(b *Build, from *ast.Package, path string) *ast.Package {
                 error(b, from.dir, "cannot locate module cache; set OCEAN_MOD_CACHE or HOME");
                 return zero(*ast.Package);
             }
-            resolvedRoot, verr := VerifyCachedModule(b.sumRoot, replaced ? replacement : name, version, cacheDir);
+            resolvedRoot, verr := verifyBuildModule(b, replaced ? replacement : name, version, cacheDir);
             if (verr != "") {
                 error(b, from.dir, verr);
                 return zero(*ast.Package);
@@ -352,6 +353,16 @@ func resolveImport(b *Build, from *ast.Package, path string) *ast.Package {
     resolved, ok := util.Realpath(location);
     if (!ok || !util.IsDir(resolved)) { error(b, location, "package directory does not exist"); return zero(*ast.Package); }
     return loadDirectory(b, resolved);
+}
+
+func verifyBuildModule(b *Build, modPath string, version string, cacheDir string) (string, string) {
+    ver := version == "" ? "latest" : version;
+    key := b.sumRoot + "\x00" + cacheDir + "\x00" + modPath + "\x00" + ver;
+    root, ok := b.verifiedModules[key];
+    if (ok) return root, "";
+    resolved, errMsg := VerifyCachedModule(b.sumRoot, modPath, ver, cacheDir);
+    if (errMsg == "") b.verifiedModules[key] = resolved;
+    return resolved, errMsg;
 }
 
 func IsTestFile(name string) bool { return strings.HasSuffix(name, "_test.oc"); }
@@ -628,9 +639,10 @@ func useTestProjectSum(b *Build) bool {
     spec := b.sumRoot[len(cache) + 1:];
     at := strings.LastIndexByte(spec, '@');
     if (at < 0) return true;
-    _, errMsg := VerifyCachedModule(project.root, spec[0:at], spec[at + 1:], cache);
-    if (errMsg != "") { error(b, b.sumRoot, errMsg); return false; }
+    version := strings.ReplaceAll(spec[at + 1:], "%2F", "/");
     b.sumRoot = project.root;
+    _, errMsg := verifyBuildModule(b, spec[0:at], version, cache);
+    if (errMsg != "") { error(b, project.root, errMsg); return false; }
     return true;
 }
 

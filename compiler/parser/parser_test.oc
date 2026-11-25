@@ -205,3 +205,19 @@ func TestHardeningAndEdgeCases(t *testing.T) {
     nestedSizeof += "; }";
     parse(nestedSizeof);
 }
+
+func TestTrialCacheRespectsNestingBudget(t *testing.T) {
+    d := diag.NewList(); d.live = false;
+    src := new(ast.Source); src.path = "t.oc"; src.text = "sizeof(*int)";
+    src.tokens, _ = scanner.Scan(src.path, src.text, d, false);
+    p := new(Parser); p.src = src; p.toks = src.tokens; p.diags = d;
+    p.depth = 400;
+    if (tryParenType(p)) t.Error("type trial exceeded depth limit");
+    p.depth = 0;
+    if (!tryParenType(p)) t.Error("shallow trial reused a failure from the depth limit");
+}
+
+func TestBitfieldWidthLimit(t *testing.T) {
+    expectError(t, "package p; struct Wide { field varuint(128) : 65; }",
+        "bitfield size must be an integer literal from 1 through 64");
+}

@@ -171,7 +171,7 @@ func followsTypeArgs(p *Parser) bool {
 }
 
 func tryTypeArgs(p *Parser) ([]*ast.Node, bool) {
-    key := trialKey(p.pos, p.split, 1);
+    key := trialKey(p, 1);
     ft, fok := p.failedTrials[key];
     if (fok && ft) return make([]*ast.Node), false;
     m := save(p);
@@ -439,7 +439,7 @@ func parenType(p *Parser, k ast.NK, msg string) *ast.Node {
 
 // tryParenType checks whether '(' Type ')' follows the current name.
 func tryParenType(p *Parser) bool {
-    key := trialKey(p.pos, p.split, 2);
+    key := trialKey(p, 2);
     ft, fok := p.failedTrials[key];
     if (fok && ft) return false;
     m := save(p);
@@ -488,7 +488,7 @@ func primary1(p *Parser) *ast.Node {
             }
         }
         if (name == "buffer" && peek(p, 1) == scanner.Kind.Lt) {
-            bkey := trialKey(p.pos, p.split, 3);
+            bkey := trialKey(p, 3);
             ft, fok := p.failedTrials[bkey];
             if (!(fok && ft)) {
                 m := save(p);

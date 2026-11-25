@@ -158,3 +158,34 @@ func TestEmptyReplaceAndSumVerification(t *testing.T) {
     if (hadCache) util.Setenv("OCEAN_MOD_CACHE", prevCache); else util.Unsetenv("OCEAN_MOD_CACHE");
     util.RemoveAll(root);
 }
+
+func TestCacheVersionPaths(t *testing.T) {
+    root := writeTree(t, []string{
+        "ocean.mod", "module example.com/app\n",
+        "cache/example.com/dep@latest/ocean.mod", "module example.com/dep\n",
+        "cache/example.com/dep@latest%2Fnext/ocean.mod", "module example.com/dep\n",
+        "cache/example.com/dep@latest%2Fnext/version.oc", "package dep;",
+    });
+    defer util.RemoveAll(root);
+    cache := root + "/cache";
+    b := NewBuild(quiet());
+    b.sumRoot = root;
+    entries := make([]SumEntry);
+    for (_, version := range []string{"latest", "latest/next"}) {
+        path := ModuleCachePath(cache, "example.com/dep", version);
+        digest, ok := util.HashDir(path);
+        if (!ok) t.Fatal("hashing cache entry ", path);
+        entries.append(SumEntry{module: "example.com/dep", version: version, hash: digest});
+    }
+    if (!WriteSum(root, entries)) t.Fatal("write checksum manifest");
+    for (_, version := range []string{"latest", "latest/next"}) {
+        resolved, problem := verifyBuildModule(b, "example.com/dep", version, cache);
+        if (problem != "" || resolved != ModuleCachePath(cache, "example.com/dep", version)) {
+            t.Fatal("verify version ", version, ": ", problem);
+        }
+    }
+    if (len(b.verifiedModules) != 2) t.Fatal("versions shared a verification result");
+    b.sumRoot = root + "/other";
+    _, problem := verifyBuildModule(b, "example.com/dep", "latest", cache);
+    if (!strings.Contains(problem, "missing ocean.sum entry")) t.Error("verification leaked across checksum manifests");
+}

@@ -145,8 +145,11 @@ func stmt(c *Checker, n *ast.Node) {
         n.ival = 1;
     case ast.NK.Defer:
         c.fn.hasDefer = true;
-        valueExpr(c, n.a);
         call := n.a;
+        previous := c.deferredCall;
+        c.deferredCall = call;
+        valueExpr(c, call);
+        c.deferredCall = previous;
         if (call.sem == ast.Sem.CallBuiltin && call.text == "delete" && len(call.list) == 2 && hasMovableIndex(call.list[0])) {
             warn(c, call.list[0], "deferred delete captures a map slot that can become invalid if its container moves");
         }
@@ -746,47 +749,49 @@ func checkGoto(c *Checker, g *ast.Node, label *ast.Node) {
 func checkInstanceBitfields(c *Checker, at *ast.Node, t *ast.Type) {
     if (nilT(t)) return;
     seen: map[string]bool;
-    checkInstanceBitfieldsWalk(c, at, t, &seen);
+    checkInstanceBitfieldsWalk(c, at, t, &seen, 0);
 }
 
-func checkInstanceBitfieldsWalk(c *Checker, at *ast.Node, t *ast.Type, seen *map[string]bool) bool {
+func checkInstanceBitfieldsWalk(c *Checker, at *ast.Node, t *ast.Type, seen *map[string]bool, depth int) bool {
     if (nilT(t)) return false;
     switch (t.kind) {
     case ast.TK.Invalid, ast.TK.Void, ast.TK.Bool, ast.TK.Int, ast.TK.Float, ast.TK.String, ast.TK.Null, ast.TK.Param, ast.TK.Family, ast.TK.UntypedInt, ast.TK.UntypedFloat:
         return false;
     }
+    if (len(t.args) > 0) depth++;
     k := TypeKey(t);
     sv, sok := (*seen)[k];
     if (sok && sv) return false;
+    if (typeExpansionExceeded(c, at, depth, k)) return true;
     (*seen)[k] = true;
     switch (t.kind) {
     case ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
-        return !nilT(t.elem) && checkInstanceBitfieldsWalk(c, at, t.elem, seen);
+        return !nilT(t.elem) && checkInstanceBitfieldsWalk(c, at, t.elem, seen, depth);
     case ast.TK.Map:
-        return checkInstanceBitfieldsWalk(c, at, t.key, seen) || checkInstanceBitfieldsWalk(c, at, t.elem, seen);
+        return checkInstanceBitfieldsWalk(c, at, t.key, seen, depth) || checkInstanceBitfieldsWalk(c, at, t.elem, seen, depth);
     case ast.TK.Tuple, ast.TK.Func:
-        for (_, p := range t.params) { if (checkInstanceBitfieldsWalk(c, at, p, seen)) return true; }
-        for (_, r := range t.results) { if (checkInstanceBitfieldsWalk(c, at, r, seen)) return true; }
+        for (_, p := range t.params) { if (checkInstanceBitfieldsWalk(c, at, p, seen, depth)) return true; }
+        for (_, r := range t.results) { if (checkInstanceBitfieldsWalk(c, at, r, seen, depth)) return true; }
         return false;
     case ast.TK.Union, ast.TK.Interface:
-        for (_, term := range t.terms) { if (checkInstanceBitfieldsWalk(c, at, term, seen)) return true; }
+        for (_, term := range t.terms) { if (checkInstanceBitfieldsWalk(c, at, term, seen, depth)) return true; }
         return false;
     case ast.TK.Named:
         if (!nilS(t.sym) && t.sym.state != 2) return false;
         u := Underlying(t);
-        return u != t && checkInstanceBitfieldsWalk(c, at, u, seen);
+        return u != t && checkInstanceBitfieldsWalk(c, at, u, seen, depth);
     case ast.TK.Enum:
         if (!nilS(t.sym) && t.sym.state != 2) return false;
-        for (_, a := range t.args) { if (checkInstanceBitfieldsWalk(c, at, a, seen)) return true; }
+        for (_, a := range t.args) { if (checkInstanceBitfieldsWalk(c, at, a, seen, depth)) return true; }
         for (_, v := range c.VariantsOf(t)) {
-            for (_, pt := range v.types) { if (checkInstanceBitfieldsWalk(c, at, pt, seen)) return true; }
-            for (_, pf := range v.fields) { if (checkInstanceBitfieldsWalk(c, at, pf.ty, seen)) return true; }
-            if (!nilT(v.fixedType) && checkInstanceBitfieldsWalk(c, at, v.fixedType, seen)) return true;
+            for (_, pt := range v.types) { if (checkInstanceBitfieldsWalk(c, at, pt, seen, depth)) return true; }
+            for (_, pf := range v.fields) { if (checkInstanceBitfieldsWalk(c, at, pf.ty, seen, depth)) return true; }
+            if (!nilT(v.fixedType) && checkInstanceBitfieldsWalk(c, at, v.fixedType, seen, depth)) return true;
         }
         return false;
     case ast.TK.Struct:
         if (!nilS(t.sym) && t.sym.state != 2) return false;
-        for (_, a := range t.args) { if (checkInstanceBitfieldsWalk(c, at, a, seen)) return true; }
+        for (_, a := range t.args) { if (checkInstanceBitfieldsWalk(c, at, a, seen, depth)) return true; }
         if (len(t.args) > 0) {
             for (_, f := range c.FieldsOf(t)) {
                 if (f.bits <= 0) continue;
@@ -803,7 +808,7 @@ func checkInstanceBitfieldsWalk(c *Checker, at *ast.Node, t *ast.Type, seen *map
             }
         }
         for (_, f := range c.FieldsOf(t)) {
-            if (!f.valueParam && checkInstanceBitfieldsWalk(c, at, f.ty, seen)) return true;
+            if (checkInstanceBitfieldsWalk(c, at, f.ty, seen, depth)) return true;
         }
     }
     return false;

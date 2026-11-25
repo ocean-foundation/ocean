@@ -1625,22 +1625,6 @@ static void table_insert(Thread *t) {
     buckets[b] = t;
     nthreads++;
 }
-static void table_remove(int64_t id) {
-    if (id <= 0 || !nbuckets) return;
-    size_t b = hash_thread_id(id) & (nbuckets - 1);
-    Thread **link = &buckets[b];
-    while (*link) {
-        Thread *cur = *link;
-        if (cur->id == id) {
-            *link = cur->next;
-            cur->next = NULL;
-            nthreads--;
-            return;
-        }
-        link = &cur->next;
-    }
-}
-
 static void cleanup_sync(void);
 static void shutdown_threads(void);
 static void initialize(void) {
@@ -1768,17 +1752,19 @@ int32_t ocean_threads_await(int64_t id) {
     while (!t->done || t->joining) {
         if (cancelled()) { unlock(&registry); ocean_runtime_thread_return(); }
         cond_wait(&changed, &registry);
-        t = find(id);
-        if (!t) { unlock(&registry); ocean_threads_checkpoint(); return -1; }
     }
-    if (t == &main_thread) { unlock(&registry); ocean_threads_checkpoint(); return 0; }
+    if (t == &main_thread || t->joined) {
+        unlock(&registry);
+        ocean_threads_checkpoint();
+        return 0;
+    }
     t->joining = 1;
-    table_remove(id);
     Handle h = t->handle;
     unlock(&registry);
     join(h);
-    free(t);
     lock(&registry);
+    t->joined = 1;
+    t->joining = 0;
     broadcast(&changed);
     unlock(&registry);
     ocean_threads_checkpoint(); return 0;
@@ -1828,25 +1814,22 @@ static void shutdown_threads(void) {
     main_thread.done = 1;
     broadcast(&changed);
     returning = 1;
-    size_t bucket = 0;
-    for (;;) {
-        int64_t next_worker = -1;
-        for (; bucket < nbuckets; bucket++) {
-            for (Thread *t = buckets[bucket]; t; t = t->next) {
-                if (!is_current_os_thread(t)) { next_worker = t->id; break; }
-            }
-            if (next_worker >= 0) break;
+    // No worker can be spawned or removed during this walk.
+    for (size_t b = 0; b < nbuckets; b++) {
+        for (Thread *t = buckets[b]; t; t = t->next) {
+            // A successful native join invalidates the handle.
+            if (t->joined || (!t->joining && is_current_os_thread(t))) continue;
+            int64_t id = t->id;
+            unlock(&registry);
+            ocean_threads_await(id);
+            lock(&registry);
         }
-        if (next_worker < 0) break;
-        unlock(&registry);
-        ocean_threads_await(next_worker);
-        lock(&registry);
     }
     for (size_t b = 0; b < nbuckets; b++) {
         Thread *t = buckets[b];
         while (t) {
             Thread *next = t->next;
-            if (is_current_os_thread(t)) self = NULL;
+            if (t == self) self = NULL;
 #if defined(_WIN32)
             if (!t->joined) CloseHandle(t->handle);
 #endif

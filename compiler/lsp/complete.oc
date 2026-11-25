@@ -261,7 +261,7 @@ func candidates(a *Analysis) []*Candidate {
             for (name, v := range m.requires) {
                 _, replaced := m.replaces[name];
                 if (replaced) continue;
-                dir := cache + "/" + name + "@" + (v == "" ? "latest" : v);
+                dir := loader.ModuleCachePath(cache, name, v);
                 if (util.IsDir(dir)) candidateDir(&out, dir, name, 0, &budget, true);
             }
         }
