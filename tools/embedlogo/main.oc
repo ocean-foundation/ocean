@@ -9,5 +9,5 @@ func main() {
     file.Write("logo := `").unwrap();
     logo := os.ReadFile("logo.ansi").unwrap();
     file.Write(logo).unwrap();
-    file.Write("\n`;\n").unwrap();
+    file.Write("`;\n").unwrap();
 }

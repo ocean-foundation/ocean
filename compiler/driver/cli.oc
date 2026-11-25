@@ -22,6 +22,7 @@ func Main(argv array<string>) int {
     args := make([]string);
     for (i := 0; i < len(argv); i++) args.append(argv[i]);
     argc := len(args);
+    if (argc == 2 && args[1] == "logo") { util.Stdout(logo); return 0; }
     if (argc == 2 && (args[1] == "-v" || args[1] == "--version")) { util.Stdout(versionText()); return 0; }
     if (argc > 1 && args[1] == "target") return targetMain(args[2:]);
     if (argc > 1 && args[1] == "test") return testMain(args);
@@ -65,7 +66,7 @@ func Main(argv array<string>) int {
 
 func versionText() string {
     return logo +
-    "Ocean compiler (ocean) " + Version() + "\nCommit " + Commit() + " (" + CommitDate() + "), built " + BuildDate() + "\nCopyright Connor Egan " + CommitYear() + "\n";
+    "\n\nOcean compiler (ocean) " + Version() + "\nCommit " + Commit() + " (" + CommitDate() + "), built " + BuildDate() + "\nCopyright Connor Egan " + CommitYear() + "\n";
 }
 
 func modMain(args []string) int {
