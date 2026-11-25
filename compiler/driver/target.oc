@@ -96,21 +96,8 @@ func targetRoot() string {
     return util.NormalizePath(root + (util.Windows() ? "/Ocean" : "/.ocean") + "/targets");
 }
 
-// Each release uses the same tested sysroots and runtime libraries on every host.
-func bundleRelease() string { return "nightly-2026.11.22"; }
-
-func bundleDigest(target util.Target) string {
-    switch (target.Name()) {
-    case "aarch64-linux": return "73020116a8e3d99da0b5e95feb467082e0c61d1cfb103431c345956a7438c869";
-    case "aarch64-macos": return "5a7c8c41d012f2a703a921a765b1bdd33f62754671d0996e3ee6973c9cb86347";
-    case "aarch64-windows": return "6b1716aab98f274ff094baba20dab8dc53ff5bfa143e4d6bae13b6e19899b410";
-    case "riscv64-linux": return "061c860b9fd34700f8092e2977683552fa27c48a2ddc7fa6139f06b977920df7";
-    case "x86_64-linux": return "f3d0b0ba9f2d1129cb86aae7389941bcc482284cce45356b22f2360735b388af";
-    case "x86_64-macos": return "6745d345555e7a2a5d001e1bbd6f38564925e89fb6efb3c5f71da1be75a6b133";
-    case "x86_64-windows": return "ea863e3d097b86c16f31d0836b21efab508f3f37a8ab1f5031c07ed6f89dfe82";
-    }
-    return "";
-}
+// Untagged builds can still use toolchains installed by the previous compiler.
+func bundleRelease() string { return bundleVersion == "" ? "nightly-2026.11.22" : bundleVersion; }
 
 func versionedTargetRoot(root string) string { return root + "/" + bundleRelease(); }
 
@@ -177,26 +164,49 @@ func verifyTargetArchive(archive string, digest string) bool {
     return false;
 }
 
-func unpackTargetBundle(stage string, destination string, target util.Target) bool {
-    digest := bundleDigest(target);
-    if (digest == "") {
-        util.Stderr("ocean target: no published bundle for " + target.Name() + "\n");
+func downloadTargetAsset(asset string, path string, showProgress bool) bool {
+    url := "https://github.com/ocean-foundation/ocean/releases/download/" + bundleVersion + "/" + asset;
+    progress := showProgress && util.IsTerminal(2) ? "--progress-bar" : "--silent";
+    status := util.Run([]string{"curl", "--fail", "--location", progress, "--show-error", "--retry", "2",
+        "--connect-timeout", "15", "--proto", "=https", "--proto-redir", "=https", "--output", path, url}.array());
+    if (status.Failed || status.Code != 0) {
+        util.Stderr("ocean target: could not download " + asset + "\n");
         return false;
     }
-    asset := "ocean-deps_" + bundleRelease() + "_" + target.Name() + ".tar.xz";
-    url := "https://github.com/ocean-foundation/ocean-c/releases/download/" + bundleRelease() + "/" + asset;
+    return true;
+}
+
+func targetArchiveDigest(checksums string, asset string) string {
+    for (_, line := range strings.Split(checksums, "\n")) {
+        fields := strings.Fields(line);
+        if (len(fields) != 2 || fields[1] != asset || len(fields[0]) != 64) continue;
+        digest := strings.ToLower(fields[0]);
+        valid := true;
+        for (i := 0; i < len(digest); i++) {
+            if (strings.IndexByte("0123456789abcdef", digest[i]) < 0) { valid = false; break; }
+        }
+        if (valid) return digest;
+    }
+    return "";
+}
+
+func unpackTargetBundle(stage string, destination string, target util.Target) bool {
+    if (bundleVersion == "") {
+        util.Stderr("ocean target: use a published Ocean release or rebuild with BUNDLE_VERSION set to a published tag\n");
+        return false;
+    }
+    asset := "ocean-deps_" + bundleVersion + "_" + target.Name() + ".tar.xz";
+    manifest := "SHA256SUMS_" + target.Name() + ".txt";
+    if (!downloadTargetAsset(manifest, stage + "/" + manifest, false)) return false;
+    checksums, _ := util.ReadFile(stage + "/" + manifest);
+    digest := targetArchiveDigest(checksums, asset);
+    if (digest == "") { util.Stderr("ocean target: missing SHA-256 for " + asset + "\n"); return false; }
     archive := stage + "/" + asset;
     util.Stdout("Downloading " + asset + "\n");
-    progress := util.IsTerminal(2) ? "--progress-bar" : "--silent";
-    status := util.Run([]string{"curl", "--fail", "--location", progress, "--show-error", "--retry", "2",
-        "--connect-timeout", "15", "--proto", "=https", "--proto-redir", "=https", "--output", archive, url}.array());
-    if (status.Failed || status.Code != 0) {
-        util.Stderr("ocean target: curl failed\n");
-        return false;
-    }
-    util.Stdout("Verifying download...");
+    if (!downloadTargetAsset(asset, archive, true)) return false;
+    util.Stdout("Verifying download... ");
     if (!verifyTargetArchive(archive, digest) || !util.Mkdir(destination)) return false;
-    util.Stdout("Extracting package...");
+    util.Stdout("Extracting package... ");
     if (!targetCommand([]string{"tar", "-xf", archive, "-C", destination})) return false;
     return util.Remove(archive);
 }

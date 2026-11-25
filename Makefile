@@ -2,6 +2,7 @@
 # OCEAN is the bootstrap compiler (an installed ocean, or a previous build).
 OCEAN ?= ocean
 VERSION ?= dev
+BUNDLE_VERSION ?= $(if $(filter dev,$(VERSION)),$(shell git describe --tags --match 'nightly-*' --abbrev=0 2>/dev/null),$(VERSION))
 # Windows builds use GNU Make in an MSYS2 CLANG64/CLANGARM64 shell.
 EXE := $(if $(filter Windows_NT,$(OS)),.exe,)
 OUT ?= build/ocean$(EXE)
@@ -15,7 +16,7 @@ COMMIT_YEAR ?= $(shell git log -1 --format=%cd --date=format:%Y 2>/dev/null || d
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -X $(PKG).version=$(VERSION) -X $(PKG).commit=$(COMMIT) \
 	-X $(PKG).commitDate=$(COMMIT_DATE) -X $(PKG).commitYear=$(COMMIT_YEAR) \
-	-X $(PKG).buildDate=$(BUILD_DATE)
+	-X $(PKG).buildDate=$(BUILD_DATE) -X $(PKG).bundleVersion=$(BUNDLE_VERSION)
 
 .PHONY: all test selfhost clean runtime logo crosscheck release
 all: runtime logo
@@ -69,6 +70,6 @@ release:
 		os=$${t#*-}; \
 		ext=$$( [ "$$os" = "windows" ] && echo .exe || true ); \
 		out="build/release/ocean-$(VERSION)-$$os-$$arch$$ext"; \
-		OCOS=$$os OCARCH=$$arch "$(OUT)" build -ldflags "$(LDFLAGS)" -o "$$out" .; \
+		OCOS=$$os OCARCH=$$arch "$(OUT)" build $(RELEASE_FLAGS) -ldflags "$(LDFLAGS)" -o "$$out" .; \
 		echo "built $$out"; \
 	done

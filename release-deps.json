@@ -1,0 +1,33 @@
+{
+  "profiles": {
+    "ubuntu-24.04": {
+      "manager": "apt",
+      "packages": "build-essential curl ca-certificates git gnupg libffi-dev libcurl4-openssl-dev pkg-config patchelf python3 xz-utils",
+      "toolchain": "clang-23 lld-23 llvm-23 libclang-rt-23-dev"
+    },
+    "riscv64-ubuntu-26.04": {
+      "manager": "apt",
+      "packages": "build-essential ca-certificates git libffi-dev libcurl4-openssl-dev pkg-config patchelf python3 xz-utils clang-21 lld-21 llvm-21 libclang-rt-21-dev"
+    },
+    "macos": {
+      "manager": "brew",
+      "packages": "llvm lld libffi pkgconf",
+      "sdk": "Xcode command line tools"
+    },
+    "windows": {
+      "manager": "pacman",
+      "packages": "make git curl xz",
+      "native_packages": ["clang", "lld", "llvm", "libffi", "curl", "pkgconf", "python"]
+    }
+  },
+  "targets": [
+    {"arch": "x86_64", "system": "linux", "runner": "ubuntu-24.04", "profile": "ubuntu-24.04"},
+    {"arch": "aarch64", "system": "linux", "runner": "ubuntu-24.04-arm", "profile": "ubuntu-24.04"},
+    {"arch": "riscv64", "system": "linux", "runner": "ubuntu-24.04", "profile": "riscv64-ubuntu-26.04", "image": "riscv64/ubuntu:26.04"},
+    {"arch": "x86_64", "system": "macos", "runner": "macos-15-intel", "profile": "macos"},
+    {"arch": "aarch64", "system": "macos", "runner": "macos-15", "profile": "macos"},
+    {"arch": "x86_64", "system": "windows", "runner": "windows-2025", "profile": "windows", "msystem": "CLANG64", "prefix": "mingw-w64-clang-x86_64"},
+    {"arch": "aarch64", "system": "windows", "runner": "windows-11-arm", "profile": "windows", "msystem": "CLANGARM64", "prefix": "mingw-w64-clang-aarch64"},
+    {"arch": "wasm", "system": "js", "profile": null, "dependencies": "Host bundle Clang with WebAssembly support, wasm-ld, and the embedded Ocean runtime"}
+  ]
+}
