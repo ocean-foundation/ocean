@@ -118,7 +118,7 @@ def build_bundle(destination, version, arch, system, *, compress=True):
             if Path('/usr/lib/gcc').exists(): copy('/usr/lib/gcc',root/'sysroot/usr/lib/gcc')
             machine=output('gcc','-print-multiarch')
             libdir=Path('/usr/lib')/machine; target=root/'sysroot/usr/lib'/machine
-            core=re.compile(r'^(?:[Sgr]?crt.*\.o|lib(?:c|m|pthread|dl|rt|util|resolv|gcc_s|stdc\+\+)(?:[._-].*)?|ld-linux.*)$')
+            core=re.compile(r'^(?:[Sgr]?crt.*\.o|lib(?:c|m|mvec|pthread|dl|rt|util|resolv|gcc_s|stdc\+\+)(?:[._-].*)?|ld-linux.*)$')
             for file in libdir.iterdir():
                 if file.is_file() and core.match(file.name): copy(file,target/file.name)
             runtime=Path('/lib')/machine
@@ -189,12 +189,25 @@ def build_bundle(destination, version, arch, system, *, compress=True):
         timeout = 60 * int(os.environ.get('OCEAN_RELEASE_TEST_TIMEOUT_SCALE', '1'))
         print('Verifying relocated dependency tools', flush=True)
         subprocess.run([str(executable),'--version'],check=True,timeout=timeout)
-        probe=Path(temporary)/'probe.c';probe.write_text('#include <stdio.h>\n#include <ffi.h>\n#include <curl/curl.h>\nint main(void){if(!curl_version() || !sizeof(ffi_cif))return 1;puts("bundle-ok");return 0;}\n')
+        probe = Path(temporary) / 'probe.c'
+        libraries = ['-lffi', '-lcurl']
+        math_header = math_check = ''
+        if system == 'linux':
+            math_header = '#include <math.h>\n'
+            math_check = '    volatile double angle = 0.0;\n    if (cos(angle) != 1.0) return 1;\n'
+            libraries.append('-lm')
+        probe.write_text(
+            '#include <stdio.h>\n#include <ffi.h>\n#include <curl/curl.h>\n' + math_header
+            + 'int main(void) {\n'
+            + '    if (!curl_version() || !sizeof(ffi_cif)) return 1;\n'
+            + math_check
+            + '    puts("bundle-ok");\n    return 0;\n}\n'
+        )
         application=Path(temporary)/('probe.exe' if system=='windows' else 'probe')
         config=root/'bin/clang.cfg';base=config.read_text()
         if system=='macos':config.write_text('-isysroot\n"'+output('xcrun','--show-sdk-path')+'"\n'+base)
         print('Compiling dependency bundle probe', flush=True)
-        subprocess.run([str(executable),str(probe),'-lffi','-lcurl','-o',str(application)],check=True,timeout=timeout)
+        subprocess.run([str(executable), str(probe), *libraries, '-o', str(application)], check=True, timeout=timeout)
         env=dict(os.environ,PATH=str(root/'bin')+os.pathsep+os.environ['PATH'])
         print('Running dependency bundle probe', flush=True)
         assert subprocess.check_output([str(application)],text=True,env=env,timeout=timeout).strip()=='bundle-ok'

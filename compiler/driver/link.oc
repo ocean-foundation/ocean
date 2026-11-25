@@ -258,6 +258,12 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
             if (!clangRun(p, cargs)) { util.RemoveAll(dir); util.Remove(staged); return false; }
             objs.append(obj);
         }
+        // llvm-ar expects an absent path or a valid archive.
+        if (util.BuildTarget().system == "windows" && !util.Remove(staged)) {
+            util.Stderr("could not remove staged archive: " + util.OutputError(staged, true) + "\n");
+            util.RemoveAll(dir);
+            return false;
+        }
         largs := objectLinkArgs(staged);
         largs.append(objs...);
         if (!clangRun(p, largs)) { util.RemoveAll(dir); util.Remove(staged); return false; }
