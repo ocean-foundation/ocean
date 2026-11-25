@@ -171,7 +171,7 @@ func frameName(inst *Inst) string {
 }
 
 // frameOff gives the offset of an OcFrame field (core.c) for the target's
-// pointer size: {prev, name, i64 site, defers, jb, locals, i64 in_defer}.
+// pointer size: {prev, name, i64 site, defers, jb, locals, i64 in_defer, active_defers}.
 func frameOff(g *Gen, field string) int {
     p := g.c.PtrSize();
     site := p == 8 ? 16 : 8;
@@ -183,7 +183,8 @@ func frameOff(g *Gen, field string) int {
     case "jb": return site + 8 + p;
     case "locals": return site + 8 + 2 * p;
     case "in_defer": return base;
-    case "size": return base + 8;
+    case "active_defers": return base + 8;
+    case "size": return base + 16;
     }
     return 0;
 }
@@ -197,6 +198,7 @@ func prologue(g *Gen, displayName string) {
     emit(g, "store ptr " + cstr(g, displayName) + ", ptr " + gep(g, f.frame, frameOff(g, "name")));
     emit(g, "store i64 0, ptr " + gep(g, f.frame, frameOff(g, "site")));
     emit(g, "store ptr null, ptr " + gep(g, f.frame, frameOff(g, "defers")));
+    emit(g, "store ptr null, ptr " + gep(g, f.frame, frameOff(g, "active_defers")));
     emit(g, "store ptr null, ptr " + gep(g, f.frame, frameOff(g, "jb")));
     // owned locals, released by the runtime when a panic unwinds this frame
     emit(g, "store ptr %loctab, ptr " + gep(g, f.frame, frameOff(g, "locals")));

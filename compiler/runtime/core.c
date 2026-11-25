@@ -42,7 +42,7 @@ typedef struct OcDefer {
 typedef struct OcLocal { void *slot; const struct OcType *t; } OcLocal;
 /* locals: the frame's owned locals (null-slot terminated), released when a
  * panic unwinds past the frame. */
-typedef struct OcFrame { struct OcFrame *prev; const char *name; int64_t site; OcDefer *defers; void *jb; const OcLocal *locals; int64_t in_defer; } OcFrame;
+typedef struct OcFrame { struct OcFrame *prev; const char *name; int64_t site; OcDefer *defers; void *jb; const OcLocal *locals; int64_t in_defer; OcDefer *active_defers; } OcFrame;
 typedef struct OcBufNode { struct OcBufNode *next; void *blk; const OcType *elem; } OcBufNode;
 
 extern const OcSite oc_sites[];
@@ -1304,14 +1304,22 @@ static int is_strict_ancestor(const OcFrame *anc, const OcFrame *f) {
     return 0;
 }
 
+static void release_defer(OcDefer *d) {
+    d->thunk(d, 0);
+    free(d);
+}
+
 void oc_run_defers(OcFrame *f) {
     while (f->defers) {
         OcDefer *d = f->defers;
         f->defers = d->next;
+        d->next = f->active_defers;
+        f->active_defers = d;
         oc_in_defer++;
         d->thunk(d, 1);
         oc_in_defer--;
-        free(d);
+        f->active_defers = d->next;
+        release_defer(d);
     }
 }
 
@@ -1322,8 +1330,17 @@ static void discard_defers(OcFrame *f) {
     while (f->defers) {
         OcDefer *d = f->defers;
         f->defers = d->next;
-        d->thunk(d, 0);
-        free(d);
+        release_defer(d);
+    }
+}
+/* Called only when unwinding has reached the frame that invoked the defer.
+ * A panic recovered inside the deferred call leaves its active record intact. */
+static void abandon_active_defers(OcFrame *f) {
+    while (f->active_defers) {
+        OcDefer *d = f->active_defers;
+        f->active_defers = d->next;
+        oc_in_defer--;
+        release_defer(d);
     }
 }
 
@@ -1358,6 +1375,7 @@ static void unwind(OcArr *msg, int64_t site, OcFrame *start, OcFrame *traceFrom)
     panicking = &p;
     for (OcFrame *f = start; f; f = f->prev) {
         oc_top = f;
+        abandon_active_defers(f);
         if (f->defers) {
             p.deferFrame = f;
             oc_run_defers(f);
@@ -1401,6 +1419,7 @@ void oc_return_panic(OcArr *msg, int64_t site) {
     while (target->prev && target->prev->name && (target->site & FORWARD_BIT)) target = target->prev;
     int can_rec = recovery_possible(target);
     for (OcFrame *s = f; s && s != target; s = s->prev) {
+        abandon_active_defers(s);
         discard_defers(s);
         if (can_rec) drop_locals(s);
     }
@@ -1427,7 +1446,12 @@ extern _Noreturn void ocean_threads_exit(void);
 extern void ocean_threads_begin_return(void);
 void ocean_runtime_thread_return(void) {
     if (ocean_threads_begin_return) ocean_threads_begin_return();
-    for (OcFrame *f = oc_top; f; f = f->prev) { oc_top = f; oc_run_defers(f); drop_locals(f); }
+    for (OcFrame *f = oc_top; f; f = f->prev) {
+        oc_top = f;
+        abandon_active_defers(f);
+        oc_run_defers(f);
+        drop_locals(f);
+    }
     oc_top = NULL;
     if (ocean_threads_exit) ocean_threads_exit();
     exit(0);

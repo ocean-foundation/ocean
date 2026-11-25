@@ -42,3 +42,45 @@ func TestSkippedDefersPreserveBorrowedPointers(t *testing.T) {
     }
     free(p);
 }
+
+interface PanickingDeferredAction { func Fail(DeferredPayload); }
+
+func (receiver DeferredPayload) Fail(arg DeferredPayload) {
+    panic receiver.message + arg.message;
+}
+
+func runPanickingDefer(total *int) {
+    receiver: PanickingDeferredAction = DeferredPayload{message: "deferred "};
+    defer func() { *total += 1; }();
+    defer receiver.Fail(DeferredPayload{message: "panic"});
+}
+
+func recoverPanickingDefer(total *int) (message string) {
+    defer func() {
+        value := recover();
+        if (value != null) message = value.(string);
+    }();
+    runPanickingDefer(total);
+    return;
+}
+
+func recoverInsideDefer(total *int, payload DeferredPayload) {
+    defer func() {
+        if (recover() != null) *total += len(payload.message);
+    }();
+    panic "handled inside the defer";
+}
+
+func runInternallyRecoveredDefer(total *int) {
+    defer func() { *total += 10; }();
+    defer recoverInsideDefer(total, DeferredPayload{message: "kept"});
+}
+
+func TestActiveDefersDuringPanic(t *testing.T) {
+    total := 0;
+    if (recoverPanickingDefer(&total) != "deferred panic" || total != 1) {
+        t.Error("an escaping panic did not unwind the running defer");
+    }
+    runInternallyRecoveredDefer(&total);
+    if (total != 15) t.Error("recovery inside a defer disrupted its caller");
+}

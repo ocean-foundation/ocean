@@ -382,7 +382,7 @@ func ffiCapture(g *Gen, n *ast.Node) []V {
         store(g, anyT, slot, bv);
     }
     ex := tmp(g); emit(g, ex + " = load ptr, ptr " + extras);
-    // ffiCall normally drops this fresh array directly. A skipped defer owns it.
+    // The caller or defer record owns the freshly built extras array.
     out.append(freshNoTemp(ex, check.DynOf(anyT)));
     return out;
 }
@@ -402,11 +402,6 @@ func ffiCall(g *Gen, s *ast.Symbol, vals []V, t *ast.Type) V {
     declare(g, "@oc_cvar_call", "declare i64 @oc_cvar_call(ptr, i64, i64, i64, ptr, ptr, ptr)");
     r := tmp(g);
     emit(g, r + " = call i64 @oc_cvar_call(ptr @\"" + s.name + "\", i64 " + itoa(rk) + ", i64 " + itoa(nfixed) + ", i64 " + itoa(nfixed) + ", ptr " + kinds + ", ptr " + slots + ", ptr " + vals[nfixed].r + ")");
-    if (g.trackTemps) {
-        exSlot := alloca(g, vals[nfixed].t);
-        emit(g, "store ptr " + vals[nfixed].r + ", ptr " + exSlot);
-        emit(g, "call void @oc_drop(ptr " + exSlot + ", ptr " + desc(g, vals[nfixed].t) + ")");
-    }
     res: V; res.t = t;
     if (len(ft.results) == 0) return res;
     rt := ft.results[0];
@@ -430,7 +425,14 @@ func ffiCall(g *Gen, s *ast.Symbol, vals []V, t *ast.Type) V {
 func genFFICall(g *Gen, n *ast.Node, t *ast.Type) V {
     vals := ffiCapture(g, n);
     setSite(g, n);
-    return ffiCall(g, n.sym, vals, t);
+    result := ffiCall(g, n.sym, vals, t);
+    nfixed := len(vals) - 1;
+    if (g.trackTemps) {
+        exSlot := alloca(g, vals[nfixed].t);
+        emit(g, "store ptr " + vals[nfixed].r + ", ptr " + exSlot);
+        emit(g, "call void @oc_drop(ptr " + exSlot + ", ptr " + desc(g, vals[nfixed].t) + ")");
+    }
+    return result;
 }
 
 func declareExtern(g *Gen, s *ast.Symbol) {
