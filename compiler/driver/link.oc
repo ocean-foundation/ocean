@@ -78,7 +78,7 @@ func clangTargetArgs(target util.Target) []string {
     if (root != "") {
         path := targetPath(root, target);
         sdk, _ := util.ReadFile(path + "/sdk");
-        args = managedClangArgs(root, target, path, sdk);
+        args = managedClangArgs(root, target, path, macOSSDKPath(path, sdk));
     } else {
         clang, _ := util.Getenv("OCEAN_CLANG");
         args.append(clang == "" ? "clang" : clang);
@@ -124,7 +124,7 @@ func clangRun(p *Program, args []string) bool {
     if (target.system == "linux")
         util.Stderr("Install a Linux linker, libc headers, startup objects and runtime libraries for " + target.arch + ". Set OCEAN_SYSROOT if the target files are in a separate sysroot.\n");
     else if (target.system == "macos")
-        util.Stderr("Install the Xcode Command Line Tools on macOS, or provide a macOS SDK via OCEAN_SYSROOT and a Mach-O linker.\n");
+        util.Stderr("Install the Xcode Command Line Tools on macOS, or provide a macOS SDK via OCEAN_SYSROOT and a Mach-O linker such as ld64.lld.\n");
     else if (target.system == "windows")
         util.Stderr("Install a MinGW-w64 toolchain for " + target.arch + ", such as LLVM-MinGW, and point OCEAN_CLANG to its Clang.\n");
     if (p.usesFFI) util.Stderr("Install libffi headers and libraries for the target.\n");
@@ -261,7 +261,7 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
             objs.append(obj);
         }
         // Seed the reserved path with an empty archive for llvm-ar.
-        if (target.system == "windows" && !util.WriteFileAtomic(staged, "!<arch>\n", 420)) {
+        if (archivesLibraries(target) && !util.WriteFileAtomic(staged, "!<arch>\n", 420)) {
             util.Stderr("could not initialize staged archive: " + util.OutputError(staged, false) + "\n");
             util.RemoveAll(dir);
             util.Remove(staged);
@@ -420,16 +420,21 @@ func wasmCompileFlags(dir string) []string {
     return []string{"-I" + dir, "-D__thread=", "-ffunction-sections", "-fdata-sections"};
 }
 
-// COFF libraries are indexed archives. Mach-O relocatable links must retain
-// private externals referenced by other cached objects.
+// COFF libraries, and Mach-O libraries linked by ld64.lld (which has no -r),
+// are indexed archives. Mach-O relocatable links must retain private externals
+// referenced by other cached objects.
 func objectLinkArgs(output string) []string {
     target := util.BuildTarget();
-    if (target.system == "windows") {
+    if (archivesLibraries(target)) {
         return []string{targetTool(managedTargetRoot(target), "llvm-ar"), "rcs", output};
     }
     args := clangArgs([]string{"-r", "-nostdlib", "-o", output});
     if (target.system == "macos") args.append("-Wl,-keep_private_externs");
     return args;
+}
+
+func archivesLibraries(target util.Target) bool {
+    return target.system == "windows" || crossMacOSTarget(target);
 }
 
 func targetPackageFlags(target util.Target, packageName string, options ...string) ([]string, bool) {
