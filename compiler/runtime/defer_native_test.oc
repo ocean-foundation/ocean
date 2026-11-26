@@ -1,0 +1,145 @@
+package runtime;
+import "testing";
+
+struct DeferredPayload { message string; parts []string; }
+interface DeferredAction { func AddTo(*int); }
+
+func (value DeferredPayload) AddTo(total *int) {
+    *total += len(value.message) + len(value.parts[0]);
+}
+
+func addDeferredArguments(total *int, payload DeferredPayload, extra ...string) {
+    *total += len(payload.message) + len(extra[0]);
+}
+
+func captureDeferredValues(total *int, p *int, skip bool) int {
+    payload := DeferredPayload{message: "message", parts: []string{"part"}};
+    receiver: DeferredAction = payload;
+    defer receiver.AddTo(total);
+    defer addDeferredArguments(total, payload, payload.message);
+    if (skip) {
+        defer free(p);
+        return panic "skip deferred calls";
+    }
+    return 1;
+}
+
+func recoverSkippedDefers(total *int, p *int) (caught bool) {
+    defer func() { caught = recover() != null; }();
+    captureDeferredValues(total, p, true);
+    return;
+}
+
+func TestSkippedDefersPreserveBorrowedPointers(t *testing.T) {
+    total := 0;
+    p := new(int);
+    *p = 5;
+    if (!recoverSkippedDefers(&total, p) || total != 0 || *p != 5) {
+        t.Error("a skipped defer ran or destroyed borrowed data");
+    }
+    if (captureDeferredValues(&total, p, false) != 1 || total != 25) {
+        t.Error("deferred calls lost their captured values");
+    }
+    free(p);
+}
+
+interface PanickingDeferredAction { func Fail(DeferredPayload); }
+
+func (receiver DeferredPayload) Fail(arg DeferredPayload) {
+    panic receiver.message + arg.message;
+}
+
+func runPanickingDefer(total *int) {
+    receiver: PanickingDeferredAction = DeferredPayload{message: "deferred "};
+    defer func() { *total += 1; }();
+    defer receiver.Fail(DeferredPayload{message: "panic"});
+}
+
+func recoverPanickingDefer(total *int) (message string) {
+    defer func() {
+        value := recover();
+        if (value != null) message = value.(string);
+    }();
+    runPanickingDefer(total);
+    return;
+}
+
+func recoverInsideDefer(total *int, payload DeferredPayload) {
+    defer func() {
+        if (recover() != null) *total += len(payload.message);
+    }();
+    panic "handled inside the defer";
+}
+
+func runInternallyRecoveredDefer(total *int) {
+    defer func() { *total += 10; }();
+    defer recoverInsideDefer(total, DeferredPayload{message: "kept"});
+}
+
+func TestActiveDefersDuringPanic(t *testing.T) {
+    total := 0;
+    if (recoverPanickingDefer(&total) != "deferred panic" || total != 1) {
+        t.Error("an escaping panic did not unwind the running defer");
+    }
+    runInternallyRecoveredDefer(&total);
+    if (total != 15) t.Error("recovery inside a defer disrupted its caller");
+}
+
+func deferArraySpreads(boxed *[]any, ints *[]int, source *[]int) {
+    defer boxed.append((*source)...);
+    defer boxed.prepend((*source)...);
+    defer boxed.add(1, 3, (*source)...);
+    defer ints.append((*source)...);
+    (*source)[0] = 99;
+}
+
+func TestDeferredArraySpreads(t *testing.T) {
+    boxed: []any;
+    boxed.append(1, 2);
+    ints := []int{1};
+    source := []int{4, 5};
+    deferArraySpreads(&boxed, &ints, &source);
+    expected := []int{4, 5, 1, 3, 4, 5, 2, 4, 5};
+    if (len(boxed) != len(expected)) {
+        t.Error("deferred spreads inserted the wrong number of interface values");
+        return;
+    }
+    for (i, value := range expected) {
+        if (boxed[i].(int) != value) t.Error("deferred spread lost a captured value or changed the insertion order");
+    }
+    if (len(ints) != 3 || ints[1] != 4 || ints[2] != 5 || source[0] != 99) {
+        t.Error("deferred spread did not preserve the source snapshot");
+    }
+}
+
+func panicInRange(values *[]string) {
+    for (_, value := range (*values)) {
+        panic value + " in range";
+    }
+}
+
+func failWhileEvaluatingArgument() int { panic "argument"; }
+
+func usePayload(payload DeferredPayload, n int) int {
+    return len(payload.message) + len(payload.parts[0]) + n;
+}
+
+func recoverTemporaryPanic(values *[]string, inRange bool) (message string) {
+    defer func() { message = recover().(string); }();
+    if (inRange) panicInRange(values);
+    // This call completes and transfers its argument. Its original temporary
+    // entry must be inactive when the next call panics before transfer.
+    usePayload(DeferredPayload{message: "moved", parts: []string{"value"}}, 0);
+    usePayload(DeferredPayload{message: "live", parts: []string{"value"}}, failWhileEvaluatingArgument());
+    return;
+}
+
+func TestStatementTemporariesDuringPanic(t *testing.T) {
+    values := []string{"panic"};
+    if (recoverTemporaryPanic(&values, true) != "panic in range") {
+        t.Error("panic in range did not preserve the message through recovery");
+    }
+    if (recoverTemporaryPanic(&values, false) != "argument" || values[0] != "panic") {
+        t.Error("panic in an argument damaged live values");
+    }
+}

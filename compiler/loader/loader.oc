@@ -22,6 +22,8 @@ struct Build {
     noModule map[string]bool;
     byDir map[string]*ast.Package;
     root *ast.Package;
+    verifiedModules map[string]string;
+    sumRoot string;              // module whose ocean.sum verifies external dependencies
     errors int;
     recover bool;
     overlays []*Overlay;
@@ -224,12 +226,13 @@ func (b *Build) FindModule(location string) *ast.Module {
                     arrow := start + 1;
                     if (arrow < n && part[arrow] != "=>") arrow++;
                     if (arrow + 1 >= n || part[arrow] != "=>") error(b, manifest, "replace expects module => directory or module version");
+                    else if (part[arrow + 1] == "") error(b, manifest, "replace target cannot be empty");
                     else {
                         mod.replaces[name] = part[arrow + 1];
                         if (arrow + 2 < n) mod.replaceVersions[name] = part[arrow + 2];
+                        _, had := mod.requires[name];
+                        if (!had) mod.requires[name] = "";
                     }
-                    _, had := mod.requires[name];
-                    if (!had) mod.requires[name] = "";
                 }
             }
             if (mod.path == "") error(b, manifest, "missing module declaration");
@@ -267,39 +270,6 @@ func (b *Build) StandardSource() string {
     return b.stdRoot;
 }
 
-func moduleCache() string {
-    c, ok := util.Getenv("OCEAN_MOD_CACHE");
-    if (ok) return c;
-    home, hok := util.Getenv("HOME");
-    return (hok ? home : "/tmp") + "/.cache/ocean/modules";
-}
-
-func download(b *Build, module string, version string) string {
-    if (!ValidModulePath(module) || (version != "" && (!ValidModulePath(version) || version[0] == '-'))) {
-        error(b, module, "invalid module path or version"); return "";
-    }
-    dest := moduleCache() + "/" + module + "@" + (version == "" ? "latest" : version);
-    if (util.IsDir(dest)) { r, _ := util.Realpath(dest); return r; }
-    if (b.recover) return "";  // editor analysis never downloads
-    base := filepath.Dir(dest);
-    if (!util.MkdirAll(base)) { error(b, base, "cannot create module cache"); return ""; }
-    tmp := base + "/.download-" + strconv.Itoa(util.Pid());
-    util.RemoveAll(tmp);
-    util.Stderr("ocean: downloading " + module + " " + (version == "" ? "latest" : version) + "\n");
-    args := []string{"git", "clone", "--quiet", "--depth", "1"};
-    if (version != "") { args.append("--branch"); args.append(version); }
-    args.append("--"); args.append("https://" + module); args.append(tmp);
-    st := util.Run(args.array());
-    if (st.Code != 0 || st.Failed) { error(b, module, "module download failed"); util.RemoveAll(tmp); return ""; }
-    if (!util.Exists(tmp + "/ocean.mod")) { error(b, module, "downloaded module has no ocean.mod"); util.RemoveAll(tmp); return ""; }
-    if (!util.Rename(tmp, dest)) {
-        if (!util.IsDir(dest)) error(b, dest, "cannot install downloaded module");
-        util.RemoveAll(tmp);
-    }
-    r, _ := util.Realpath(dest);
-    return r;
-}
-
 func resolveImport(b *Build, from *ast.Package, path string) *ast.Package {
     if (b.testDirectory != "" && (path == "__ocean_test_internal" || path == "__ocean_test_external")) {
         prev := b.loadingExternal;
@@ -309,6 +279,13 @@ func resolveImport(b *Build, from *ast.Package, path string) *ast.Package {
         return r;
     }
     if (!ValidModulePath(path)) { error(b, from.dir, "invalid import path: " + path); return zero(*ast.Package); }
+    if (from.harness) {
+        std := b.StandardSource();
+        if (std == "") { error(b, from.dir, "cannot locate compiler executable for standard library lookup"); return zero(*ast.Package); }
+        resolved, ok := util.Realpath(std + "/" + path);
+        if (!ok || !util.IsDir(resolved)) { error(b, from.dir, "package not found: " + path); return zero(*ast.Package); }
+        return loadDirectory(b, resolved);
+    }
     location := "";
     mod := from.module;
     hasMod := !NilModule(mod);
@@ -340,17 +317,30 @@ func resolveImport(b *Build, from *ast.Package, path string) *ast.Package {
         replaced := false;
         if (matched != "") { r, ok := mod.replaces[matched]; if (ok) { replacement = r; replaced = true; } }
         root := "";
-        if (replaced && (replacement[0] == '.' || replacement[0] == '/')) {
+        if (replaced && len(replacement) > 0 && (replacement[0] == '.' || replacement[0] == '/')) {
             p := replacement[0] == '/' ? replacement : mod.root + "/" + replacement;
             r, ok := util.Realpath(p);
             if (ok) root = r;
+        } else if (replaced && replacement == "") {
+            error(b, from.dir, "replace target cannot be empty for " + matched);
+            return zero(*ast.Package);
         } else {
             version := "";
             if (matched != "") {
-                if (replaced) { v, _ := mod.replaceVersions[matched]; version = v; }
-                else { v, _ := mod.requires[matched]; version = v; }
+                if (replaced) { v, ok := mod.replaceVersions[matched]; if (ok) version = v; }
+                else { v, ok := mod.requires[matched]; if (ok) version = v; }
             }
-            root = download(b, replaced ? replacement : name, version);
+            cacheDir, cok := ModuleCacheDir();
+            if (!cok) {
+                error(b, from.dir, "cannot locate module cache; set OCEAN_MOD_CACHE or HOME");
+                return zero(*ast.Package);
+            }
+            resolvedRoot, verr := verifyBuildModule(b, replaced ? replacement : name, version, cacheDir);
+            if (verr != "") {
+                error(b, from.dir, verr);
+                return zero(*ast.Package);
+            }
+            root = resolvedRoot;
         }
         if (root == "") { error(b, from.dir, "cannot resolve module: " + name); return zero(*ast.Package); }
         downloaded := b.FindModule(root);
@@ -363,6 +353,16 @@ func resolveImport(b *Build, from *ast.Package, path string) *ast.Package {
     resolved, ok := util.Realpath(location);
     if (!ok || !util.IsDir(resolved)) { error(b, location, "package directory does not exist"); return zero(*ast.Package); }
     return loadDirectory(b, resolved);
+}
+
+func verifyBuildModule(b *Build, modPath string, version string, cacheDir string) (string, string) {
+    ver := version == "" ? "latest" : version;
+    key := b.sumRoot + "\x00" + cacheDir + "\x00" + modPath + "\x00" + ver;
+    root, ok := b.verifiedModules[key];
+    if (ok) return root, "";
+    resolved, errMsg := VerifyCachedModule(b.sumRoot, modPath, ver, cacheDir);
+    if (errMsg == "") b.verifiedModules[key] = resolved;
+    return resolved, errMsg;
 }
 
 func IsTestFile(name string) bool { return strings.HasSuffix(name, "_test.oc"); }
@@ -396,10 +396,12 @@ func loadDirectory(b *Build, location string) *ast.Package {
     }
     p := new(ast.Package);
     p.externalTest = external;
+    harness := b.harnessDirectory != "" && location == b.harnessDirectory;
+    p.harness = harness;
     p.id = len(b.packages);
     p.dir = location;
     p.loading = true;
-    p.module = b.FindModule(location);
+    if (!harness) p.module = b.FindModule(location);
     b.packages.append(p);
     b.byDir[key] = p;
     std := b.StandardSource();
@@ -413,7 +415,6 @@ func loadDirectory(b *Build, location string) *ast.Package {
             p.isRootModule = location == p.module.root;
         } else p.path = location;
     }
-    harness := b.harnessDirectory != "" && location == b.harnessDirectory;
     names := make([]string);
     if (!harness) {
         entries, ok := util.ListDir(location);
@@ -544,11 +545,17 @@ func canonicalLocation(b *Build, location string) string {
 func (b *Build) LoadPackage(location string) bool {
     path := canonicalLocation(b, location);
     if (path == "") return false;
+    setSumRoot(b, path);
     b.root = loadDirectory(b, path);
     if (b.errors > 0 && !b.recover) return false;
     if (b.root.name == "") return false;
     finish(b);
     return b.errors == 0;
+}
+
+func setSumRoot(b *Build, path string) {
+    mod := b.FindModule(path);
+    b.sumRoot = NilModule(mod) ? "" : mod.root;
 }
 
 func finish(b *Build) {
@@ -573,6 +580,10 @@ struct TestFunc { name string; external bool; }
 func (b *Build) LoadTestPackage(location string, harnessDirectory string) bool {
     path := canonicalLocation(b, location);
     if (path == "") return false;
+    setSumRoot(b, path);
+    // The test driver resolves import paths to directories before loading them.
+    // A cached package under test still uses the invoking project's checksums.
+    if (!useTestProjectSum(b)) return false;
     b.testDirectory = path;
     b.harnessDirectory = harnessDirectory;
     internal := loadDirectory(b, path);
@@ -615,6 +626,25 @@ func (b *Build) LoadTestPackage(location string, harnessDirectory string) bool {
     return b.errors == 0;
 }
 
+func useTestProjectSum(b *Build) bool {
+    if (b.sumRoot == "") return true;
+    cacheDir, configured := ModuleCacheDir();
+    if (!configured) return true;
+    cache, ok := util.Realpath(cacheDir);
+    if (!ok || !pathPrefix(b.sumRoot, cache) || b.sumRoot == cache) return true;
+    project := b.FindModule(util.Getcwd());
+    if (NilModule(project) || project.root == b.sumRoot) return true;
+
+    spec := b.sumRoot[len(cache) + 1:];
+    at := strings.LastIndexByte(spec, '@');
+    if (at < 0) return true;
+    version := strings.ReplaceAll(spec[at + 1:], "%2F", "/");
+    b.sumRoot = project.root;
+    _, errMsg := verifyBuildModule(b, spec[0:at], version, cache);
+    if (errMsg != "") { error(b, project.root, errMsg); return false; }
+    return true;
+}
+
 // PackageTestPath gives the module-qualified display path of a location.
 func (b *Build) PackageTestPath(location string) string {
     path, ok := util.Realpath(location);
@@ -630,6 +660,7 @@ func (b *Build) PackageTestLocation(location string) string {
     path, ok := util.Realpath(location);
     if (ok) return path;
     cwd := util.Getcwd();
+    setSumRoot(b, cwd);
     m := b.FindModule(cwd);
     if (!NilModule(m) && m.path != "" && pathPrefix(location, m.path)) {
         r, rok := util.Realpath(m.root + location[len(m.path):]);
@@ -650,6 +681,7 @@ func (b *Build) AddOverlay(path string, text string) { o := new(Overlay); o.path
 func (b *Build) SetRecover(r bool) { b.recover = r; }
 func (b *Build) Root() *ast.Package { return b.root; }
 func (b *Build) Order() []*ast.Package { return b.order; }
+func (b *Build) Packages() []*ast.Package { return b.packages; }
 func (b *Build) Errors() int { return b.errors; }
 func (b *Build) IsLibrary() bool { return b.isLibrary; }
 func (b *Build) PackageName() string { return b.packageName; }

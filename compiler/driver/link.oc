@@ -20,10 +20,10 @@ func generate(p *Program) (string, bool) {
     opts.library = p.isLibrary;
     opts.usesThreads = p.checker.UsesThreads();
     opts.wasm = targetWasm();
-    ir, ok := backend.Generate(p.checker, p.checker.Packages(), p.build.Root(), opts);
-    p.usesFFI = strings.Contains(ir, "@oc_cvar_call(");
-    p.usesCurl = strings.Contains(ir, "@\"curl_") || strings.Contains(ir, "@curl_");
-    return ir, ok;
+    res := backend.GenerateOutput(p.checker, p.checker.Packages(), p.build.Root(), opts);
+    p.usesFFI = res.UsesFFI;
+    p.usesCurl = res.UsesCurl;
+    return res.IR, res.Ok;
 }
 
 func optLevel() string {
@@ -178,8 +178,8 @@ func compileProgram(p *Program, ir string, output string, staticLink bool) bool 
         }
         cacheStore(key, obj);
     }
-    staged := output + ".ocean-tmp" + (p.isLibrary ? "" : os.ExeSuffix());
-    if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
+    staged, sok := util.CreateStagingPath(output, 493, target.ExeSuffix());
+    if (!sok) { util.Stderr("could not create output: " + util.OutputError(output, false) + "\n"); util.RemoveAll(dir); return false; }
     args := clangArgs([]string{obj, "-o", staged});
     if (!appendLinkFlags(p, &args, staticLink)) { util.RemoveAll(dir); util.Remove(staged); return false; }
     ok2 := clangRun(p, args);
@@ -235,8 +235,10 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
         util.RemoveAll(dir); return false;
     }
     rts := runtimeSources(p, dir);
-    staged := output + ".ocean-tmp" + (p.isLibrary ? "" : util.BuildTarget().ExeSuffix());
-    if (!util.CreateOutput(staged)) { util.Stderr("could not create output: " + util.OutputError(staged, false) + "\n"); util.RemoveAll(dir); return false; }
+    target := util.BuildTarget();
+    staged, sok := util.CreateStagingPath(output, p.isLibrary || target.Wasm() ? 420 : 493,
+        p.isLibrary ? "" : target.ExeSuffix());
+    if (!sok) { util.Stderr("could not create output: " + util.OutputError(output, false) + "\n"); util.RemoveAll(dir); return false; }
     args := clangArgs([]string{optLevel(), "-w", "-Wno-override-module"});
     if (targetWasm()) {
         args = clangArgs([]string{"-O1", "-w", "-Wno-override-module"});
@@ -258,10 +260,11 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
             if (!clangRun(p, cargs)) { util.RemoveAll(dir); util.Remove(staged); return false; }
             objs.append(obj);
         }
-        // llvm-ar expects an absent path or a valid archive.
-        if (util.BuildTarget().system == "windows" && !util.Remove(staged)) {
-            util.Stderr("could not remove staged archive: " + util.OutputError(staged, true) + "\n");
+        // Seed the reserved path with an empty archive for llvm-ar.
+        if (target.system == "windows" && !util.WriteFileAtomic(staged, "!<arch>\n", 420)) {
+            util.Stderr("could not initialize staged archive: " + util.OutputError(staged, false) + "\n");
             util.RemoveAll(dir);
+            util.Remove(staged);
             return false;
         }
         largs := objectLinkArgs(staged);
@@ -277,6 +280,25 @@ func compileUncached(p *Program, ir string, output string, staticLink bool) bool
     util.RemoveAll(dir);
     if (!util.Rename(staged, output)) { util.Stderr("could not save output: " + util.OutputError(output, true) + "\n"); util.Remove(staged); return false; }
     return true;
+}
+
+func emitAsmByte(out *util.Buf, ch i8) {
+    v := (ch -> int) & 255;
+    if (ch == '"' || ch == '\\' || v < 32 || v > 126) { (*out).Addc('\\'); (*out).Addc(util.HexDigit(v >> 4)); (*out).Addc(util.HexDigit(v)); }
+    else (*out).Addc(ch);
+}
+
+func hasPrefixAt(s string, i int, p string) bool {
+    if (i + len(p) > len(s)) return false;
+    for (k := 0; k < len(p); k++) { if (s[i + k] != p[k]) return false; }
+    return true;
+}
+
+func isDarwinLocalLabel(line string, c int) bool {
+    return hasPrefixAt(line, c, "L_") || hasPrefixAt(line, c, "Ltmp") || hasPrefixAt(line, c, "LBB") ||
+        hasPrefixAt(line, c, "LCPI") || hasPrefixAt(line, c, "LJTI") || hasPrefixAt(line, c, "Lfunc_") ||
+        hasPrefixAt(line, c, "Lset") || hasPrefixAt(line, c, "Lloh") ||
+        hasPrefixAt(line, c, "l_");
 }
 
 // selfContainedIR merges the runtime into the program module for --emit-llvm.
@@ -302,17 +324,29 @@ func selfContainedIR(p *Program, ir string) (string, bool) {
             start = k + 1;
             if (line == "" || strings.HasPrefix(strings.TrimSpace(line), ".addrsig") || strings.HasPrefix(strings.TrimSpace(line), ".ident")) continue;
             out.Add("module asm \"");
+            inQ := false; escQ := false;
             for (c := 0; c < len(line); c++) {
                 ch := line[c];
-                // local labels are renamed per unit so they cannot collide
-                if (ch == '.' && c + 1 < len(line) && line[c + 1] == 'L' && (c == 0 || !labelChar(line[c - 1]))) {
-                    out.Add(".Locrt").Add(strconv.Itoa(i)).Add("_");
-                    c++;
+                if (inQ) {
+                    if (escQ) escQ = false;
+                    else if (ch == '\\') escQ = true;
+                    else if (ch == '"') inQ = false;
+                    emitAsmByte(&out, ch);
                     continue;
                 }
-                v := (ch -> int) & 255;
-                if (ch == '"' || ch == '\\' || v < 32 || v > 126) { out.Addc('\\'); out.Addc(util.HexDigit(v >> 4)); out.Addc(util.HexDigit(v)); }
-                else out.Addc(ch);
+                if (ch == '"') { inQ = true; emitAsmByte(&out, ch); continue; }
+                // local labels are renamed per unit so they cannot collide
+                if (c == 0 || !labelChar(line[c - 1])) {
+                    if (ch == '.' && c + 1 < len(line) && line[c + 1] == 'L') {
+                        out.Add(".Locrt").Add(strconv.Itoa(i)).Add("_");
+                        c++;
+                        continue;
+                    }
+                    if (util.MacOS() && isDarwinLocalLabel(line, c)) {
+                        out.Add("Locrt").Add(strconv.Itoa(i)).Add("_");
+                    }
+                }
+                emitAsmByte(&out, ch);
             }
             out.Add("\"\n");
         }

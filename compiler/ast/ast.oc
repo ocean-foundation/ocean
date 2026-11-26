@@ -158,9 +158,13 @@ func (n *Node) Pos() string {
 func itoa(v int) string {
     if (v == 0) return "0";
     neg := v < 0;
-    if (neg) v = -v;
+    if (!neg) v = -v;
     out := make([]i8);
-    for (v > 0) { out.prepend(('0' + v % 10) -> i8); v = v / 10; }
+    for (v < 0) {
+        d := -(v % 10);
+        out.prepend(('0' + d) -> i8);
+        v = v / 10;
+    }
     if (neg) out.prepend('-');
     return out -> string;
 }

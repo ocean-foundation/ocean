@@ -1,0 +1,39 @@
+package runtime;
+import "sync";
+import "testing";
+import "threads";
+
+func didPanic(action func()) (caught bool) {
+    defer func() { if (recover() != null) caught = true; }();
+    action();
+    return;
+}
+
+func TestRepeatedSynchronizationClose(t *testing.T) {
+    m: sync.Mutex;
+    m.Lock();
+    m.Unlock();
+    m.Close();
+    if (!didPanic(func() { m.Destroy(); })) t.Error("second mutex close did not panic");
+
+    g: sync.WaitGroup;
+    g.Close();
+    if (!didPanic(func() { g.Close(); })) t.Error("second wait group close did not panic");
+}
+
+func TestRepeatableAwait(t *testing.T) {
+    pending: sync.WaitGroup;
+    pending.Add(1);
+    target := threads.Spawn(func() { pending.Wait(); });
+    waiters := make([]int);
+    for (i := 0; i < 4; i++) {
+        waiters.append(threads.Spawn(func() { threads.Await(target); }));
+    }
+    pending.Done();
+    for (_, waiter := range waiters) threads.Await(waiter);
+    threads.Await(target);
+    threads.Await(target);
+    if (!threads.IsDone(target)) t.Error("awaited thread lost its completion state");
+    threads.Wake(target);
+    threads.Kill(target);
+}

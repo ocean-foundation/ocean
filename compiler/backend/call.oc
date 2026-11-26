@@ -3,34 +3,27 @@ import "github.com/ocean-foundation/ocean/compiler/ast";
 import "github.com/ocean-foundation/ocean/compiler/check";
 import "github.com/ocean-foundation/ocean/compiler/scanner";
 
-// argList evaluates call arguments for an Ocean function type.
-func argList(g *Gen, n *ast.Node, ft *ast.Type) string {
+// argValues evaluates call arguments (packing variadics) as individual values.
+func argValues(g *Gen, n *ast.Node, ft *ast.Type) []V {
+    out := make([]V);
     params := make([]*ast.Type);
     for (_, p := range ft.params) params.append(sub(g, p));
-    vals := make([]V);
+    fixed := len(params);
+    if (ft.variadic) fixed--;
     if (n.flag2) {
-        // one multi-result call supplies all arguments
         tv := genExpr(g, n.list[0]);
         rts := under(tv.t).results;
+        vals := make([]V);
         for (i, rt := range rts) vals.append(load(g, rt, gep(g, tv.r, tupleOffset(g, rts, i))));
-        out := "";
-        fixed := len(params);
-        if (ft.variadic) fixed--;
-        for (i := 0; i < fixed; i++) out += ", " + argText(g, owner(g, copyV(g, conv(g, vals[i], params[i]))));
+        for (i := 0; i < fixed; i++) out.append(copyV(g, conv(g, vals[i], params[i])));
         if (ft.variadic) {
             extra := make([]V);
             for (i := fixed; i < len(vals); i++) extra.append(vals[i]);
-            out += ", ptr " + owner(g, packVariadic(g, params[len(params) - 1], extra, zero(*ast.Node))).r;
+            out.append(packVariadic(g, params[len(params) - 1], extra, zero(*ast.Node)));
         }
         return out;
     }
-    out := "";
-    fixed := len(params);
-    if (ft.variadic) fixed--;
-    for (i := 0; i < fixed && i < len(n.list); i++) {
-        v := argValue(g, n.list[i], params[i]);
-        out += ", " + argText(g, owner(g, v));
-    }
+    for (i := 0; i < fixed && i < len(n.list); i++) out.append(argValue(g, n.list[i], params[i]));
     if (ft.variadic) {
         vt := params[len(params) - 1];
         extra := make([]V);
@@ -39,13 +32,10 @@ func argList(g *Gen, n *ast.Node, ft *ast.Type) string {
             if (n.flag && i == len(n.list) - 1) { spread = n.list[i]; break; }
             extra.append(genAs(g, n.list[i], under(vt).elem));
         }
-        out += ", ptr " + owner(g, packVariadic(g, vt, extra, spread)).r;
+        out.append(packVariadic(g, vt, extra, spread));
     }
     return out;
 }
-
-// owner marks v as moved into the callee, which owns its parameters.
-func owner(g *Gen, v V) V { consume(g, v); return v; }
 
 // argValue evaluates one argument. Sized buffers are raw storage passed by
 // address (the callee aliases the caller's elements); others are owned copies.
@@ -75,43 +65,47 @@ func packVariadic(g *Gen, vt *ast.Type, items []V, spread *ast.Node) V {
         for (i, it := range items) store(g, elem, gep(g, data, i * es), copyV(g, conv(g, it, elem)));
     }
     if (nilN(spread)) return freshV(g, arr, vt);
+    slot := spill(g, mkV(arr, vt));
+    temp := trackTemp(g, slot, vt);
     sv := genExpr(g, spread);
     su := under(sv.t);
     sd := arrayDataPtr(g, sv);
     sn := collectionLen(g, sv);
     se := su.elem;
     if (check.Identical(se, elem)) {
-        slot := spill(g, mkV(arr, vt));
         emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + itoa(len(items)) + ", ptr " + sd + ", i64 " + sn + ", ptr " + desc(g, elem) + ", i64 0)");
-        r := tmp(g); emit(g, r + " = load ptr, ptr " + slot);
-        return freshV(g, r, vt);
+    } else {
+        packVariadicConverted(g, slot, sd, sn, se, elem);
     }
-    // spread of concrete elements into an interface parameter: box each
-    slot := spill(g, mkV(arr, vt));
+    v := freshNoTemp(load(g, vt, slot).r, vt);
+    v.tmp = temp;
+    return v;
+}
+
+// Spread of concrete elements into an interface parameter: box each.
+func packVariadicConverted(g *Gen, slot string, data string, count string, source *ast.Type, elem *ast.Type) {
     idx := alloca(g, check.TInt());
     emit(g, "store i64 0, ptr " + idx);
     head := newLabel(g, "spread"); body := newLabel(g, "spreadbody"); done := newLabel(g, "spreaddone");
     br(g, head);
     label(g, head);
     i := tmp(g); emit(g, i + " = load i64, ptr " + idx);
-    c := tmp(g); emit(g, c + " = icmp slt i64 " + i + ", " + sn);
+    c := tmp(g); emit(g, c + " = icmp slt i64 " + i + ", " + count);
     condBr(g, c, body, done);
     label(g, body);
-    ep := gepDyn(g, sd, i, sizeOf(g, se));
-    ev := conv(g, load(g, se, ep), elem);
+    ep := gepDyn(g, data, i, sizeOf(g, source));
+    ev := copyV(g, conv(g, load(g, source, ep), elem));
     dst := tmp(g);
-    emit(g, dst + " = call ptr @oc_arr_push(ptr " + slot + ", i64 " + itoa(es) + ")");
+    emit(g, dst + " = call ptr @oc_arr_push(ptr " + slot + ", i64 " + itoa(sizeOf(g, elem)) + ")");
     store(g, elem, dst, ev);
     i2 := tmp(g); emit(g, i2 + " = add i64 " + i + ", 1");
     emit(g, "store i64 " + i2 + ", ptr " + idx);
     br(g, head);
     label(g, done);
-    r := tmp(g); emit(g, r + " = load ptr, ptr " + slot);
-    return freshV(g, r, vt);
 }
 
 // emitCall performs the call and returns its result value.
-func emitCall(g *Gen, n *ast.Node, callee string, ft *ast.Type, lead string, args string, t *ast.Type) V {
+func emitCall(g *Gen, n *ast.Node, callee string, ft *ast.Type, lead string, receiver string, args []V, t *ast.Type) V {
     results := make([]*ast.Type);
     for (_, r := range ft.results) results.append(sub(g, r));
     setSite(g, n);
@@ -125,7 +119,13 @@ func emitCall(g *Gen, n *ast.Node, callee string, ft *ast.Type, lead string, arg
         res.r = slot; res.fresh = true; res.t = st;
         if (len(results) == 1) res.t = results[0];
     }
-    call += args + ")";
+    call += receiver;
+    // Arguments remain owned here until evaluation and dispatch have succeeded.
+    for (_, v := range args) {
+        call += ", " + argText(g, v);
+        consume(g, v);
+    }
+    call += ")";
     rl := retLL(g, results);
     if (rl == "void") { emit(g, "call void " + callee + call); if (!resultAgg(g, results)) { res.r = ""; res.t = check.TVoid(); } }
     else { r := tmp(g); emit(g, r + " = call " + rl + " " + callee + call); res.r = r; res.fresh = true; res.t = results[0]; }
@@ -143,8 +143,8 @@ func genCall(g *Gen, n *ast.Node, t *ast.Type) V {
         targs := n.targs;
         if (len(targs) > 0) ft = check.Subst(ft, check.MakeEnv(s.typeParams, targs));
         name := funcRef(g, s, targs);
-        args := argList(g, n, ft);
-        return emitCall(g, n, name, ft, "null", args, t);
+        args := argValues(g, n, ft);
+        return emitCall(g, n, name, ft, "null", "", args, t);
     case ast.Sem.CallMethod: return genMethodCall(g, n, t);
     case ast.Sem.CallIface: return genIfaceCall(g, n, t);
     case ast.Sem.CallParamMethod: return genParamMethodCall(g, n, t);
@@ -161,8 +161,8 @@ func genCall(g *Gen, n *ast.Node, t *ast.Type) V {
         emit(g, "call void @oc_uninit_func(i64 " + itoa(site(g, n)) + ")");
         term(g, "unreachable");
         label(g, ok);
-        args := argList(g, n, ft);
-        return emitCall(g, n, fn, ft, env, args, t);
+        args := argValues(g, n, ft);
+        return emitCall(g, n, fn, ft, env, "", args, t);
     case ast.Sem.CallExtern: return genExternCall(g, n, t);
     case ast.Sem.CallBuiltin: return genBuiltin(g, n, t);
     case ast.Sem.CallEnum: return genEnumCall(g, n, t);
@@ -173,18 +173,16 @@ func genCall(g *Gen, n *ast.Node, t *ast.Type) V {
 
 func memberOf(n *ast.Node) *ast.Node { if (n.a.kind == ast.NK.Inst) return n.a.a; return n.a; }
 
-func receiverArg(g *Gen, recv *ast.Node, m *ast.Symbol, base *ast.Type) string {
+func receiverArg(g *Gen, recv *ast.Node, m *ast.Symbol) V {
     rt := typeOf(g, recv);
     if (m.recvPtr) {
-        if (rt.kind == ast.TK.Ptr) { v := derefChain(g, genExpr(g, recv)); return "ptr " + v.r; }
-        return "ptr " + addrOf(g, recv);
+        if (rt.kind == ast.TK.Ptr) return derefChain(g, genExpr(g, recv));
+        return mkV(addrOf(g, recv), check.PtrTo(rt));
     }
     v: V;
     if (rt.kind == ast.TK.Ptr) { pv := derefChain(g, genExpr(g, recv)); v = copyV(g, load(g, pv.t.elem, pv.r)); }
     else v = copyV(g, genExpr(g, recv));
-    consume(g, v);
-    if (isAgg(base)) return "ptr " + spill(g, v);
-    return ll(base) + " " + v.r;
+    return v;
 }
 
 func genMethodCall(g *Gen, n *ast.Node, t *ast.Type) V {
@@ -196,9 +194,9 @@ func genMethodCall(g *Gen, n *ast.Node, t *ast.Type) V {
     name := methodRef(g, m, base, n.targs);
     env := check.MakeEnv(m.recvParams, base.args).Extend(m.typeParams, n.targs);
     ft := check.Subst(m.ty, env);
-    recv := receiverArg(g, mem.a, m, base);
-    args := ", " + recv + argList(g, n, ft);
-    return emitCall(g, n, name, ft, "null", args, t);
+    args := []V{receiverArg(g, mem.a, m)};
+    args.append(argValues(g, n, ft)...);
+    return emitCall(g, n, name, ft, "null", "", args, t);
 }
 
 func genParamMethodCall(g *Gen, n *ast.Node, t *ast.Type) V {
@@ -218,9 +216,9 @@ func genParamMethodCall(g *Gen, n *ast.Node, t *ast.Type) V {
     name := methodRef(g, m, base, n.targs);
     env := check.MakeEnv(m.recvParams, base.args).Extend(m.typeParams, n.targs);
     ft := check.Subst(m.ty, env);
-    recv := receiverArg(g, mem.a, m, base);
-    args := ", " + recv + argList(g, n, ft);
-    return emitCall(g, n, name, ft, "null", args, t);
+    args := []V{receiverArg(g, mem.a, m)};
+    args.append(argValues(g, n, ft)...);
+    return emitCall(g, n, name, ft, "null", "", args, t);
 }
 
 func genIfaceCall(g *Gen, n *ast.Node, t *ast.Type) V {
@@ -249,8 +247,8 @@ func genIfaceCall(g *Gen, n *ast.Node, t *ast.Type) V {
     }
     fn := tmp(g);
     emit(g, fn + " = call ptr @oc_method(ptr " + d + ", ptr " + methodName(g, dispatch) + ", i64 " + itoa(site(g, n)) + ")");
-    args := ", ptr " + data + argList(g, n, ft);
-    return emitCall(g, n, fn, ft, "null", args, t);
+    args := argValues(g, n, ft);
+    return emitCall(g, n, fn, ft, "null", ", ptr " + data, args, t);
 }
 
 // ---- externs ----
@@ -362,28 +360,34 @@ func ffiCapture(g *Gen, n *ast.Node) []V {
             sv := genExpr(g, a);
             su := under(sv.t);
             boxed := "";
+            boxedSlot := "";
             if (su.kind == ast.TK.Dyn && check.IsInterface(su.elem)) boxed = sv.r;
             else {
                 b := tmp(g);
                 emit(g, b + " = call ptr @oc_box_elements(ptr " + desc(g, sv.t) + ", ptr " + spill(g, sv) + ")");
                 boxed = b;
+                boxedSlot = alloca(g, check.DynOf(anyT));
+                emit(g, "store ptr " + b + ", ptr " + boxedSlot);
             }
             l := tmp(g); emit(g, l + " = call i64 @oc_arr_len(ptr " + boxed + ")");
             emit(g, "call void @oc_arr_insert_from(ptr " + extras + ", i64 " + itoa(i - nfixed) + ", ptr " + arrayDataPtr(g, mkV(boxed, check.DynOf(anyT))) + ", i64 " + l + ", ptr " + desc(g, anyT) + ", i64 0)");
+            if (boxedSlot != "" && g.trackTemps) emit(g, "call void @oc_drop(ptr " + boxedSlot + ", ptr " + desc(g, check.DynOf(anyT)) + ")");
             continue;
         }
-        bv := box(g, conv(g, genExpr(g, a), anyT));
+        bv := copyV(g, conv(g, genExpr(g, a), anyT));
         slot := tmp(g);
         emit(g, slot + " = call ptr @oc_arr_push(ptr " + extras + ", i64 16)");
-        emit(g, "store {ptr, ptr} " + bv.r + ", ptr " + slot);
+        store(g, anyT, slot, bv);
     }
     ex := tmp(g); emit(g, ex + " = load ptr, ptr " + extras);
-    out.append(mkV(ex, check.DynOf(anyT)));
+    // The caller or defer record owns the freshly built extras array.
+    out.append(freshNoTemp(ex, check.DynOf(anyT)));
     return out;
 }
 
 // ffiCall calls extern s through libffi with captured values (fixed..., extras).
 func ffiCall(g *Gen, s *ast.Symbol, vals []V, t *ast.Type) V {
+    g.usesFFI = true;
     ft := s.ty;
     nfixed := len(ft.params);
     kinds := allocaBytes(g, 8 * (nfixed + 1), 8);
@@ -402,8 +406,12 @@ func ffiCall(g *Gen, s *ast.Symbol, vals []V, t *ast.Type) V {
     u := under(rt);
     if (u.kind == ast.TK.Int) return mkV(intConv(g, r, check.TInt(), u), rt);
     if (u.kind == ast.TK.Float) {
+        if (u.bits == 32) {
+            t32 := tmp(g); emit(g, t32 + " = trunc i64 " + r + " to i32");
+            f32v := tmp(g); emit(g, f32v + " = bitcast i32 " + t32 + " to float");
+            return mkV(f32v, rt);
+        }
         d := tmp(g); emit(g, d + " = bitcast i64 " + r + " to double");
-        if (u.bits == 32) { x := tmp(g); emit(g, x + " = fptrunc double " + d + " to float"); return mkV(x, rt); }
         return mkV(d, rt);
     }
     if (u.kind == ast.TK.Bool) { b := tmp(g); emit(g, b + " = icmp ne i64 " + r + ", 0"); return mkV(b, rt); }
@@ -415,10 +423,18 @@ func ffiCall(g *Gen, s *ast.Symbol, vals []V, t *ast.Type) V {
 func genFFICall(g *Gen, n *ast.Node, t *ast.Type) V {
     vals := ffiCapture(g, n);
     setSite(g, n);
-    return ffiCall(g, n.sym, vals, t);
+    result := ffiCall(g, n.sym, vals, t);
+    nfixed := len(vals) - 1;
+    if (g.trackTemps) {
+        exSlot := alloca(g, vals[nfixed].t);
+        emit(g, "store ptr " + vals[nfixed].r + ", ptr " + exSlot);
+        emit(g, "call void @oc_drop(ptr " + exSlot + ", ptr " + desc(g, vals[nfixed].t) + ")");
+    }
+    return result;
 }
 
 func declareExtern(g *Gen, s *ast.Symbol) {
+    if (len(s.name) >= 5 && s.name[0:5] == "curl_") g.usesCurl = true;
     ft := s.ty;
     dsig := cRet(ft.results) + " @\"" + s.name + "\"(";
     for (i, p := range ft.params) { if (i > 0) dsig += ", "; dsig += cParam(p); }
@@ -533,26 +549,50 @@ func genBuiltin(g *Gen, n *ast.Node, t *ast.Type) V {
         if (homogeneous(rt)) homCheckSlot(g, rt, slot, index, itoa(len(vals)));
         if (hasSpread) { ni := tmp(g); emit(g, ni + " = add i64 " + index + ", " + itoa(len(vals))); index = ni; }
     }
-    if (hasSpread) {
-        su := under(spread.t);
-        sd := ""; sn := "";
-        if (su.kind == ast.TK.String) { sd = arrayDataPtr(g, spread); sn = collectionLen(g, spread); }
-        else { sd = arrayDataPtr(g, spread); sn = collectionLen(g, spread); }
-        se := su.kind == ast.TK.String ? check.TI8() : su.elem;
-        if (check.Identical(se, elem)) {
-            emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + index + ", ptr " + sd + ", i64 " + sn + ", ptr " + desc(g, elem) + ", i64 " + itoa(site(g, n)) + ")");
-        } else {
-            fail(g, n, "spread element conversion is not supported here");
-        }
-    }
+    if (hasSpread) insertArraySpread(g, rt, slot, index, spread, itoa(site(g, n)));
     if (snap != "") writeBack(g, recv, snap, rt);
     return mkV("", t);
+}
+
+func insertArraySpread(g *Gen, rt *ast.Type, slot string, index string, spread V, siteID string) {
+    elem := rt.elem;
+    source := under(spread.t);
+    sourceElem := source.kind == ast.TK.String ? check.TI8() : source.elem;
+    same := check.Identical(sourceElem, elem);
+    if (!same && !spread.fresh) spread = copyV(g, spread);
+    data := arrayDataPtr(g, spread);
+    count := collectionLen(g, spread);
+    if (same) {
+        emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + index + ", ptr " + data + ", i64 " + count + ", ptr " + desc(g, elem) + ", i64 " + siteID + ")");
+    } else {
+        elemSize := sizeOf(g, elem);
+        dest := tmp(g);
+        emit(g, dest + " = call ptr @oc_arr_insert(ptr " + slot + ", i64 " + index + ", i64 " + count + ", i64 " + itoa(elemSize) + ", i64 " + siteID + ")");
+        idx := alloca(g, check.TInt());
+        emit(g, "store i64 0, ptr " + idx);
+        head := newLabel(g, "sp"); body := newLabel(g, "spb"); done := newLabel(g, "spd");
+        br(g, head);
+        label(g, head);
+        iv := tmp(g); emit(g, iv + " = load i64, ptr " + idx);
+        more := tmp(g); emit(g, more + " = icmp slt i64 " + iv + ", " + count);
+        condBr(g, more, body, done);
+        label(g, body);
+        src := gepDyn(g, data, iv, sizeOf(g, sourceElem));
+        value := copyV(g, conv(g, load(g, sourceElem, src), elem));
+        store(g, elem, gepDyn(g, dest, iv, elemSize), value);
+        next := tmp(g); emit(g, next + " = add i64 " + iv + ", 1");
+        emit(g, "store i64 " + next + ", ptr " + idx);
+        br(g, head);
+        label(g, done);
+    }
+    if (homogeneous(rt)) homCheckSlot(g, rt, slot, index, count);
 }
 
 func genEnumCall(g *Gen, n *ast.Node, t *ast.Type) V {
     et := t;
     p := alloca(g, et);
     setTag(g, et, p, n.ival);
+    result := freshV(g, p, et);
     vs := g.c.VariantsOf(under(et));
     v := vs[n.ival];
     fs := g.c.VariantFields(v);
@@ -562,7 +602,7 @@ func genEnumCall(g *Gen, n *ast.Node, t *ast.Type) V {
         val := genAs(g, a, fs[i].ty);
         store(g, fs[i].ty, gep(g, base, l.places[i].offset), val);
     }
-    return freshV(g, p, et);
+    return result;
 }
 
 func genIntrinsic(g *Gen, n *ast.Node, t *ast.Type) V {

@@ -100,13 +100,21 @@ func jsonField(line string, key string) string {
             else if (c == 'u' && i + 4 < len(line)) {
                 v := 0;
                 for (k := 1; k <= 4; k++) v = v * 16 + hexValue(line[i + k]);
-                b.Addc(v -> i8);
+                appendUtf8(&b, v);
                 i += 4;
             } else b.Addc(c);
             i++;
         } else { b.Addc(line[i]); i++; }
     }
     return b.String();
+}
+func appendUtf8(b *util.Buf, c int) {
+    if (c < 0 || c > 1114111 || (c >= 55296 && c <= 57343)) return;
+    if (c < 128) { (*b).Addc(c -> i8); return; }
+    if (c < 2048) { (*b).Addc((192 | (c >> 6)) -> i8); }
+    else if (c < 65536) { (*b).Addc((224 | (c >> 12)) -> i8); (*b).Addc((128 | ((c >> 6) & 63)) -> i8); }
+    else { (*b).Addc((240 | (c >> 18)) -> i8); (*b).Addc((128 | ((c >> 12) & 63)) -> i8); (*b).Addc((128 | ((c >> 6) & 63)) -> i8); }
+    (*b).Addc((128 | (c & 63)) -> i8);
 }
 func hexValue(c i8) int {
     if (c >= '0' && c <= '9') return (c - '0') -> int;
@@ -350,11 +358,21 @@ func testExecute(r *Reporter, executable string, displayExe string) int {
     if (displayExe != "") startDisplay(r, displayExe);
     evR, evW, ok1 := util.Pipe();
     outR, outW, ok2 := util.Pipe();
-    if (!ok1 || !ok2) { util.Stderr("ocean test: pipe\n"); return 1; }
+    if (!ok1 || !ok2) {
+        if (ok1) { util.CloseFd(evR); util.CloseFd(evW); }
+        if (ok2) { util.CloseFd(outR); util.CloseFd(outW); }
+        stopDisplay(r, 0.0, 1);
+        util.Stderr("ocean test: pipe\n"); return 1;
+    }
     grR := -1; grW := -1;
     if (!r.shared) {
         a, b, ok3 := util.Pipe();
-        if (!ok3) { util.Stderr("ocean test: worker slots\n"); return 1; }
+        if (!ok3) {
+            util.CloseFd(evR); util.CloseFd(evW);
+            util.CloseFd(outR); util.CloseFd(outW);
+            stopDisplay(r, 0.0, 1);
+            util.Stderr("ocean test: worker slots\n"); return 1;
+        }
         grR = a; grW = b;
     }
     start := util.MonoSeconds();
@@ -366,7 +384,12 @@ func testExecute(r *Reporter, executable string, displayExe string) int {
     pid := util.SpawnMapped(argv.array(), maps, r.displayFD >= 0, false);
     util.CloseFd(evW); util.CloseFd(outW);
     if (!r.shared) { util.CloseFd(grR); r.grantFD = grW; util.SetNonblock(grW); }
-    if (pid < 0) { util.CloseFd(evR); util.CloseFd(outR); util.Stderr("ocean test: fork\n"); return 1; }
+    if (pid < 0) {
+        util.CloseFd(evR); util.CloseFd(outR);
+        if (r.grantFD >= 0) { util.CloseFd(r.grantFD); r.grantFD = -1; }
+        stopDisplay(r, 0.0, 1);
+        util.Stderr("ocean test: fork\n"); return 1;
+    }
     timedOut := false;
     pending := "";
     fds := []int{evR, outR};
@@ -525,6 +548,32 @@ func isTerminalOk(noTTY bool, json bool) bool {
     return !noTTY && !json && util.IsTerminal(0) && util.IsTerminal(1) && (!has || term != "dumb");
 }
 
+func hasOcSuffix(path string) bool {
+    n := len(path);
+    if (n < 3) return false;
+    return path[n - 3] == '.' && (path[n - 2] == 'o' || path[n - 2] == 'O') && (path[n - 1] == 'c' || path[n - 1] == 'C');
+}
+
+func outputHasSourceSuffix(path string) bool {
+    if (path == "") return false;
+    if (hasOcSuffix(path)) return true;
+    resolved, ok := util.Realpath(path);
+    return ok && hasOcSuffix(resolved);
+}
+
+func outputOverwritesInput(outPath string, prog *Program) bool {
+    if (outPath == "") return false;
+    if (outputHasSourceSuffix(outPath)) return true;
+    if (!ast_nil(prog) && (prog.build -> int) != 0) {
+        for (_, pk := range prog.build.Packages()) {
+            for (_, src := range pk.files) {
+                if (src.abs != "" && sameFile(outPath, src.abs)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 // testOne runs one package's tests (args exclude program name and "test").
 func testOne(args []string, shared bool) int {
     location := "."; reportPath := ""; jsonPath := "";
@@ -576,16 +625,12 @@ func testOne(args []string, shared bool) int {
     prog := Frontend(location, true, dir + "/harness", diags);
     failed := prog.fatal || !prog.ok;
     overwrite := false;
-    if (!failed) {
-        for (_, pk := range prog.checker.Packages()) {
-            for (_, src := range pk.files) {
-                if (src.abs == "") continue;
-                if ((reportPath != "" && sameFile(reportPath, src.abs)) || (jsonPath != "" && sameFile(jsonPath, src.abs))) {
-                    util.Stderr("ocean test: output would overwrite an input file\n"); failed = true; overwrite = true;
-                }
-            }
-        }
+    if (outputOverwritesInput(reportPath, prog) || outputOverwritesInput(jsonPath, prog)) {
+        util.Stderr("ocean test: output would overwrite an input file\n");
+        failed = true;
+        overwrite = true;
     }
+    if (!failed && targetWasm()) { util.Stderr("ocean test requires a native target\n"); failed = true; }
     if (!failed) {
         ir, ok := generate(prog);
         failed = !ok || !compileProgram(prog, ir, exe, false);
@@ -706,8 +751,19 @@ func testMain(args []string) int {
         if (len(list) == 0) util.Stderr("ocean test: no packages matched\n");
         return 1;
     }
-    if ((report != "" && strings.HasSuffix(report, ".oc")) || (jsonFile != "" && strings.HasSuffix(jsonFile, ".oc"))) {
+    if (outputHasSourceSuffix(report) || outputHasSourceSuffix(jsonFile)) {
         util.Stderr("ocean test: output would overwrite an Ocean source file\n"); return 1;
+    }
+    for (_, dirPath := range list) {
+        names, ok := util.ListDir(dirPath);
+        if (!ok) continue;
+        for (_, e := range names) {
+            if (!hasOcSuffix(e)) continue;
+            srcAbs := dirPath + "/" + e;
+            if ((report != "" && sameFile(report, srcAbs)) || (jsonFile != "" && sameFile(jsonFile, srcAbs))) {
+                util.Stderr("ocean test: output would overwrite an Ocean source file\n"); return 1;
+            }
+        }
     }
     return testPackages(flags, list, report, jsonFile, json, notty);
 }

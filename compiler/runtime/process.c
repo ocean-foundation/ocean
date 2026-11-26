@@ -16,9 +16,9 @@
 #else
 #include <fcntl.h>
 #include <spawn.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <dirent.h>
 #ifdef __APPLE__
 #include <crt_externs.h>
 #include <Availability.h>
@@ -54,12 +54,25 @@ typedef struct {
     const char *error;
 } OceanProcess;
 static int fail(OceanProcess *p, const char *text) { p->error = text; return 1; }
-static int append(OceanProcess *p, const char *bytes, size_t count) {
-    if (count > SIZE_MAX - (size_t)p->output_size - 1) return 0;
-    char *out = realloc(p->output, (size_t)p->output_size + count + 1);
-    if (!out) return 0;
-    memcpy(out + p->output_size, bytes, count); p->output_size += (int64_t)count;
-    out[p->output_size] = 0; p->output = out; return 1;
+static int append(OceanProcess *p, size_t *cap, const char *bytes, size_t count) {
+    if (!count) return 1;
+    if (p->output_size < 0 || count > SIZE_MAX - (size_t)p->output_size - 1) return 0;
+    size_t need = (size_t)p->output_size + count + 1;
+    if (need > *cap) {
+        size_t ncap = *cap ? *cap : 256;
+        while (ncap < need) {
+            if (ncap > SIZE_MAX / 2) { ncap = need; break; }
+            ncap *= 2;
+        }
+        char *out = realloc(p->output, ncap);
+        if (!out) return 0;
+        p->output = out;
+        *cap = ncap;
+    }
+    memcpy(p->output + p->output_size, bytes, count);
+    p->output_size += (int64_t)count;
+    p->output[p->output_size] = 0;
+    return 1;
 }
 #ifdef _WIN32
 static wchar_t *wide(const char *s) {
@@ -83,7 +96,13 @@ char *ocean_process_argument(int64_t index) {
 /* Quoting follows CommandLineToArgvW / the Microsoft CRT, including trailing \. */
 static wchar_t *command_line(const char *const *argv) {
     size_t length = 1;
-    for (size_t i = 0; argv[i]; i++) length += strlen(argv[i]) * 2 + 4;
+    for (size_t i = 0; argv[i]; i++) {
+        size_t alen = strlen(argv[i]);
+        if (alen > (SIZE_MAX - length) / 3) return NULL;
+        size_t add = alen * 2 + 4;
+        if (add > SIZE_MAX - length) return NULL;
+        length += add;
+    }
     wchar_t *line = calloc(length, sizeof(*line)), *out = line;
     if (!line) return NULL;
     for (size_t i = 0; argv[i]; i++) {
@@ -102,16 +121,39 @@ static wchar_t *command_line(const char *const *argv) {
     *out = 0; return line;
 }
 char *ocean_process_lookpath(const char *name) {
-    wchar_t *input = wide(name), found[32768]; if (!input) return NULL;
-    DWORD n = SearchPathW(NULL, input, L".exe", 32768, found, NULL); free(input);
-    if (!n || n >= 32768 || (GetFileAttributesW(found) & FILE_ATTRIBUTE_DIRECTORY)) return NULL;
-    /* Reject the implicit current-directory search, matching exec.LookPath. */
-    if (!strchr(name, '/') && !strchr(name, '\\') && !strchr(name, ':')) {
-        wchar_t cwd[32768]; GetCurrentDirectoryW(32768, cwd);
-        wchar_t *slash = wcsrchr(found, L'\\');
-        if (slash) { *slash = 0; int same = !_wcsicmp(found, cwd); *slash = L'\\'; if (same) return NULL; }
+    if (!name || !*name) return NULL;
+    wchar_t *input = wide(name);
+    if (!input) return NULL;
+    wchar_t *found = malloc(32768 * sizeof(wchar_t));
+    wchar_t *cwd = malloc(32768 * sizeof(wchar_t));
+    wchar_t *pathEnv = NULL;
+    if (!found || !cwd) { free(input); free(found); free(cwd); return NULL; }
+    int explicit = strchr(name, '/') || strchr(name, '\\') || strchr(name, ':');
+    const wchar_t *search_dir = NULL;
+    if (!explicit) {
+        pathEnv = malloc(32768 * sizeof(wchar_t));
+        if (!pathEnv) { free(input); free(found); free(cwd); return NULL; }
+        DWORD plen = GetEnvironmentVariableW(L"PATH", pathEnv, 32768);
+        if (!plen || plen >= 32768) { free(input); free(found); free(cwd); free(pathEnv); return NULL; }
+        search_dir = pathEnv;
     }
-    return utf8(found);
+    DWORD n = SearchPathW(search_dir, input, L".exe", 32768, found, NULL);
+    free(input);
+    free(pathEnv);
+    DWORD attr = n && n < 32768 ? GetFileAttributesW(found) : INVALID_FILE_ATTRIBUTES;
+    if (!n || n >= 32768 || attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        free(found); free(cwd); return NULL;
+    }
+    /* Reject the implicit current-directory search, matching exec.LookPath. */
+    if (!explicit) {
+        DWORD clen = GetCurrentDirectoryW(32768, cwd);
+        if (!clen || clen >= 32768) { free(found); free(cwd); return NULL; }
+        wchar_t *slash = wcsrchr(found, L'\\');
+        if (slash) { *slash = 0; int same = !_wcsicmp(found, cwd); *slash = L'\\'; if (same) { free(found); free(cwd); return NULL; } }
+    }
+    char *res = utf8(found);
+    free(found); free(cwd);
+    return res;
 }
 static int compare_env(const void *a, const void *b) { return _wcsicmp(*(const wchar_t *const *)a, *(const wchar_t *const *)b); }
 static HANDLE inherited(HANDLE original) {
@@ -128,29 +170,33 @@ static wchar_t *put_hex(wchar_t *p, unsigned long long v) {
 /* Atomically creates an inheritable, exclusive, delete-on-close temporary file,
  * supporting long paths via the \\?\ prefix without a reopen race. */
 static HANDLE temp_file(const wchar_t *prefix) {
-    wchar_t base[32768], full[32768], path[32768];
+    wchar_t *base = malloc(32768 * sizeof(wchar_t));
+    wchar_t *full = malloc(32768 * sizeof(wchar_t));
+    wchar_t *path = malloc(32768 * sizeof(wchar_t));
+    if (!base || !full || !path) { free(base); free(full); free(path); return INVALID_HANDLE_VALUE; }
     DWORD bn = GetTempPathW(32768, base);
-    if (!bn || bn >= 32768) return INVALID_HANDLE_VALUE;
+    if (!bn || bn >= 32768) { free(base); free(full); free(path); return INVALID_HANDLE_VALUE; }
     DWORD fn = GetFullPathNameW(base, 32768, full, NULL);
-    if (!fn || fn >= 32768) return INVALID_HANDLE_VALUE;
+    if (!fn || fn >= 32768) { free(base); free(full); free(path); return INVALID_HANDLE_VALUE; }
     size_t pos = 0;
     if (wcsncmp(full, L"\\\\?\\", 4) == 0) {
-        if (fn >= 32700) return INVALID_HANDLE_VALUE;
+        if (fn >= 32700) { free(base); free(full); free(path); return INVALID_HANDLE_VALUE; }
         memcpy(path, full, fn * sizeof(wchar_t)); pos = fn;
     } else if (full[0] == L'\\' && full[1] == L'\\') {
-        if (fn + 6 >= 32700) return INVALID_HANDLE_VALUE;
+        if (fn + 6 >= 32700) { free(base); free(full); free(path); return INVALID_HANDLE_VALUE; }
         memcpy(path, L"\\\\?\\UNC\\", 8 * sizeof(wchar_t));
         memcpy(path + 8, full + 2, (fn - 2) * sizeof(wchar_t)); pos = fn + 6;
     } else {
-        if (fn + 4 >= 32700) return INVALID_HANDLE_VALUE;
+        if (fn + 4 >= 32700) { free(base); free(full); free(path); return INVALID_HANDLE_VALUE; }
         memcpy(path, L"\\\\?\\", 4 * sizeof(wchar_t));
         memcpy(path + 4, full, fn * sizeof(wchar_t)); pos = fn + 4;
     }
     if (pos && path[pos - 1] != L'\\') path[pos++] = L'\\';
     size_t plen = wcslen(prefix);
-    if (pos + plen + 64 >= 32768) return INVALID_HANDLE_VALUE;
+    if (pos + plen + 64 >= 32768) { free(base); free(full); free(path); return INVALID_HANDLE_VALUE; }
     SECURITY_ATTRIBUTES security = {sizeof(security), NULL, TRUE};
     unsigned long long pid = (unsigned long long)GetCurrentProcessId();
+    HANDLE res = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < 64; attempt++) {
         LARGE_INTEGER counter = {0}; QueryPerformanceCounter(&counter);
         unsigned long long seq = (unsigned long long)InterlockedIncrement64(&temp_sequence);
@@ -161,11 +207,12 @@ static HANDLE temp_file(const wchar_t *prefix) {
         *at++ = L'-'; at = put_hex(at, seq);
         memcpy(at, L".tmp", 5 * sizeof(wchar_t));
         HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, &security, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
-        if (file != INVALID_HANDLE_VALUE) return file;
+        if (file != INVALID_HANDLE_VALUE) { res = file; break; }
         DWORD err = GetLastError();
-        if (err != ERROR_FILE_EXISTS && err != ERROR_ALREADY_EXISTS) return INVALID_HANDLE_VALUE;
+        if (err != ERROR_FILE_EXISTS && err != ERROR_ALREADY_EXISTS) break;
     }
-    return INVALID_HANDLE_VALUE;
+    free(base); free(full); free(path);
+    return res;
 }
 /* Writes input to an inheritable, delete-on-close temporary file positioned at
  * its start, for use as a child's standard input. */
@@ -212,12 +259,17 @@ static HANDLE spawn(OceanProcess *p, HANDLE input, HANDLE capture) {
     startup.StartupInfo.hStdInput = handles[0]; startup.StartupInfo.hStdOutput = handles[1]; startup.StartupInfo.hStdError = handles[2];
     HANDLE allowed[3]; size_t used = 0;
     for (int i = 0; i < 3; i++) if (handles[i] != INVALID_HANDLE_VALUE) { int duplicate = 0; for (size_t j = 0; j < used; j++) if (allowed[j] == handles[i]) duplicate = 1; if (!duplicate) allowed[used++] = handles[i]; }
-    SIZE_T bytes = 0; InitializeProcThreadAttributeList(NULL, 1, 0, &bytes);
-    startup.lpAttributeList = malloc(bytes);
-    int initialized = startup.lpAttributeList && InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &bytes);
-    int configured = initialized && UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, allowed, used * sizeof(HANDLE), NULL, NULL);
+    int initialized = 0, configured = 1;
+    DWORD create_flags = CREATE_UNICODE_ENVIRONMENT;
+    if (used > 0) {
+        SIZE_T bytes = 0; InitializeProcThreadAttributeList(NULL, 1, 0, &bytes);
+        startup.lpAttributeList = malloc(bytes);
+        initialized = startup.lpAttributeList && InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &bytes);
+        configured = initialized && UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, allowed, used * sizeof(HANDLE), NULL, NULL);
+        create_flags |= EXTENDED_STARTUPINFO_PRESENT;
+    }
     PROCESS_INFORMATION process = {0};
-    int created = configured && CreateProcessW(application, line, NULL, NULL, TRUE, CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT, environment, directory, &startup.StartupInfo, &process);
+    int created = configured && CreateProcessW(application, line, NULL, NULL, used > 0 ? TRUE : FALSE, create_flags, environment, directory, &startup.StartupInfo, &process);
     if (initialized) DeleteProcThreadAttributeList(startup.lpAttributeList); free(startup.lpAttributeList);
     for (int i = 0; i < 3; i++) if (handles[i] != INVALID_HANDLE_VALUE && handles[i] != capture && handles[i] != input) CloseHandle(handles[i]);
     free(application); free(line); free(directory); free(environment);
@@ -227,6 +279,7 @@ static HANDLE spawn(OceanProcess *p, HANDLE input, HANDLE capture) {
 }
 int32_t ocean_process_run_input(OceanProcess *p, const char *input, int64_t input_size, int64_t has_input) {
     p->exit_code = -1; p->output = NULL; p->output_size = 0; p->error = NULL;
+    size_t out_cap = 0;
     HANDLE capture = INVALID_HANDLE_VALUE, stdin_file = INVALID_HANDLE_VALUE;
     if (p->capture) {
         capture = temp_file(L"ocx");
@@ -245,7 +298,7 @@ int32_t ocean_process_run_input(OceanProcess *p, const char *input, int64_t inpu
     if (capture != INVALID_HANDLE_VALUE) {
         LARGE_INTEGER zero = {0}; read_ok = SetFilePointerEx(capture, zero, NULL, FILE_BEGIN) != 0;
         char buffer[8192]; DWORD n;
-        while (read_ok) { if (!ReadFile(capture, buffer, sizeof(buffer), &n, NULL)) { read_ok = 0; break; } if (!n) break; if (!append(p, buffer, n)) read_ok = 0; }
+        while (read_ok) { if (!ReadFile(capture, buffer, sizeof(buffer), &n, NULL)) { read_ok = 0; break; } if (!n) break; if (!append(p, &out_cap, buffer, n)) read_ok = 0; }
         CloseHandle(capture);
     }
     if (!waited) return fail(p, "exec: wait failed");
@@ -267,7 +320,9 @@ int32_t ocean_process_start(OceanProcess *p, const char *input, int64_t input_si
 /* Returns 1 when the process has exited (releasing the handle), 0 while it
  * runs (only without block), or -1 on failure. */
 int32_t ocean_process_wait(int64_t handle, int64_t block, int64_t *exit_code, int64_t *signal_number) {
-    HANDLE child = (HANDLE)(intptr_t)handle; *exit_code = -1; *signal_number = 0;
+    *exit_code = -1; *signal_number = 0;
+    if (!handle || (HANDLE)(intptr_t)handle == INVALID_HANDLE_VALUE) return -1;
+    HANDLE child = (HANDLE)(intptr_t)handle;
     DWORD waiting = WaitForSingleObject(child, block ? INFINITE : 0);
     if (waiting == WAIT_TIMEOUT) return 0;
     DWORD code = 0;
@@ -276,19 +331,37 @@ int32_t ocean_process_wait(int64_t handle, int64_t block, int64_t *exit_code, in
     if (!waited) return -1;
     *exit_code = (int64_t)code; return 1;
 }
-int32_t ocean_process_kill(int64_t handle) { return TerminateProcess((HANDLE)(intptr_t)handle, 1) ? 0 : -1; }
+int32_t ocean_process_kill(int64_t handle) {
+    if (!handle || (HANDLE)(intptr_t)handle == INVALID_HANDLE_VALUE) return -1;
+    return TerminateProcess((HANDLE)(intptr_t)handle, 1) ? 0 : -1;
+}
 int32_t ocean_process_run(OceanProcess *p) { return ocean_process_run_input(p, NULL, 0, 0); }
 #else
 char *ocean_process_argument(int64_t index) { (void)index; return NULL; }
 char *ocean_process_lookpath(const char *name) {
-    const char *path = getenv("PATH"); if (!path) path = "/bin:/usr/bin";
+    if (!name || !*name) return NULL;
+    const char *path = getenv("PATH");
     int explicit = strchr(name, '/') != NULL;
+    if (!explicit && (!path || !*path)) return NULL;
+    if (!path) path = "";
     for (const char *at = path; ; ) {
         const char *end = strchr(at, ':'); size_t n = end ? (size_t)(end - at) : strlen(at);
         char *candidate = explicit ? strdup(name) : malloc(n + strlen(name) + 3);
         if (!candidate) return NULL;
-        if (!explicit) { memcpy(candidate, at, n); candidate[n] = '/'; strcpy(candidate + n + 1, name); if (!n) { free(candidate); candidate = malloc(strlen(name) + 3); if (!candidate) return NULL; sprintf(candidate, "./%s", name); } }
-        if (!access(candidate, X_OK)) { DIR *dir = opendir(candidate); if (dir) closedir(dir); else { if (!explicit && candidate[0] != '/') { free(candidate); return NULL; } return candidate; } }
+        if (!explicit) {
+            if (!n) {
+                free(candidate);
+                if (!end) return NULL;
+                at = end + 1;
+                continue;
+            }
+            memcpy(candidate, at, n); candidate[n] = '/'; strcpy(candidate + n + 1, name);
+        }
+        struct stat st;
+        if (!access(candidate, X_OK) && stat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
+            if (!explicit && candidate[0] != '/') { free(candidate); return NULL; }
+            return candidate;
+        }
         free(candidate); if (explicit || !end) return NULL; at = end + 1;
     }
 }
@@ -346,8 +419,16 @@ static int input_file(const char *input, int64_t size) {
 }
 /* Starts p with optional standard-input and capture fds (>= 3); returns the pid or -1. */
 static pid_t spawn(OceanProcess *p, int input, int capture) {
+    const char *exec_path = p->path;
+    char *resolved = NULL;
+    if (!exec_path || !*exec_path) { fail(p, "exec: executable could not be started"); return -1; }
+    if (!strchr(exec_path, '/')) {
+        resolved = ocean_process_lookpath(exec_path);
+        if (!resolved) { fail(p, "exec: executable not found or resolves relative to current directory"); return -1; }
+        exec_path = resolved;
+    }
     posix_spawn_file_actions_t actions;
-    if (posix_spawn_file_actions_init(&actions)) { fail(p, "exec: cannot initialize spawn actions"); return -1; }
+    if (posix_spawn_file_actions_init(&actions)) { free(resolved); fail(p, "exec: cannot initialize spawn actions"); return -1; }
     int failed = 0;
     if (input >= 0) failed = posix_spawn_file_actions_adddup2(&actions, input, 0);
     if (!failed && capture >= 0) {
@@ -361,13 +442,15 @@ static pid_t spawn(OceanProcess *p, int input, int capture) {
     char **env = p->environment ? (char **)p->environment : environ;
 #endif
     pid_t child = -1;
-    if (!failed) failed = posix_spawnp(&child, p->path, &actions, NULL, (char *const *)p->argv, env);
+    if (!failed) failed = posix_spawn(&child, exec_path, &actions, NULL, (char *const *)p->argv, env);
+    free(resolved);
     posix_spawn_file_actions_destroy(&actions);
     if (failed) { fail(p, "exec: executable could not be started"); return -1; }
     return child;
 }
 int32_t ocean_process_run_input(OceanProcess *p, const char *input, int64_t input_size, int64_t has_input) {
     p->exit_code = -1; p->output = NULL; p->output_size = 0; p->error = NULL;
+    size_t out_cap = 0;
     int file = p->capture ? temp_fd() : -1;
     if (p->capture && file < 0) return fail(p, "exec: executable could not be started");
     int stdin_file = has_input ? input_file(input, input_size) : -1;
@@ -386,7 +469,7 @@ int32_t ocean_process_run_input(OceanProcess *p, const char *input, int64_t inpu
             ssize_t n = read(file, buffer, sizeof(buffer));
             if (n < 0) { if (errno == EINTR) continue; read_ok = 0; break; }
             if (n == 0) break;
-            if (!append(p, buffer, (size_t)n)) read_ok = 0;
+            if (!append(p, &out_cap, buffer, (size_t)n)) read_ok = 0;
         }
         close(file);
     }
@@ -409,6 +492,7 @@ int32_t ocean_process_start(OceanProcess *p, const char *input, int64_t input_si
  * without block), or -1 on failure. A signal exit reports exit code -1. */
 int32_t ocean_process_wait(int64_t handle, int64_t block, int64_t *exit_code, int64_t *signal_number) {
     *exit_code = -1; *signal_number = 0;
+    if (handle <= 0) return -1;
     int status; pid_t result;
     while ((result = waitpid((pid_t)handle, &status, block ? 0 : WNOHANG)) < 0) if (errno != EINTR) return -1;
     if (result == 0) return 0;
@@ -416,6 +500,9 @@ int32_t ocean_process_wait(int64_t handle, int64_t block, int64_t *exit_code, in
     else if (WIFSIGNALED(status)) *signal_number = WTERMSIG(status);
     return 1;
 }
-int32_t ocean_process_kill(int64_t handle) { return kill((pid_t)handle, SIGKILL) ? -1 : 0; }
+int32_t ocean_process_kill(int64_t handle) {
+    if (handle <= 0) return -1;
+    return kill((pid_t)handle, SIGKILL) ? -1 : 0;
+}
 int32_t ocean_process_run(OceanProcess *p) { return ocean_process_run_input(p, NULL, 0, 0); }
 #endif

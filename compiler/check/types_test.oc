@@ -1,0 +1,89 @@
+package check;
+import "github.com/ocean-foundation/ocean/compiler/diag";
+import "github.com/ocean-foundation/ocean/compiler/loader";
+import "github.com/ocean-foundation/ocean/compiler/util";
+import "testing";
+
+enum TreePayload { nodes([]RecursiveTree), empty }
+struct RecursiveTree { payload TreePayload; children []RecursiveTree; value int; }
+
+func TestRecursiveDynamicOwnership(t *testing.T) {
+    leaf := RecursiveTree{payload: TreePayload.empty, value: 3};
+    tree := RecursiveTree{payload: TreePayload.nodes([]RecursiveTree{leaf}), children: []RecursiveTree{leaf}};
+    copy := tree;
+    copy.children[0].value = 9;
+    if (tree.children[0].value != 3) t.Error("recursive value copy shared its children");
+}
+
+struct ExpandingChain<T> { next *ExpandingChain<[]T>; value T; }
+
+func TestExpandingGenericPointer(t *testing.T) {
+    leaf := ExpandingChain<[]int>{value: []int{7}};
+    chain := ExpandingChain<int>{next: &leaf, value: 2};
+    boxed: any = chain;
+    if (chain.next.value[0] != 7 || boxed == null) t.Error("expanding pointer instance");
+}
+
+func TestUseBeforeDeferredFree(t *testing.T) {
+    p := new(int);
+    defer free(p);
+    *p = 7;
+    if (*p != 7) t.Error("pointer was not usable before deferred free");
+}
+
+func freeOnFailure(failed bool) int {
+    p := new(int);
+    if (failed) {
+        free(p);
+        return -1;
+    }
+    *p = 1;
+    value := *p;
+    free(p);
+    return value;
+}
+
+func TestPointerFreeOnReturningBranch(t *testing.T) {
+    if (freeOnFailure(true) != -1 || freeOnFailure(false) != 1) {
+        t.Error("pointer cleanup on a returning branch");
+    }
+}
+
+func checkFixture(t *testing.T, source string) *diag.List {
+    dir, ok := util.MakeTempDir("ocean-check-fixture-");
+    if (!ok) t.Fatal("create fixture directory");
+    defer util.RemoveAll(dir);
+    d := diag.NewList(); d.live = false;
+    b := loader.NewBuild(d);
+    if (!util.WriteFile(dir + "/main.oc", source) || !b.LoadPackage(dir)) t.Fatal("load checker fixture");
+    NewChecker(d).Check(b.Order(), b.StandardSource());
+    return d;
+}
+
+func TestCheckerDoesNotTrackFreedPointers(t *testing.T) {
+    // Check the diagnostics only. This function must never be executed.
+    d := checkFixture(t, "package p; func f() { p := new(int); free(p); free(p); }");
+    if (d.errors != 0) t.Error("the checker tracked a freed raw pointer");
+}
+
+func TestInvalidRecursiveLayouts(t *testing.T) {
+    d := checkFixture(t, "package p; struct Bad(self Bad) {} " +
+        "struct Chain<T> { next []Chain<[]T>; } func f() { value: Chain<int>; }");
+    cycle := false;
+    expansion := false;
+    for (_, diagnostic := range d.items) {
+        if (diagnostic.message == "cyclic type declaration") cycle = true;
+        if (diagnostic.message == "generic type expansion exceeds compiler limits") expansion = true;
+    }
+    if (!cycle || !expansion) t.Error("missing recursive-layout diagnostics");
+}
+
+func TestGenericFunctionValueChecksSubstitutedBitfields(t *testing.T) {
+    d := checkFixture(t, "package p; struct Flags<T> { bits T : 2; } " +
+        "func flags<T>() Flags<T> { return zero(Flags<T>); } " +
+        "func f() { flags<bool>; }");
+    for (_, diagnostic := range d.items) {
+        if (diagnostic.message == "bitfield size exceeds its type width") return;
+    }
+    t.Error("missing bitfield check on the substituted function signature");
+}

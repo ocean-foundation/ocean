@@ -100,4 +100,22 @@ func TestRecovery(t *testing.T) {
     d := quiet();
     toks, ok := Scan("t.oc", "a $ b", d, true);
     if (ok || len(toks) != 3 || toks[1].text != "b") t.Error("recovery ", len(toks));
+    // Strict mode must still emit EOF on error.
+    toksStrict, okStrict := Scan("t.oc", "$ a", quiet(), false);
+    if (okStrict || len(toksStrict) == 0 || toksStrict[len(toksStrict) - 1].kind != Kind.EOF) t.Error("strict eof");
+    // Embedded NUL is rejected as an error rather than silently truncating EOF.
+    srcNul := "a " + ([]i8{0} -> string) + " b";
+    toksNul, okNul := Scan("t.oc", srcNul, quiet(), true);
+    if (okNul || len(toksNul) != 3 || toksNul[1].text != "b") t.Error("nul recovery ", len(toksNul));
+    // Malformed numbers advance past the invalid span and never hang in recovery.
+    toksNum, okNum := Scan("t.oc", "0b222222222 123é nextTok", quiet(), true);
+    if (okNum || len(toksNum) < 2 || toksNum[len(toksNum) - 2].text != "nextTok") t.Error("num recovery");
+    // Binary/octal float overflow must be rejected.
+    bigBin := "0b";
+    for (i := 0; i < 1200; i++) bigBin += "1";
+    bigBin += ".0";
+    _, okBinOv := Scan("t.oc", bigBin, quiet(), false);
+    if (okBinOv) t.Error("binary float overflow accepted");
+    v, n := DecodeUTF8("abc", -1);
+    if (v != 0 || n != 0) t.Error("negative DecodeUTF8 index");
 }

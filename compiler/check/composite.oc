@@ -45,7 +45,7 @@ func standaloneLiteral(c *Checker, n *ast.Node) *ast.Type {
     if (len(n.list) == 0) { err(c, n, "cannot infer an empty literal; specify an array, buffer, or struct type"); return tInvalid; }
     for (_, e := range n.list) { if (!nilN(e.a)) { err(c, n, "literal requires an array, buffer, or struct assignment destination"); return tInvalid; } }
     first := n.list[0].b;
-    if (first.kind == ast.NK.Null) { err(c, n, "null array elements require an explicit pointer element type"); return tInvalid; }
+    if (first.kind == ast.NK.Null) { err(c, n, "null array elements require an explicit nullable element type"); return tInvalid; }
     et := valueExpr(c, first);
     t := ArrayOf(et, len(n.list));
     for (i := 1; i < len(n.list); i++) checkElem(c, n.list[i].b, et);
@@ -54,6 +54,8 @@ func standaloneLiteral(c *Checker, n *ast.Node) *ast.Type {
 
 func literalOf(c *Checker, n *ast.Node, t *ast.Type) *ast.Type {
     n.tyAlt = t;
+    c.CheckLayoutSize(n, t);
+    checkInstanceBitfields(c, n, t);
     u := Underlying(t);
     switch (u.kind) {
     case ast.TK.Array, ast.TK.Dyn, ast.TK.Buffer:
@@ -238,6 +240,8 @@ func castExpr(c *Checker, n *ast.Node) *ast.Type {
     target := resolveTypeOrFamily(c, n.b);
     n.tyAlt = target;
     checkLenNodes(c, target);
+    c.CheckLayoutSize(n, target);
+    checkInstanceBitfields(c, n, target);
     st := expr(c, n.a, zero(*ast.Type));
     if (target.kind == ast.TK.Invalid || st.kind == ast.TK.Invalid) return target;
     if (st.kind == ast.TK.UntypedInt) {
@@ -257,18 +261,15 @@ func castExpr(c *Checker, n *ast.Node) *ast.Type {
         if (u.kind == ast.TK.Float) { setLitType(c, n.a, u); checkF32Literal(c, n.a, u); return target; }
         st = defaultType(c, n.a, st);
     }
-    if (st.kind == ast.TK.Interface && target.kind != ast.TK.Interface && !IsAny(target)) {
-        // `any` values convert with assertions, not casts; ocean-c permits
-        // primitive casts of boxed values, handled as assertions.
-        u := Underlying(target);
-        if (u.kind == ast.TK.Int || u.kind == ast.TK.Float || u.kind == ast.TK.Bool || u.kind == ast.TK.String) { n.sem = ast.Sem.CallIface; return target; }
+    ust := Underlying(st); utgt := Underlying(target);
+    if (ust.kind == ast.TK.Interface && utgt.kind != ast.TK.Interface && !IsAny(utgt)) {
         err(c, n, "invalid conversion");
         return target;
     }
     if (target.kind == ast.TK.Array && target.len == -3) { err(c, n, "Inferred array length requires a literal body"); return tInvalid; }
     if (!c.Convertible(st, target)) {
         ua := Underlying(st); ud := Underlying(target);
-        if (ua.kind == ast.TK.Ptr && ud.kind == ast.TK.Ptr) err(c, n, "cannot cast between pointers to immutable strings and mutable values");
+        if ((isStringPtr(ua) || isStringPtr(ud)) && (ua.kind == ast.TK.Ptr || ua.kind == ast.TK.Buffer || ua.kind == ast.TK.Array) && (ud.kind == ast.TK.Ptr || ud.kind == ast.TK.Buffer || ud.kind == ast.TK.Array)) err(c, n, "cannot cast between pointers to immutable strings and mutable values");
         else err(c, n, "invalid conversion");
     }
     return target;
@@ -288,6 +289,8 @@ func zeroExpr(c *Checker, n *ast.Node) *ast.Type {
     if (t.kind == ast.TK.Buffer && t.len == -1) { err(c, n, "zero requires a fixed-size buffer type; use buffer<T, N> or buffer<T>"); return tInvalid; }
     if (t.kind == ast.TK.Array && (t.len == -2 || t.len == -1)) { err(c, n, "array<T> cannot instantiate an array; use T[n]"); return tInvalid; }
     if (t.kind == ast.TK.Family) { err(c, n, "struct literals require concrete type arguments"); return tInvalid; }
+    c.CheckLayoutSize(n, t);
+    checkInstanceBitfields(c, n, t);
     return t;
 }
 
@@ -300,6 +303,8 @@ func newExpr(c *Checker, n *ast.Node) *ast.Type {
         err(c, n, "new requires a storage type"); return tInvalid;
     }
     checkLenNodes(c, t);
+    c.CheckLayoutSize(n, t);
+    checkInstanceBitfields(c, n, t);
     return PtrTo(t);
 }
 
@@ -317,6 +322,8 @@ func sizeofExpr(c *Checker, n *ast.Node) *ast.Type {
     }
     if (t.kind == ast.TK.Void) err(c, n, "void has no storage size");
     if (t.kind == ast.TK.Array && t.len == -3) t = tInvalid;
+    c.CheckLayoutSize(n, t);
+    checkInstanceBitfields(c, n, t);
     n.tyAlt = t;
     return tInt;
 }

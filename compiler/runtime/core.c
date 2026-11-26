@@ -16,7 +16,7 @@ static int integral(double f) {
     return (double)(int64_t)f == f;
 }
 typedef struct OcType OcType;
-typedef struct { const char *name; const OcType *type; int64_t offset, bitOffset, bits, valueParam; } OcField;
+typedef struct { const char *name; const OcType *type; int64_t offset, bitOffset, bits, valueParam, unitSize; } OcField;
 typedef struct { const char *name; int64_t nfields; const OcField *fields; } OcVariant;
 typedef struct { const char *name; void *fn; } OcMethod;
 struct OcType {
@@ -29,49 +29,110 @@ struct OcType {
     int64_t nmethods; const OcMethod *methods;
     const OcType *under;
 };
-enum { K_INT = 1, K_FLOAT, K_BOOL, K_STRING, K_PTR, K_DYN, K_ARRAY, K_BUFFER, K_MAP, K_STRUCT, K_ENUM, K_IFACE, K_FUNC };
+enum { K_INT = 1, K_FLOAT, K_BOOL, K_STRING, K_PTR, K_DYN, K_ARRAY, K_BUFFER, K_MAP, K_STRUCT, K_ENUM, K_IFACE, K_FUNC, K_BUFLIST };
 enum { F_SIGNED = 1, F_OWNED = 2, F_VARW = 4, F_MIXED = 8, F_NAMED = 16 };
 
 typedef struct OcArr { int64_t len, cap; char *data; } OcArr;
 typedef struct { const OcType *t; void *data; } OcAny;
 typedef struct { const char *file; int64_t line, col; const char *text; } OcSite;
-typedef struct OcDefer { struct OcDefer *next; void (*thunk)(struct OcDefer *); } OcDefer;
+typedef struct OcDefer {
+    struct OcDefer *next;
+    void (*thunk)(struct OcDefer *, int32_t invoke);
+} OcDefer;
 typedef struct OcLocal { void *slot; const struct OcType *t; } OcLocal;
 /* locals: the frame's owned locals (null-slot terminated), released when a
  * panic unwinds past the frame. */
-typedef struct OcFrame { struct OcFrame *prev; const char *name; int64_t site; OcDefer *defers; void *jb; const OcLocal *locals; } OcFrame;
+typedef struct OcFrame { struct OcFrame *prev; const char *name; int64_t site; OcDefer *defers; void *jb; const OcLocal *locals; int64_t in_defer; OcDefer *active_defers; } OcFrame;
+typedef struct OcBufNode { struct OcBufNode *next; void *blk; const OcType *elem; } OcBufNode;
 
 extern const OcSite oc_sites[];
 extern const int64_t oc_nsites;
 __thread OcFrame *oc_top;
+__thread int64_t oc_in_defer;
 
 #define FORWARD_BIT ((int64_t)1 << 40)
-#define NULL_MARK ((void *)1)
 
-static void oc_trace(const char *header, int64_t site, OcFrame *from);
+static void oc_trace(const char *header, size_t length, int64_t site, OcFrame *from);
 void oc_panic(OcArr *msg, int64_t site);
 
 /* ---------------- memory ---------------- */
-static int64_t alloc_total, alloc_count;
-static int alloc_stats = -1;
-static void report_allocs(void) { fprintf(stderr, "oc_alloc: %lld calls, %lld bytes\n", (long long)alloc_count, (long long)alloc_total); }
-void *oc_alloc(int64_t n) {
-    if (n <= 0) n = 1;
-    if ((uint64_t)n > SIZE_MAX) __builtin_trap();
-    if (alloc_stats < 0) { alloc_stats = getenv("OC_ALLOC_STATS") != NULL; if (alloc_stats) atexit(report_allocs); }
-    if (alloc_stats) { alloc_count++; alloc_total += n; }
-    void *p = calloc(1, (size_t)n);
+static size_t checked_add(size_t a, size_t b) {
+    size_t r;
+    if (__builtin_add_overflow(a, b, &r)) __builtin_trap();
+    return r;
+}
+static size_t checked_mul(size_t a, size_t b) {
+    if (b && a > SIZE_MAX / b) __builtin_trap();
+    return a * b;
+}
+static size_t checked_i64_size(int64_t n) {
+    if (n < 0 || (uint64_t)n > SIZE_MAX) __builtin_trap();
+    return (size_t)n;
+}
+static int64_t checked_i64_add(int64_t a, int64_t b) {
+    int64_t r;
+    if (__builtin_add_overflow(a, b, &r)) __builtin_trap();
+    return r;
+}
+static int64_t checked_i64_mul(int64_t a, int64_t b) {
+    if (a == 0 || b == 0) return 0;
+    if (a > 0) {
+        if (b > 0) { if (a > INT64_MAX / b) __builtin_trap(); }
+        else { if (b < INT64_MIN / a) __builtin_trap(); }
+    } else {
+        if (b > 0) { if (a < INT64_MIN / b) __builtin_trap(); }
+        else { if (a == INT64_MIN || b < INT64_MAX / a) __builtin_trap(); }
+    }
+    return (int64_t)((uint64_t)a * (uint64_t)b);
+}
+static void *xmalloc(size_t n) {
+    void *p = malloc(n ? n : 1);
     if (!p) __builtin_trap();
     return p;
 }
+static void *xcalloc(size_t count, size_t sz) {
+    size_t tot = checked_mul(count, sz);
+    void *p = calloc(1, tot ? tot : 1);
+    if (!p) __builtin_trap();
+    return p;
+}
+static int64_t alloc_total, alloc_count;
+static int alloc_stats = -1;
+static void report_allocs(void) {
+    fprintf(stderr, "oc_alloc: %lld calls, %lld bytes\n",
+        (long long)__atomic_load_n(&alloc_count, __ATOMIC_RELAXED),
+        (long long)__atomic_load_n(&alloc_total, __ATOMIC_RELAXED));
+}
+void *oc_alloc(int64_t n) {
+    if (n < 0 || (uint64_t)n > SIZE_MAX) __builtin_trap();
+    size_t sz = n == 0 ? 1 : (size_t)n;
+    if (__atomic_load_n(&alloc_stats, __ATOMIC_RELAXED) < 0) {
+        int enabled = getenv("OC_ALLOC_STATS") != NULL;
+        int expected = -1;
+        if (__atomic_compare_exchange_n(&alloc_stats, &expected, enabled, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED) && enabled) {
+            atexit(report_allocs);
+        }
+    }
+    if (__atomic_load_n(&alloc_stats, __ATOMIC_RELAXED)) {
+        __atomic_fetch_add(&alloc_count, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&alloc_total, n, __ATOMIC_RELAXED);
+    }
+    void *p = calloc(1, sz);
+    if (!p) __builtin_trap();
+    return p;
+}
+static void *oc_alloc_size(size_t n) {
+    if (n > (size_t)INT64_MAX) __builtin_trap();
+    return oc_alloc((int64_t)n);
+}
 void *oc_realloc(void *p, int64_t n) {
-    if (n <= 0) n = 1;
-    if ((uint64_t)n > SIZE_MAX) __builtin_trap();
-    void *q = realloc(p, (size_t)n);
+    if (n < 0 || (uint64_t)n > SIZE_MAX) __builtin_trap();
+    size_t sz = n == 0 ? 1 : (size_t)n;
+    void *q = realloc(p, sz);
     if (!q) __builtin_trap();
     return q;
 }
-void oc_free(void *p) { if (p && p != NULL_MARK) free(p); }
+void oc_free(void *p) { if (p) free(p); }
 void oc_trap(void) { __builtin_trap(); }
 
 /* ---------------- strings ---------------- */
@@ -79,18 +140,24 @@ void oc_trap(void) { __builtin_trap(); }
  * one zero byte (so string data is always NUL-terminated). */
 #define ARR_HDR 32
 static OcArr *arr_make(int64_t len, int64_t cap, int64_t es) {
-    OcArr *a = oc_alloc(ARR_HDR + cap * es + 1);
+    if (len < 0 || cap < 0 || es < 0) __builtin_trap();
+    size_t payload = 0;
+    if (cap && es) payload = checked_mul(checked_i64_size(cap), checked_i64_size(es));
+    size_t total = checked_add(ARR_HDR, checked_add(payload, 1));
+    OcArr *a = oc_alloc_size(total);
     a->len = len; a->cap = cap;
     a->data = (char *)a + ARR_HDR;
     return a;
 }
 OcArr *oc_str_bytes(const char *p, int64_t n) {
-    if (n <= 0) return NULL;
+    if (n < 0) __builtin_trap();
+    if (n == 0) return NULL;
+    if (!p) __builtin_trap();
     OcArr *a = arr_make(n, n, 1);
     memcpy(a->data, p, (size_t)n);
     return a;
 }
-OcArr *oc_str_c(const char *s) { return oc_str_bytes(s, (int64_t)strlen(s)); }
+OcArr *oc_str_c(const char *s) { return s ? oc_str_bytes(s, (int64_t)strlen(s)) : NULL; }
 static int64_t alen(const OcArr *a) { return a ? a->len : 0; }
 /* String constants are static (capacity -1) and never copied or freed. */
 /* Strings stored in variables own their bytes (constants are copied too). */
@@ -100,20 +167,22 @@ OcArr *oc_str_copy(OcArr *a) {
     return oc_str_bytes(a->data, a->len);
 }
 OcArr *oc_str_concat(OcArr *a, OcArr *b) {
-    int64_t n = alen(a) + alen(b);
+    int64_t la = alen(a), lb = alen(b);
+    int64_t n = checked_i64_add(la, lb);
     if (!n) return NULL;
-    if (!alen(b)) return oc_str_copy(a);
-    if (!alen(a)) return oc_str_copy(b);
+    if (!lb) return oc_str_copy(a);
+    if (!la) return oc_str_copy(b);
     OcArr *r = arr_make(n, n, 1);
-    memcpy(r->data, a->data, (size_t)a->len);
-    memcpy(r->data + a->len, b->data, (size_t)b->len);
+    if (la) memcpy(r->data, a->data, (size_t)la);
+    if (lb) memcpy(r->data + la, b->data, (size_t)lb);
     return r;
 }
 OcArr *oc_str_add_byte(OcArr *a, int8_t c, int64_t prepend) {
-    int64_t n = alen(a) + 1;
+    int64_t la = alen(a);
+    int64_t n = checked_i64_add(la, 1);
     OcArr *r = arr_make(n, n, 1);
-    if (prepend) { r->data[0] = c; if (alen(a)) memcpy(r->data + 1, a->data, (size_t)a->len); }
-    else { if (alen(a)) memcpy(r->data, a->data, (size_t)a->len); r->data[n - 1] = c; }
+    if (prepend) { r->data[0] = c; if (la) memcpy(r->data + 1, a->data, (size_t)la); }
+    else { if (la) memcpy(r->data, a->data, (size_t)la); r->data[n - 1] = c; }
     return r;
 }
 int64_t oc_str_cmp(OcArr *a, OcArr *b) {
@@ -131,7 +200,7 @@ int64_t oc_str_eq(OcArr *a, OcArr *b) {
 /* A writable NUL-terminated copy of string data, for C callees. */
 void *oc_str_cdup(OcArr *a) {
     int64_t n = alen(a);
-    char *p = oc_alloc(n + 1);
+    char *p = oc_alloc(checked_i64_add(n, 1));
     if (n) memcpy(p, a->data, (size_t)n);
     return p;
 }
@@ -143,8 +212,7 @@ int64_t oc_arr_cap(OcArr *a) { return a ? (a->cap < 0 ? a->len : a->cap) : 0; }
 /* ---------------- bounds and fatal errors ---------------- */
 static void put_bytes(const char *s, size_t n) { while (n) { ssize_t w = write(2, s, n); if (w <= 0) return; s += w; n -= (size_t)w; } }
 static void put(const char *s) { put_bytes(s, strlen(s)); }
-/* Length of the current panic header (messages may contain NUL bytes). */
-static size_t header_length = (size_t)-1;
+static void die(void);
 static void putn(int64_t v) { char b[32]; snprintf(b, sizeof b, "%lld", (long long)v); put(b); }
 static const OcSite *site_of(int64_t id) {
     id &= ~FORWARD_BIT;
@@ -169,8 +237,8 @@ static void put_snippet(int64_t id) {
 }
 /* Print a diagnostic whose innermost location is 'site', then the call trace
  * from frame 'from' outward. The innermost frame reports 'site'. */
-static void oc_trace(const char *header, int64_t site, OcFrame *from) {
-    if (header_length != (size_t)-1) put_bytes(header, header_length); else put(header);
+static void oc_trace(const char *header, size_t length, int64_t site, OcFrame *from) {
+    if (length != SIZE_MAX) put_bytes(header, length); else put(header);
     put("\n  --> "); put_site(site); put("\n");
     put_snippet(site);
     put("Call trace (most recent call first):\n");
@@ -182,9 +250,8 @@ static void oc_trace(const char *header, int64_t site, OcFrame *from) {
     }
 }
 static void fatal(const char *header, int64_t site) {
-    header_length = (size_t)-1;
-    oc_trace(header, site, oc_top);
-    exit(1);
+    oc_trace(header, SIZE_MAX, site, oc_top);
+    die();
 }
 void oc_bounds(int64_t index, int64_t length, int64_t site) {
     char b[160];
@@ -214,6 +281,7 @@ int64_t oc_any_equal(const OcType *ta, const void *da, const OcType *tb, const v
 typedef struct OcMap OcMap;
 OcMap *oc_map_copy(OcMap *m);
 int64_t oc_map_equal(OcMap *a, OcMap *b);
+void oc_buf_drop(void **head);
 
 static int owned(const OcType *t) { return t && (t->flags & F_OWNED); }
 
@@ -221,7 +289,8 @@ OcArr *oc_arr_copy(OcArr *a, const OcType *elem) {
     if (!a || !a->len) return NULL;
     int64_t es = elem->size;
     OcArr *r = arr_make(a->len, a->len, es);
-    memcpy(r->data, a->data, (size_t)(a->len * es));
+    size_t bytes = checked_mul(checked_i64_size(a->len), checked_i64_size(es));
+    if (bytes && a->data) memcpy(r->data, a->data, bytes);
     if (owned(elem)) for (int64_t i = 0; i < a->len; i++) oc_copy(r->data + i * es, a->data + i * es, elem);
     return r;
 }
@@ -291,7 +360,7 @@ static void fix_headers(char *p, const OcType *t) {
             for (int64_t i = 0; i < t->bits; i++) fix_headers(p + array_elems_offset(t->elem) + i * t->elem->size, t->elem);
         break;
     case K_BUFFER:
-        if (t->bits > 0 && (t->elem->kind == K_ARRAY || t->elem->kind == K_STRUCT))
+        if (t->bits > 0 && (t->elem->kind == K_ARRAY || t->elem->kind == K_STRUCT || t->elem->kind == K_BUFFER || t->elem->kind == K_ENUM))
             for (int64_t i = 0; i < t->bits; i++) fix_headers(p + i * t->elem->size, t->elem);
         break;
     case K_STRUCT:
@@ -324,8 +393,9 @@ void oc_set_tag(void *p, int64_t tag, const OcType *t) {
 void *oc_block_copy(const void *src, const OcType *elem) {
     int64_t off = array_elems_offset(elem);
     int64_t bytes = src ? *(const int64_t *)src : 0;
-    char *r = oc_alloc(off + bytes);
-    if (src) memcpy(r, src, (size_t)(off + bytes));
+    if (bytes < 0) __builtin_trap();
+    char *r = oc_alloc(checked_i64_add(off, bytes));
+    if (src) memcpy(r, src, checked_i64_size(checked_i64_add(off, bytes)));
     else *(int64_t *)r = 0;
     if (owned(elem)) {
         int64_t n = elem->size ? bytes / elem->size : 0;
@@ -333,10 +403,21 @@ void *oc_block_copy(const void *src, const OcType *elem) {
     }
     return r;
 }
-void *oc_block_new(int64_t count, const OcType *elem) {
+void oc_block_copy_elems(void *blk, const OcType *elem) {
+    if (!blk || !elem || !owned(elem)) return;
     int64_t off = array_elems_offset(elem);
-    char *r = oc_alloc(off + count * elem->size);
-    *(int64_t *)r = count * elem->size;
+    int64_t n = block_count(blk, elem);
+    for (int64_t i = 0; i < n; i++) {
+        char *p = (char *)blk + off + i * elem->size;
+        oc_copy(p, p, elem);
+    }
+}
+void *oc_block_new(int64_t count, const OcType *elem) {
+    if (count < 0) __builtin_trap();
+    int64_t off = array_elems_offset(elem);
+    int64_t payload = checked_i64_mul(count, elem->size);
+    char *r = oc_alloc(checked_i64_add(off, payload));
+    *(int64_t *)r = payload;
     return r;
 }
 
@@ -365,17 +446,29 @@ static int num_of(const OcType *t, const void *p, int64_t *ival, uint64_t *uval,
     else { *uval = raw; *isunsigned = 1; }
     return 1;
 }
+static int wide_is_neg(const OcType *t, const void *p) {
+    if (!(t->flags & F_SIGNED) || t->bits <= 0) return 0;
+    int64_t n = (t->bits + 7) / 8;
+    int top = (int)((t->bits - 1) % 8);
+    return (((const unsigned char *)p)[n - 1] >> top) & 1;
+}
+static int wide_byte(const OcType *t, const void *p, int64_t idx, int neg) {
+    int64_t n = (t->bits + 7) / 8;
+    if (idx >= n) return neg ? 0xff : 0;
+    unsigned char c = ((const unsigned char *)p)[idx];
+    int64_t bits_in_byte = t->bits - idx * 8;
+    if (bits_in_byte < 8) {
+        unsigned int mask = (1u << bits_in_byte) - 1u;
+        c = (unsigned char)((c & mask) | (neg ? (~mask & 0xffu) : 0u));
+    }
+    return c;
+}
 static int wide_equal(const OcType *ta, const void *a, const OcType *tb, const void *b) {
-    /* compare as sign-extended byte strings of the wider size */
+    int neg_a = wide_is_neg(ta, a), neg_b = wide_is_neg(tb, b);
+    if (neg_a != neg_b) return 0;
     int64_t na = (ta->bits + 7) / 8, nb = (tb->bits + 7) / 8, n = na > nb ? na : nb;
     for (int64_t i = 0; i < n; i++) {
-        int ca = i < na ? ((const unsigned char *)a)[i] : -1, cb = i < nb ? ((const unsigned char *)b)[i] : -1;
-        if (i >= na) ca = ((ta->flags & F_SIGNED) && (((const signed char *)a)[na - 1] < 0)) ? 255 : 0;
-        if (i >= nb) cb = ((tb->flags & F_SIGNED) && (((const signed char *)b)[nb - 1] < 0)) ? 255 : 0;
-        int bits_a = (int)(ta->bits - i * 8), bits_b = (int)(tb->bits - i * 8);
-        if (i == na - 1 && bits_a < 8) { int m = (1 << bits_a) - 1; int s = (ta->flags & F_SIGNED) && (ca >> (bits_a - 1)) & 1; ca = (ca & m) | (s ? (~m & 255) : 0); }
-        if (i == nb - 1 && bits_b < 8) { int m = (1 << bits_b) - 1; int s = (tb->flags & F_SIGNED) && (cb >> (bits_b - 1)) & 1; cb = (cb & m) | (s ? (~m & 255) : 0); }
-        if (ca != cb) return 0;
+        if (wide_byte(ta, a, i, neg_a) != wide_byte(tb, b, i, neg_b)) return 0;
     }
     return 1;
 }
@@ -384,7 +477,9 @@ static int wide_float_equal(const OcType *t, const void *v, double f) {
     if (f != f || f - f != 0) return 0;          /* NaN or infinity */
     if (!integral(f)) return 0;
     int64_t n = (t->bits + 7) / 8;
-    unsigned char mag[n + 1];
+    unsigned char stack_mag[256];
+    size_t mag_sz = checked_add(checked_i64_size(n), 1);
+    unsigned char *mag = mag_sz <= sizeof(stack_mag) ? stack_mag : xmalloc(mag_sz);
     const unsigned char *bytes = v;
     int neg = 0;
     memcpy(mag, bytes, (size_t)n); mag[n] = 0;
@@ -395,9 +490,9 @@ static int wide_float_equal(const OcType *t, const void *v, double f) {
             for (int top_bits = top + 1; top_bits < 8; top_bits++) mag[n - 1] |= (unsigned char)(1 << top_bits);
             int carry = 1;
             for (int64_t i = 0; i < n; i++) { int x = (unsigned char)~mag[i] + carry; mag[i] = (unsigned char)x; carry = x >> 8; }
-        }
+        } else if (top < 7) mag[n - 1] &= (unsigned char)((1 << (top + 1)) - 1);
     } else if (top < 7) mag[n - 1] &= (unsigned char)((1 << (top + 1)) - 1);
-    if ((f < 0) != neg && f != 0) return 0;
+    if ((f < 0) != neg && f != 0) { if (mag != stack_mag) free(mag); return 0; }
     double af = f < 0 ? -f : f;
     uint64_t bitsf; memcpy(&bitsf, &af, 8);      /* af = m * 2^shift, from the IEEE fields */
     int exp = (int)((bitsf >> 52) & 0x7ff);
@@ -405,17 +500,19 @@ static int wide_float_equal(const OcType *t, const void *v, double f) {
     if (exp == 0) shift = -1074; else { m |= 1ull << 52; shift = exp - 1075; }
     if (af == 0) { m = 0; shift = 0; }
     while (shift < 0 && m && !(m & 1)) { m >>= 1; shift++; }
-    if (shift < 0) return 0;
+    if (shift < 0) { if (mag != stack_mag) free(mag); return 0; }
     /* compare mag with m << shift byte by byte */
     int64_t total = n + 1 > (shift + 64) / 8 + 2 ? n + 1 : (shift + 64) / 8 + 2;
+    int eq = 1;
     for (int64_t i = 0; i < total; i++) {
         int64_t bit = i * 8 - shift;            /* bits of m landing in byte i */
         unsigned int want = 0;
         for (int k = 0; k < 8; k++) { int64_t mb = bit + k; if (mb >= 0 && mb < 64 && ((m >> mb) & 1)) want |= 1u << k; }
         unsigned int have = i <= n ? mag[i] : 0;
-        if (have != want) return 0;
+        if (have != want) { eq = 0; break; }
     }
-    return 1;
+    if (mag != stack_mag) free(mag);
+    return eq;
 }
 static int numeric_equal(const OcType *ta, const void *a, const OcType *tb, const void *b) {
     int64_t ia = 0, ib = 0; uint64_t ua = 0, ub = 0; double fa = 0, fb = 0; int sa = 0, sb = 0;
@@ -424,17 +521,18 @@ static int numeric_equal(const OcType *ta, const void *a, const OcType *tb, cons
         if (ka == 3 && kb == 3) return wide_equal(ta, a, tb, b);
         /* wide vs narrow: compare via 64-bit when the wide value fits */
         const OcType *tw = ka == 3 ? ta : tb; const void *w = ka == 3 ? a : b;
-        int64_t n = (tw->bits + 7) / 8; const unsigned char *bytes = w;
-        int neg = (tw->flags & F_SIGNED) && (bytes[n - 1] & 0x80);
-        if ((ka == 3 ? kb : ka) == 2) { double kf2 = 0; int64_t x1 = 0; uint64_t x2 = 0; int x3 = 0; num_of(ka == 3 ? tb : ta, ka == 3 ? b : a, &x1, &x2, &kf2, &x3); return wide_float_equal(tw, w, kf2); }
-        for (int64_t i = 8; i < n; i++) if (bytes[i] != (neg ? 0xff : 0)) return 0;
+        int64_t n = (tw->bits + 7) / 8;
+        int neg = wide_is_neg(tw, w);
+        int other = ka == 3 ? kb : ka;
+        if (other == 2) { double kf2 = 0; int64_t x1 = 0; uint64_t x2 = 0; int x3 = 0; num_of(ka == 3 ? tb : ta, ka == 3 ? b : a, &x1, &x2, &kf2, &x3); return wide_float_equal(tw, w, kf2); }
+        for (int64_t i = 8; i < n; i++) if (wide_byte(tw, w, i, neg) != (neg ? 0xff : 0)) return 0;
         uint64_t low = load_u(w, 8);
         int64_t ki = 0; uint64_t ku = 0; double kf = 0; int ks = 0;
-        int k = ka == 3 ? kb : ka;
-        if (k == 1) { num_of(ka == 3 ? tb : ta, ka == 3 ? b : a, &ki, &ku, &kf, &ks);
+        if (other == 1) {
+            num_of(ka == 3 ? tb : ta, ka == 3 ? b : a, &ki, &ku, &kf, &ks);
             if (ks) return !neg && low == ku;
-            return (int64_t)low == ki && ((int64_t)low < 0) == neg; }
-        if (k == 2) { num_of(ka == 3 ? tb : ta, ka == 3 ? b : a, &ki, &ku, &kf, &ks); return wide_float_equal(tw, w, kf); }
+            return neg ? ((int64_t)low < 0 && (int64_t)low == ki) : (low <= (uint64_t)INT64_MAX && (int64_t)low == ki);
+        }
         return 0;
     }
     if (ka == 2 || kb == 2) {
@@ -472,12 +570,23 @@ static uint64_t hash_number(const OcType *t, const void *p) {
     }
     if (k == 1) return mix(us ? uv : (uint64_t)iv);
     if (k == 3) {
-        int64_t n = (t->bits + 7) / 8; const unsigned char *b = p;
-        int neg = (t->flags & F_SIGNED) && (b[n - 1] & 0x80);
+        int64_t n = (t->bits + 7) / 8;
+        int neg = wide_is_neg(t, p);
         int fits = 1;
-        for (int64_t i = 8; i < n; i++) if (b[i] != (neg ? 0xff : 0)) fits = 0;
-        if (fits) return mix(load_u(p, 8));
-        return hash_bytes(p, n);
+        for (int64_t i = 8; i < n; i++) if (wide_byte(t, p, i, neg) != (neg ? 0xff : 0)) { fits = 0; break; }
+        uint64_t low = load_u(p, 8);
+        if (fits && (!neg || (int64_t)low < 0)) return mix(low);
+        int64_t used = n;
+        while (used > 1) {
+            int top = wide_byte(t, p, used - 1, neg);
+            int prev = wide_byte(t, p, used - 2, neg);
+            if (neg && top == 0xff && (prev & 0x80)) used--;
+            else if (!neg && top == 0x00) used--;
+            else break;
+        }
+        uint64_t h = 1469598103934665603ULL ^ (uint64_t)(neg ? 1 : 0);
+        for (int64_t i = 0; i < used; i++) { h ^= (unsigned char)wide_byte(t, p, i, neg); h *= 1099511628211ULL; }
+        return mix(h);
     }
     return 0;
 }
@@ -496,7 +605,7 @@ uint64_t oc_hash(const void *p, const OcType *t) {
     case K_BOOL: return mix(*(const unsigned char *)p & 1);
     case K_STRING: case K_DYN: {
         const OcArr *a = *(OcArr *const *)p;
-        if (!a) return 3;
+        if (!a || !a->len) return 3;
         if (t->kind == K_STRING || (t->elem->kind == K_INT && t->elem->size == 1)) return hash_bytes(a->data, a->len);
         uint64_t h = 5;
         for (int64_t i = 0; i < a->len; i++) h = mix(h * 31 + oc_hash(a->data + i * t->elem->size, t->elem));
@@ -520,8 +629,14 @@ uint64_t oc_hash(const void *p, const OcType *t) {
         uint64_t h = 17;
         for (int64_t i = 0; i < t->nfields; i++) {
             const OcField *f = &t->fields[i];
-            if (f->bits) { char tmp[16] = {0}; read_bits(p, f, tmp, f->type); h = mix(h * 31 + oc_hash(tmp, f->type)); }
-            else h = mix(h * 31 + oc_hash((const char *)p + f->offset, f->type));
+            if (f->bits) {
+                char stack_tmp[16] = {0};
+                char *tmp = f->type->size > 16 ? xcalloc(1, checked_i64_size(f->type->size)) : stack_tmp;
+                read_bits(p, f, tmp, f->type);
+                uint64_t fh = oc_hash(tmp, f->type);
+                if (tmp != stack_tmp) free(tmp);
+                h = mix(h * 31 + fh);
+            } else h = mix(h * 31 + oc_hash((const char *)p + f->offset, f->type));
         }
         return h;
     }
@@ -540,10 +655,13 @@ uint64_t oc_hash(const void *p, const OcType *t) {
 }
 
 static void read_bits(const void *base, const OcField *f, void *out, const OcType *t) {
-    uint64_t unit = load_u((const char *)base + f->offset, 8);
-    uint64_t v = (unit >> f->bitOffset) & (f->bits >= 64 ? ~0ULL : (((uint64_t)1 << f->bits) - 1));
-    if ((t->flags & F_SIGNED) && f->bits < 64 && ((v >> (f->bits - 1)) & 1)) v |= ~(((uint64_t)1 << f->bits) - 1);
-    memcpy(out, &v, (size_t)(t->size > 8 ? 8 : t->size));
+    int64_t usz = f->unitSize > 0 ? f->unitSize : 8;
+    if (usz > 8) usz = 8;
+    uint64_t unit = load_u((const char *)base + f->offset, usz);
+    uint64_t mask = f->bits >= 64 ? ~0ULL : (((uint64_t)1 << f->bits) - 1);
+    uint64_t v = (unit >> f->bitOffset) & mask;
+    if ((t->flags & F_SIGNED) && f->bits < 64 && ((v >> (f->bits - 1)) & 1)) v |= ~mask;
+    memcpy(out, &v, (size_t)(t->size > 8 ? 8 : checked_i64_size(t->size)));
     if (t->size > 8) memset((char *)out + 8, (t->flags & F_SIGNED) && ((int64_t)v < 0) ? 0xff : 0, (size_t)(t->size - 8));
 }
 
@@ -559,7 +677,7 @@ int64_t oc_equal(const void *a, const void *b, const OcType *t) {
     case K_BOOL: return (*(const unsigned char *)a & 1) == (*(const unsigned char *)b & 1);
     case K_STRING: return oc_str_eq(*(OcArr *const *)a, *(OcArr *const *)b);
     case K_PTR: return load_u(a, t->size) == load_u(b, t->size);
-    case K_FUNC: return !memcmp(a, b, (size_t)t->size);
+    case K_FUNC: return t->size ? !memcmp(a, b, (size_t)t->size) : 1;
     case K_DYN: {
         const OcArr *x = *(OcArr *const *)a, *y = *(OcArr *const *)b;
         int64_t n = alen(x);
@@ -585,9 +703,14 @@ int64_t oc_equal(const void *a, const void *b, const OcType *t) {
         for (int64_t i = 0; i < t->nfields; i++) {
             const OcField *f = &t->fields[i];
             if (f->bits) {
-                char x[16] = {0}, y[16] = {0};
+                char sx[16] = {0}, sy[16] = {0};
+                char *x = f->type->size > 16 ? xcalloc(1, checked_i64_size(f->type->size)) : sx;
+                char *y = f->type->size > 16 ? xcalloc(1, checked_i64_size(f->type->size)) : sy;
                 read_bits(a, f, x, f->type); read_bits(b, f, y, f->type);
-                if (!oc_equal(x, y, f->type)) return 0;
+                int64_t eq = oc_equal(x, y, f->type);
+                if (x != sx) free(x);
+                if (y != sy) free(y);
+                if (!eq) return 0;
             } else if (!oc_equal((const char *)a + f->offset, (const char *)b + f->offset, f->type)) return 0;
         }
         return 1;
@@ -671,6 +794,7 @@ void oc_destroy(void *slot, const OcType *t) {
         break;
     }
     case K_IFACE: { OcAny *x = slot; if (x->t) destroy_boxed(x->t, x->data); break; }
+    case K_BUFLIST: oc_buf_drop((void **)slot); break;
     }
 }
 static void destroy_boxed(const OcType *t, void *data) {
@@ -685,9 +809,58 @@ void oc_drop(void *slot, const OcType *t) {
     memset(slot, 0, (size_t)t->size);
 }
 void oc_free_ptr(void *p, const OcType *pointee) {
-    if (!p || p == NULL_MARK) return;
+    if (!p) return;
     if (pointee) oc_destroy(p, pointee);
     free(p);
+}
+void oc_buf_push(void **head, void *blk, const OcType *elem) {
+    if (!head || !blk) return;
+    OcBufNode *n = xmalloc(sizeof(OcBufNode));
+    n->blk = blk;
+    n->elem = elem;
+    n->next = (OcBufNode *)*head;
+    *head = n;
+}
+void oc_buf_drop(void **head) {
+    if (!head) return;
+    OcBufNode *n = (OcBufNode *)*head;
+    *head = NULL;
+    while (n) {
+        OcBufNode *next = n->next;
+        if (n->blk) {
+            if (n->elem && owned(n->elem)) {
+                int64_t off = array_elems_offset(n->elem);
+                int64_t cnt = block_count(n->blk, n->elem);
+                for (int64_t i = 0; i < cnt; i++) {
+                    oc_destroy((char *)n->blk + off + i * n->elem->size, n->elem);
+                }
+            }
+            free(n->blk);
+        }
+        free(n);
+        n = next;
+    }
+}
+const OcType oc_type_buflist = { K_BUFLIST, (int64_t)sizeof(void *), (int64_t)sizeof(void *), 0, F_OWNED, NULL, NULL, "<buflist>", 0, NULL, 0, NULL, 0, 0, NULL, NULL };
+
+void oc_data_destroy_elems(void *dst, int64_t count, const OcType *elem) {
+    if (!dst || count <= 0 || !elem || !owned(elem)) return;
+    for (int64_t i = 0; i < count; i++) oc_destroy((char *)dst + i * elem->size, elem);
+}
+void oc_data_copy_elems(void *dst, const void *src, int64_t count, const OcType *elem) {
+    if (count <= 0) return;
+    if (!dst || !src) __builtin_trap();
+    size_t es = checked_i64_size(elem->size);
+    size_t bytes = checked_mul(checked_i64_size(count), es);
+    if (!owned(elem)) {
+        if (bytes) memmove(dst, src, bytes);
+        return;
+    }
+    char *tmp = xmalloc(bytes ? bytes : 1);
+    for (int64_t i = 0; i < count; i++) oc_copy(tmp + (size_t)i * es, (const char *)src + (size_t)i * es, elem);
+    for (int64_t i = 0; i < count; i++) oc_destroy((char *)dst + (size_t)i * es, elem);
+    if (bytes) memcpy(dst, tmp, bytes);
+    free(tmp);
 }
 
 /* ---------------- boxing ---------------- */
@@ -708,49 +881,56 @@ static void reserve(OcArr **slot, int64_t need, int64_t es) {
     OcArr *a = *slot;
     if (!a) { a = arr_make(0, 0, es); *slot = a; }
     if (need <= a->cap) return;
-    int64_t cap = a->cap * 2;
-    if (cap < 8) cap = 8;
+    int64_t cap = a->cap >= 4 ? (a->cap > INT64_MAX / 2 ? INT64_MAX : a->cap * 2) : 8;
     if (cap < need) cap = need;
     /* malloc/free only (no realloc): allocation tracking tools see every block. */
     OcArr *b = arr_make(a->len, cap, es);
-    if (a->len) memcpy(b->data, a->data, (size_t)(a->len * es));
+    if (a->len) memcpy(b->data, a->data, checked_mul(checked_i64_size(a->len), checked_i64_size(es)));
     if (a->cap >= 0) free(a);
     *slot = b;
 }
 /* Open a gap of 'count' elements at 'index'; returns its address. */
 void *oc_arr_insert(OcArr **slot, int64_t index, int64_t count, int64_t es, int64_t site) {
+    if (count < 0 || es < 0) __builtin_trap();
     int64_t len = alen(*slot);
     if (index < 0 || index > len) oc_bounds(index, len, site);
-    reserve(slot, len + count, es);
+    int64_t total = checked_i64_add(len, count);
+    reserve(slot, total, es);
     OcArr *a = *slot;
-    memmove(a->data + (index + count) * es, a->data + index * es, (size_t)((len - index) * es));
-    a->len = len + count;
-    return a->data + index * es;
+    size_t tail_bytes = checked_mul(checked_i64_size(len - index), checked_i64_size(es));
+    if (tail_bytes) memmove(a->data + checked_i64_mul(index + count, es), a->data + checked_i64_mul(index, es), tail_bytes);
+    a->len = total;
+    return a->data + checked_i64_mul(index, es);
 }
 void oc_arr_insert_from(OcArr **slot, int64_t index, const void *src, int64_t count, const OcType *elem, int64_t site) {
-    if (count <= 0) return;
+    if (count < 0) __builtin_trap();
+    if (count == 0) return;
     int64_t es = elem->size;
+    size_t bytes = checked_mul(checked_i64_size(count), checked_i64_size(es));
+    if (bytes && !src) __builtin_trap();
     /* the source may alias the destination array: snapshot it first */
-    char *copy = malloc((size_t)(count * es));
-    memcpy(copy, src, (size_t)(count * es));
+    char *copy = bytes ? xmalloc(bytes) : NULL;
+    if (bytes) memcpy(copy, src, bytes);
     char *dst = oc_arr_insert(slot, index, count, es, site);
-    memcpy(dst, copy, (size_t)(count * es));
+    if (bytes) memcpy(dst, copy, bytes);
     free(copy);
     if (owned(elem)) for (int64_t i = 0; i < count; i++) oc_copy(dst + i * es, dst + i * es, elem);
 }
 void *oc_arr_push(OcArr **slot, int64_t es) {
     int64_t len = alen(*slot);
-    reserve(slot, len + 1, es);
+    reserve(slot, checked_i64_add(len, 1), es);
     (*slot)->len = len + 1;
-    return (*slot)->data + len * es;
+    return (*slot)->data + checked_i64_mul(len, es);
 }
 void oc_arr_remove(OcArr **slot, int64_t index, int64_t es, void *out, int64_t site) {
     OcArr *a = *slot; int64_t len = alen(a);
     if (index < 0 || index >= len) oc_bounds(index, len, site);
-    memcpy(out, a->data + index * es, (size_t)es);
-    memmove(a->data + index * es, a->data + (index + 1) * es, (size_t)((len - index - 1) * es));
+    size_t ses = checked_i64_size(es);
+    if (ses) memcpy(out, a->data + checked_i64_mul(index, es), ses);
+    size_t tail_bytes = checked_mul(checked_i64_size(len - index - 1), ses);
+    if (tail_bytes) memmove(a->data + checked_i64_mul(index, es), a->data + checked_i64_mul(index + 1, es), tail_bytes);
     a->len = len - 1;
-    memset(a->data + a->len * es, 0, (size_t)es);
+    if (ses) memset(a->data + checked_i64_mul(a->len, es), 0, ses);
 }
 void oc_arr_pop(OcArr **slot, int64_t es, void *out, int64_t site) {
     int64_t len = alen(*slot);
@@ -763,9 +943,14 @@ OcArr *oc_arr_new(int64_t len, int64_t es, int64_t site) {
     return arr_make(len, len, es);
 }
 OcArr *oc_arr_from(const void *data, int64_t n, int64_t es) {
-    if (n <= 0) return NULL;
+    if (n < 0) __builtin_trap();
+    if (n == 0) return NULL;
     OcArr *a = arr_make(n, n, es);
-    memcpy(a->data, data, (size_t)(n * es));
+    size_t bytes = checked_mul(checked_i64_size(n), checked_i64_size(es));
+    if (bytes) {
+        if (!data) __builtin_trap();
+        memcpy(a->data, data, bytes);
+    }
     return a;
 }
 /* New dynamic array of elements [lo, hi) from raw storage (deep copied). */
@@ -775,16 +960,23 @@ OcArr *oc_slice(const void *data, int64_t len, int64_t lo, int64_t hi, const OcT
     int64_t n = hi - lo;
     if (n <= 0) return NULL;
     OcArr *a = arr_make(n, n, elem->size);
-    memcpy(a->data, (const char *)data + lo * elem->size, (size_t)(n * elem->size));
+    size_t bytes = checked_mul(checked_i64_size(n), checked_i64_size(elem->size));
+    if (bytes) {
+        if (!data) __builtin_trap();
+        memcpy(a->data, (const char *)data + checked_i64_mul(lo, elem->size), bytes);
+    }
     if (owned(elem)) for (int64_t i = 0; i < n; i++) oc_copy(a->data + i * elem->size, a->data + i * elem->size, elem);
     return a;
 }
 OcArr *oc_concat(const void *da, int64_t na, const void *db, int64_t nb, const OcType *elem) {
-    int64_t n = na + nb, es = elem->size;
-    if (n <= 0) return NULL;
+    if (na < 0 || nb < 0) __builtin_trap();
+    int64_t n = checked_i64_add(na, nb), es = elem->size;
+    if (n == 0) return NULL;
     OcArr *a = arr_make(n, n, es);
-    if (na) memcpy(a->data, da, (size_t)(na * es));
-    if (nb) memcpy(a->data + na * es, db, (size_t)(nb * es));
+    size_t ba = checked_mul(checked_i64_size(na), checked_i64_size(es));
+    size_t bb = checked_mul(checked_i64_size(nb), checked_i64_size(es));
+    if (ba) memcpy(a->data, da, ba);
+    if (bb) memcpy(a->data + ba, db, bb);
     if (owned(elem)) for (int64_t i = 0; i < n; i++) oc_copy(a->data + i * es, a->data + i * es, elem);
     return a;
 }
@@ -811,9 +1003,10 @@ void oc_hom_range(OcArr *a, int64_t start, int64_t count) {
 /* Fixed-array block from a dynamic array (array() method). */
 void *oc_arr_to_block(OcArr *a, const OcType *elem) {
     int64_t n = alen(a), off = array_elems_offset(elem);
-    char *r = oc_alloc(off + n * elem->size);
-    *(int64_t *)r = n * elem->size;
-    if (n) memcpy(r + off, a->data, (size_t)(n * elem->size));
+    int64_t payload = checked_i64_mul(n, elem->size);
+    char *r = oc_alloc(checked_i64_add(off, payload));
+    *(int64_t *)r = payload;
+    if (payload) memcpy(r + off, a->data, (size_t)payload);
     if (owned(elem)) for (int64_t i = 0; i < n; i++) oc_copy(r + off + i * elem->size, r + off + i * elem->size, elem);
     return r;
 }
@@ -838,19 +1031,21 @@ static int64_t map_find(const OcMap *m, const void *key, uint64_t h) {
 static uint64_t key_hash(const OcType *kt, const void *key) { return oc_hash(key, kt) | 2; }
 static void map_grow(OcMap *m) {
     int64_t old = m->cap; uint64_t *oh = m->hashes; char *ok = m->keys, *ov = m->vals;
-    int64_t cap = old ? old * 2 : 8;
-    while ((m->count + 1) * 2 > cap) cap *= 2;
+    int64_t cap = old ? checked_i64_mul(old, 2) : 8;
+    while ((m->count + 1) > cap / 2) cap = checked_i64_mul(cap, 2);
+    int64_t ks = m->kt->size ? m->kt->size : 1;
+    int64_t vs = m->vt->size ? m->vt->size : 1;
     m->cap = cap; m->tombs = 0;
-    m->hashes = oc_alloc(cap * 8);
-    m->keys = oc_alloc(cap * m->kt->size);
-    m->vals = oc_alloc(cap * (m->vt->size ? m->vt->size : 1));
+    m->hashes = oc_alloc(checked_i64_mul(cap, 8));
+    m->keys = oc_alloc(checked_i64_mul(cap, ks));
+    m->vals = oc_alloc(checked_i64_mul(cap, vs));
     for (int64_t i = 0; i < old; i++) {
         if (oh[i] < 2) continue;
         int64_t j = (int64_t)(oh[i] & (uint64_t)(cap - 1));
         while (m->hashes[j]) j = (j + 1) & (cap - 1);
         m->hashes[j] = oh[i];
-        memcpy(m->keys + j * m->kt->size, ok + i * m->kt->size, (size_t)m->kt->size);
-        memcpy(m->vals + j * m->vt->size, ov + i * m->vt->size, (size_t)m->vt->size);
+        if (m->kt->size) memcpy(m->keys + j * m->kt->size, ok + i * m->kt->size, (size_t)m->kt->size);
+        if (m->vt->size) memcpy(m->vals + j * m->vt->size, ov + i * m->vt->size, (size_t)m->vt->size);
     }
     free(oh); free(ok); free(ov);
 }
@@ -870,10 +1065,13 @@ void oc_map_set(OcMap **slot, const void *key, const void *val, const OcType *kt
         /* Replacement reuses the bucket; the copy is made before releasing the old value. */
         char *old = m->vals + i * vt->size;
         if (owned(vt)) {
-            char tmp[vt->size ? vt->size : 1];
+            char stack_tmp[256];
+            size_t vsz = vt->size ? checked_i64_size(vt->size) : 1;
+            char *tmp = vsz <= sizeof(stack_tmp) ? stack_tmp : xmalloc(vsz);
             oc_copy(tmp, val, vt);
             oc_destroy(old, vt);
-            memcpy(old, tmp, (size_t)vt->size);
+            if (vt->size) memcpy(old, tmp, (size_t)vt->size);
+            if (tmp != stack_tmp) free(tmp);
         } else oc_copy(old, val, vt);
         return;
     }
@@ -890,8 +1088,12 @@ void oc_map_set(OcMap **slot, const void *key, const void *val, const OcType *kt
 void *oc_map_slot(OcMap **slot, const void *key, const OcType *kt, const OcType *vt) {
     void *p = oc_map_get(*slot, key, kt);
     if (p) return p;
-    char zero[vt->size ? vt->size : 1]; memset(zero, 0, sizeof zero);
+    char stack_zero[256];
+    size_t vsz = vt->size ? checked_i64_size(vt->size) : 1;
+    char *zero = vsz <= sizeof(stack_zero) ? stack_zero : xmalloc(vsz);
+    oc_zero(zero, vt);
     oc_map_set(slot, key, zero, kt, vt);
+    if (zero != stack_zero) free(zero);
     return oc_map_get(*slot, key, kt);
 }
 void oc_map_delete(OcMap **slot, const void *key, const OcType *kt) {
@@ -941,8 +1143,10 @@ void oc_map_snapshot(OcMap *m, const OcType *kt, const OcType *vt, OcArr **keys,
 /* ---------------- reflection ---------------- */
 typedef struct { OcArr *name; OcAny value; } OcReflectField;
 static void *field_block(int64_t n) {
-    char *r = oc_alloc(8 + n * (int64_t)sizeof(OcReflectField));
-    *(int64_t *)r = n * (int64_t)sizeof(OcReflectField);
+    if (n < 0) __builtin_trap();
+    int64_t payload = checked_i64_mul(n, (int64_t)sizeof(OcReflectField));
+    char *r = oc_alloc(checked_i64_add(8, payload));
+    *(int64_t *)r = payload;
     return r;
 }
 void *oc_reflect_fields(const OcType *t, const void *data) {
@@ -953,7 +1157,13 @@ void *oc_reflect_fields(const OcType *t, const void *data) {
             const OcField *f = &t->fields[i];
             out[i].name = oc_str_c(f->name);
             out[i].value.t = f->type;
-            if (f->bits) { char tmp[16] = {0}; read_bits(data, f, tmp, f->type); out[i].value.data = oc_box(f->type, tmp); }
+            if (f->bits) {
+                char stack_tmp[16] = {0};
+                char *tmp = f->type->size > 16 ? xcalloc(1, checked_i64_size(f->type->size)) : stack_tmp;
+                read_bits(data, f, tmp, f->type);
+                out[i].value.data = oc_box(f->type, tmp);
+                if (tmp != stack_tmp) free(tmp);
+            }
             else if (f->type->kind == K_IFACE) oc_copy(&out[i].value, (const char *)data + f->offset, f->type);
             else out[i].value.data = oc_box(f->type, (const char *)data + f->offset);
         }
@@ -982,7 +1192,7 @@ OcArr *oc_reflect_enum_variant(const OcType *t, const void *data) {
     int64_t tag = *(const int64_t *)data;
     if (tag < 0 || tag >= t->nvariants) return NULL;
     size_t a = strlen(t->name), b = strlen(t->variants[tag].name);
-    char *s = malloc(a + b + 2);
+    char *s = xmalloc(checked_add(checked_add(a, b), 2));
     memcpy(s, t->name, a); s[a] = '.'; memcpy(s + a + 1, t->variants[tag].name, b); s[a + b + 1] = 0;
     OcArr *r = oc_str_c(s); free(s);
     return r;
@@ -1005,8 +1215,8 @@ OcArr *oc_reflect_var_integer(const OcType *t, const void *data) {
 /* Elements of a boxed array as a dynamic array of boxes (mixed []any). */
 OcArr *oc_box_elements(const OcType *t, const void *data) {
     const char *elems; int64_t n; const OcType *e = t->elem;
-    if (t->kind == K_DYN) { const OcArr *a = *(OcArr *const *)data; n = alen(a); elems = a ? a->data : NULL; }
-    else if (t->kind == K_ARRAY) { n = block_count(data, e); elems = (const char *)data + array_elems_offset(e); }
+    if (t->kind == K_DYN) { if (!data) return NULL; const OcArr *a = *(OcArr *const *)data; n = alen(a); elems = a ? a->data : NULL; }
+    else if (t->kind == K_ARRAY) { if (!data) return NULL; n = block_count(data, e); elems = (const char *)data + array_elems_offset(e); }
     else return NULL;
     if (!n) return NULL;
     OcArr *r = arr_make(n, n, sizeof(OcAny));
@@ -1050,9 +1260,10 @@ void oc_iface_elems_check(OcArr *a, OcMatcher m, int64_t hom) {
 void *oc_box_elements_block(const OcType *t, const void *data) {
     OcArr *a = oc_box_elements(t, data);
     int64_t n = alen(a);
-    char *r = oc_alloc(8 + n * (int64_t)sizeof(OcAny));
-    *(int64_t *)r = n * (int64_t)sizeof(OcAny);
-    if (n) memcpy(r + 8, a->data, (size_t)n * sizeof(OcAny));
+    int64_t payload = checked_i64_mul(n, (int64_t)sizeof(OcAny));
+    char *r = oc_alloc(checked_i64_add(8, payload));
+    *(int64_t *)r = payload;
+    if (n) memcpy(r + 8, a->data, (size_t)payload);
     if (a) free(a); /* elements were moved into the block */
     return r;
 }
@@ -1080,20 +1291,62 @@ void *oc_method(const OcType *t, const char *name, int64_t site) {
 typedef struct OcPanic {
     struct OcPanic *outer;
     OcArr *msg;
+    char *header;
+    size_t header_length;
     OcFrame *deferFrame;
     int recovered, active, returnPanic;
 } OcPanic;
 static __thread OcPanic *panicking;
-static __thread int in_defer;
+
+static int is_strict_ancestor(const OcFrame *anc, const OcFrame *f) {
+    if (!anc || !f) return 0;
+    for (const OcFrame *c = f->prev; c; c = c->prev) if (c == anc) return 1;
+    return 0;
+}
+
+static void release_defer(OcDefer *d) {
+    d->thunk(d, 0);
+    free(d);
+}
 
 void oc_run_defers(OcFrame *f) {
     while (f->defers) {
         OcDefer *d = f->defers;
         f->defers = d->next;
-        in_defer++;
-        d->thunk(d);
-        in_defer--;
-        free(d);
+        d->next = f->active_defers;
+        f->active_defers = d;
+        oc_in_defer++;
+        d->thunk(d, 1);
+        oc_in_defer--;
+        f->active_defers = d->next;
+        release_defer(d);
+    }
+}
+
+static void drop_locals(OcFrame *f) {
+    if (!f->locals) return;
+    const OcLocal *l = f->locals;
+    while (l->t) l++;
+    while (l != f->locals) {
+        l--;
+        if (l->slot) oc_drop(l->slot, l->t);
+    }
+}
+static void discard_defers(OcFrame *f) {
+    while (f->defers) {
+        OcDefer *d = f->defers;
+        f->defers = d->next;
+        release_defer(d);
+    }
+}
+/* Called only when unwinding has reached the frame that invoked the defer.
+ * A panic recovered inside the deferred call leaves its active record intact. */
+static void abandon_active_defers(OcFrame *f) {
+    while (f->active_defers) {
+        OcDefer *d = f->active_defers;
+        f->active_defers = d->next;
+        oc_in_defer--;
+        release_defer(d);
     }
 }
 
@@ -1103,13 +1356,13 @@ static void die(void) {
     exit(1);
 }
 
-static char *msg_text(OcArr *msg) {
+static char *msg_text(OcArr *msg, size_t *length) {
     int64_t n = alen(msg);
-    char *s = malloc((size_t)n + 8);
+    char *s = xmalloc(checked_add(checked_i64_size(n), 8));
     memcpy(s, "Panic: ", 7);
     if (n) memcpy(s + 7, msg->data, (size_t)n);
     s[7 + n] = 0;
-    header_length = (size_t)n + 7;
+    *length = (size_t)n + 7;
     return s;
 }
 
@@ -1122,35 +1375,48 @@ static int recovery_possible(OcFrame *f) {
     return 0;
 }
 static void unwind(OcArr *msg, int64_t site, OcFrame *start, OcFrame *traceFrom) {
-    char *header = msg_text(msg);
     OcPanic p = {0};
-    p.outer = panicking; p.msg = msg; p.active = 1;
+    p.header = msg_text(msg, &p.header_length);
+    p.outer = panicking; p.msg = msg; p.deferFrame = start; p.active = 1;
     panicking = &p;
     for (OcFrame *f = start; f; f = f->prev) {
         oc_top = f;
+        abandon_active_defers(f);
         if (f->defers) {
             p.deferFrame = f;
             oc_run_defers(f);
             if (p.recovered && f->jb) {
-                panicking = p.outer;
+                extern const OcType oc_type_string;
+                while (panicking && !is_strict_ancestor(panicking->deferFrame, f)) {
+                    OcPanic *old = panicking;
+                    panicking = old->outer;
+                    if (old->msg) oc_drop(&old->msg, &oc_type_string);
+                    free(old->header);
+                    old->header = NULL;
+                }
+                discard_defers(f);
+                drop_locals(f);
+                oc_in_defer = f->in_defer;
                 oc_top = f;
-                free(header);
-                /* the panic owned its message; recover() handed out a copy */
-                { extern const OcType oc_type_string; oc_drop(&msg, &oc_type_string); }
                 _longjmp(*(jmp_buf *)f->jb, 1);
             }
         }
         /* the panic continues past this frame: release what it owns */
-        if (f->locals && (p.recovered || recovery_possible(f->prev)))
-            for (const OcLocal *l = f->locals; l->slot; l++) oc_drop(l->slot, l->t);
+        if (f->locals && (p.recovered || recovery_possible(f->prev))) drop_locals(f);
     }
-    oc_trace(header, site, traceFrom);
+    oc_trace(p.header, p.header_length, site, traceFrom);
     die();
 }
 void oc_panic(OcArr *msg, int64_t site) {
     OcFrame *f = oc_top;
     unwind(msg, site, f, f);
 }
+_Noreturn void oc_panic_sync_closed(void) {
+    oc_panic(oc_str_c("synchronization object is closed"), oc_top ? oc_top->site : 0);
+    abort();
+}
+void oc_panic_div_zero(int64_t site) { oc_panic(oc_str_c("integer division by zero"), site); }
+void oc_panic_neg_shift(int64_t site) { oc_panic(oc_str_c("negative shift count"), site); }
 /* return panic: attribute to the caller's call site; skip this function's
  * defers and those of forwarding callers. */
 void oc_return_panic(OcArr *msg, int64_t site) {
@@ -1158,6 +1424,12 @@ void oc_return_panic(OcArr *msg, int64_t site) {
     OcFrame *target = f && f->prev ? f->prev : f;
     if (!f || !f->prev || !f->prev->name) { unwind(msg, site, f, f); return; }
     while (target->prev && target->prev->name && (target->site & FORWARD_BIT)) target = target->prev;
+    int can_rec = recovery_possible(target);
+    for (OcFrame *s = f; s && s != target; s = s->prev) {
+        abandon_active_defers(s);
+        discard_defers(s);
+        if (can_rec) drop_locals(s);
+    }
     unwind(msg, target->site & ~FORWARD_BIT, target, f);
 }
 void oc_recover(OcAny *out) {
@@ -1172,22 +1444,26 @@ void oc_recover(OcAny *out) {
     *box = oc_str_copy(p->msg); /* the panic keeps (and later frees) its own */
     out->data = box;
 }
-int64_t oc_can_cancel(void) { return !in_defer; }
+int64_t oc_can_cancel(void) { return !oc_in_defer; }
 void oc_uninit_func(int64_t site) { oc_panic(oc_str_c("call of an uninitialized function"), site); }
 void oc_map_missing(int64_t site) { oc_panic(oc_str_c("map key does not exist"), site); }
-void oc_null_deref(void) { __builtin_trap(); }
 
 /* Thread return/cancel: run every defer on this thread, then exit it. */
 extern _Noreturn void ocean_threads_exit(void);
 extern void ocean_threads_begin_return(void);
 void ocean_runtime_thread_return(void) {
     if (ocean_threads_begin_return) ocean_threads_begin_return();
-    for (OcFrame *f = oc_top; f; f = f->prev) { oc_top = f; oc_run_defers(f); }
+    for (OcFrame *f = oc_top; f; f = f->prev) {
+        oc_top = f;
+        abandon_active_defers(f);
+        oc_run_defers(f);
+        drop_locals(f);
+    }
     oc_top = NULL;
     if (ocean_threads_exit) ocean_threads_exit();
     exit(0);
 }
-int ocean_runtime_can_cancel(void) { return !in_defer; }
+int ocean_runtime_can_cancel(void) { return !oc_in_defer; }
 void ocean_runtime_closure_init(void) {}
 void ocean_runtime_thread_invoke(void *code, void *environment) {
     oc_top = NULL;
@@ -1200,18 +1476,21 @@ extern void oc_init_globals(void);
 extern int64_t oc_user_main(void);
 extern void oc_set_args(char *stream, int64_t argc);
 int oc_argc; char **oc_argv;
-/* glibc passes argc/argv to ELF constructors; the module defines main(). */
-#if !defined(__wasm__)
-__attribute__((constructor)) static void oc_capture_args(int argc, char **argv) { oc_argc = argc; oc_argv = argv; }
-#endif
 int oc_start(void) {
     int argc = oc_argc; char **argv = oc_argv;
-    if (!argv) { static char *none[] = {"", NULL}; argv = none; argc = 1; }
+    if (!argv || argc <= 0) { static char *none[] = {"", NULL}; argv = none; argc = 1; }
     size_t total = 0;
-    for (int i = 0; i < argc; i++) total += strlen(argv[i]) + 1;
-    char stream[total + 1], *p = stream; /* lives for the whole program */
-    for (int i = 0; i < argc; i++) { size_t n = strlen(argv[i]) + 1; memcpy(p, argv[i], n); p += n; }
+    for (int i = 0; i < argc; i++) total = checked_add(total, checked_add(strlen(argv[i] ? argv[i] : ""), 1));
+    char *stream = xmalloc(checked_add(total, 1)), *p = stream;
+    for (int i = 0; i < argc; i++) {
+        const char *s = argv[i] ? argv[i] : "";
+        size_t n = strlen(s) + 1;
+        memcpy(p, s, n);
+        p += n;
+    }
+    *p = 0;
     oc_set_args(stream, argc);
+    free(stream);
     oc_init_globals();
     int64_t status = oc_user_main();
     return (int)status;

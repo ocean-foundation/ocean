@@ -1,0 +1,199 @@
+package driver;
+import "github.com/ocean-foundation/ocean/compiler/ast";
+import "github.com/ocean-foundation/ocean/compiler/loader";
+import "github.com/ocean-foundation/ocean/compiler/util";
+import "path" as filepath;
+import "sort";
+import "strings";
+
+func fetchUsage() string {
+    return "Usage: ocean fetch [<url>[@version]]\n";
+}
+
+func fetchMain(args []string) int {
+    argc := len(args);
+    if (argc == 3 && (args[2] == "--help" || args[2] == "-help")) {
+        util.Stdout(fetchUsage());
+        return 0;
+    }
+    if (argc > 3) {
+        util.Stderr(fetchUsage());
+        return 1;
+    }
+    b := loader.NewBuild(newDiags());
+    mod := b.FindModule(util.Getcwd());
+    if (loader.NilModule(mod)) {
+        util.Stderr("ocean fetch: no ocean.mod found in current or parent directories\n");
+        return 1;
+    }
+    if (b.Errors() > 0) return 1;
+    if (argc == 2) {
+        if (!fetchDependencies(b, mod.root, mod)) return 1;
+        return 0;
+    }
+    spec := args[2];
+    modURL := spec;
+    ver := "";
+    hasVer := false;
+    at := strings.LastIndexByte(spec, '@');
+    if (at >= 0) {
+        modURL = spec[0:at];
+        ver = spec[at + 1:];
+        hasVer = true;
+    }
+    if (!loader.ValidModulePath(modURL) || (hasVer && (ver == "" || !loader.ValidModulePath(ver) || ver[0] == '-'))) {
+        util.Stderr("ocean fetch: invalid module specification: " + spec + "\n");
+        return 1;
+    }
+    existingVer, alreadyDeclared := mod.requires[modURL];
+    targetVer := hasVer ? ver : (alreadyDeclared ? existingVer : "latest");
+    if (targetVer == "") targetVer = "latest";
+    dependency, errMsg := fetchRequirement(b, mod.root, mod, modURL, targetVer);
+    if (errMsg != "") {
+        util.Stderr("ocean fetch: " + errMsg + "\n");
+        return 1;
+    }
+    if (!fetchDependencies(b, mod.root, dependency)) return 1;
+    if (!alreadyDeclared || hasVer) {
+        if (!upsertOceanModRequire(mod.root, modURL, targetVer)) {
+            util.Stderr("ocean fetch: could not update ocean.mod\n");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Walk module manifests without writing into the dependency cache. Importers'
+// manifests choose versions; the requesting project's ocean.sum pins the bytes.
+func fetchDependencies(b *loader.Build, root string, first *ast.Module) bool {
+    visited: map[string]bool;
+    pending := []*ast.Module{first};
+    // An explicit fetch has already selected the only direct dependency to walk.
+    visited[root] = first.root != root;
+    for (i := 0; i < len(pending); i++) {
+        mod := pending[i];
+        done, _ := visited[mod.root];
+        if (done) continue;
+        visited[mod.root] = true;
+        names := make([]string);
+        for (name, _ := range mod.requires) names.append(name);
+        sort.Strings(&names);
+        for (_, name := range names) {
+            version, _ := mod.requires[name];
+            dependency, errMsg := fetchRequirement(b, root, mod, name, version);
+            if (errMsg != "") {
+                util.Stderr("ocean fetch: " + mod.path + " requires " + name + ": " + errMsg + "\n");
+                return false;
+            }
+            pending.append(dependency);
+        }
+    }
+    return true;
+}
+
+func fetchRequirement(b *loader.Build, root string, mod *ast.Module, name string, version string) (*ast.Module, string) {
+    path := "";
+    rep, replaced := mod.replaces[name];
+    if (replaced && len(rep) > 0 && (rep[0] == '.' || rep[0] == '/')) {
+        location := rep[0] == '/' ? rep : filepath.Join(mod.root, rep);
+        resolved, ok := util.Realpath(location);
+        if (!ok) return zero(*ast.Module), "cannot resolve local replacement: " + rep;
+        path = resolved;
+    } else {
+        target := name;
+        if (replaced) {
+            target = rep;
+            version, _ = mod.replaceVersions[name];
+        }
+        cached, _, errMsg := loader.FetchModule(root, target, version);
+        if (errMsg != "") return zero(*ast.Module), errMsg;
+        path = cached;
+    }
+    errors := b.Errors();
+    dep := b.FindModule(path);
+    if (loader.NilModule(dep) || dep.root != path) return zero(*ast.Module), "module root must contain ocean.mod: " + path;
+    if (b.Errors() > errors) return zero(*ast.Module), "invalid ocean.mod: " + path;
+    if (!replaced && dep.path != name) return zero(*ast.Module), "module declares " + dep.path + ", expected " + name;
+    return dep, "";
+}
+
+func modWordsSimple(line string) []string {
+    out := make([]string);
+    i := 0;
+    for (i < len(line)) {
+        for (i < len(line) && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r' || line[i] == ';')) i++;
+        if (i >= len(line)) break;
+        if (line[i] == '#' || (line[i] == '/' && i + 1 < len(line) && line[i + 1] == '/')) break;
+        if (line[i] == '"') {
+            i++;
+            s := i;
+            for (i < len(line) && line[i] != '"') i++;
+            out.append(line[s:i]);
+            if (i < len(line)) i++;
+        } else {
+            s := i;
+            for (i < len(line) && line[i] != ' ' && line[i] != '\t' && line[i] != '\r' && line[i] != ';') i++;
+            out.append(line[s:i]);
+        }
+    }
+    return out;
+}
+
+func upsertOceanModRequire(modRoot string, modURL string, version string) bool {
+    fd := loader.LockModuleManifest(modRoot);
+    if (fd < 0) return false;
+    defer util.Close(fd);
+    path := modRoot + "/ocean.mod";
+    text, ok := util.ReadFile(path);
+    if (!ok) return false;
+    ver := version == "" ? "latest" : version;
+    lines := strings.Split(text, "\n");
+    if (len(lines) > 0 && lines[len(lines) - 1] == "") lines.pop();
+    inReq := false;
+    updated := false;
+    reqEnd := -1;
+    out := make([]string);
+    for (i := 0; i < len(lines); i++) {
+        line := lines[i];
+        parts := modWordsSimple(line);
+        if (!inReq && len(parts) >= 2 && parts[0] == "require" && parts[1] == "(") {
+            inReq = true;
+            out.append(line);
+            continue;
+        }
+        if (inReq && len(parts) >= 1 && parts[0] == ")") {
+            if (!updated) { reqEnd = len(out); }
+            inReq = false;
+            out.append(line);
+            continue;
+        }
+        if (!updated) {
+            if (inReq && len(parts) >= 1 && parts[0] == modURL) {
+                out.append("    " + modURL + " " + ver);
+                updated = true;
+                continue;
+            }
+            if (!inReq && len(parts) >= 2 && parts[0] == "require" && parts[1] == modURL) {
+                out.append("require " + modURL + " " + ver);
+                updated = true;
+                continue;
+            }
+        }
+        out.append(line);
+    }
+    if (!updated) {
+        if (reqEnd >= 0) {
+            inserted := make([]string);
+            for (i := 0; i < len(out); i++) {
+                if (i == reqEnd) inserted.append("    " + modURL + " " + ver);
+                inserted.append(out[i]);
+            }
+            out = inserted;
+        } else {
+            out.append("require " + modURL + " " + ver);
+        }
+    }
+    res := "";
+    for (_, l := range out) res += l + "\n";
+    return util.WriteFileAtomic(path, res, 420);
+}

@@ -101,7 +101,7 @@ struct Symbol {
     id int;
     builtin bool;           // Result/Optional and their methods
     used bool;
-    freed bool;
+    freed bool;             // local dynamic array or string explicitly released
     depth int;
     scopeLevel int;
     declIndex int;
@@ -110,9 +110,10 @@ struct Symbol {
     decl *Node;             // global var: its VarDecl
     self *Type;             // type symbols: the declared (named) type
     local bool;             // declared in a function body
-    scope *Scope;           // resolution scope for local type declarations
+    scope *Scope;           // declaration scope for locals
     fixedVariant int;
     valueSyms []*Symbol;    // struct: value parameters visible to field dimensions
+    stackBufScope *Scope;   // scope owning the local buffer storage
 }
 
 struct Scope {
@@ -149,6 +150,7 @@ struct Package {
     loading bool;
     syms []*Symbol;     // package-level declarations in order
     displayPath string;
+    harness bool;       // synthesized test harness package (isolated)
 }
 
 func NewScope(parent *Scope) *Scope {

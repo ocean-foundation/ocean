@@ -27,13 +27,37 @@ func isWord(k scanner.Kind) bool {
     return false;
 }
 
+func quoteStringLiteral(s string) string {
+    b: util.Buf;
+    b.Addc('"');
+    for (i := 0; i < len(s); i++) {
+        ch := s[i];
+        v := (ch -> int) & 255;
+        if (ch == '"') b.Add("\\\"");
+        else if (ch == '\\') b.Add("\\\\");
+        else if (ch == '\n') b.Add("\\n");
+        else if (ch == '\r') b.Add("\\r");
+        else if (ch == '\t') b.Add("\\t");
+        else if (v < 32 || v == 127) { b.Add("\\x").Addc(util.HexDigit(v >> 4)).Addc(util.HexDigit(v & 15)); }
+        else b.Addc(ch);
+    }
+    b.Addc('"');
+    return b.String();
+}
+
 func lexeme(t *scanner.Token) string {
-    if (t.kind == scanner.Kind.Str) return t.text;
+    if (t.kind == scanner.Kind.Str) {
+        if (t.raw) return "`" + t.text + "`";
+        return quoteStringLiteral(t.text);
+    }
     return t.text;
 }
 
 // JoinTokens joins tokens with conventional spacing.
 func JoinTokens(toks *[]*scanner.Token, from int, to int) string {
+    if (from < 0) from = 0;
+    if (to > len(*toks)) to = len(*toks);
+    if (from >= to) return "";
     b: util.Buf;
     for (i := from; i < to; i++) {
         k := (*toks)[i].kind;
@@ -54,7 +78,7 @@ func JoinTokens(toks *[]*scanner.Token, from int, to int) string {
 
 func kind(g *legacyState, i int) scanner.Kind {
     j := g.start + i;
-    if (j < len(*g.toks)) return (*g.toks)[j].kind;
+    if (j >= 0 && j < len(*g.toks)) return (*g.toks)[j].kind;
     return scanner.Kind.EOF;
 }
 func named(g *legacyState, i int, name string) bool {
@@ -64,11 +88,12 @@ func named(g *legacyState, i int, name string) bool {
 func verbatim(g *legacyState, out *util.Buf, from int, to int) {
     if (from >= to) return;
     a := g.start + from; z := g.start + to;
-    exact := g.hasSource;
-    for (i := a; exact && i < z; i++) { if ((*g.toks)[i].kind == scanner.Kind.Str) exact = false; }
-    if (exact) {
+    if (a < 0) a = 0;
+    if (z > len(*g.toks)) z = len(*g.toks);
+    if (a >= z) return;
+    if (g.hasSource) {
         s := (*g.toks)[a].off; e := (*g.toks)[z - 1].end;
-        if (e > s && e <= len(g.source)) { out.Add(g.source[s:e]); return; }
+        if (s >= 0 && e > s && e <= len(g.source)) { out.Add(g.source[s:e]); return; }
     }
     out.Add(JoinTokens(g.toks, a, z));
 }
@@ -82,7 +107,7 @@ func balanced(g *legacyState, i int) int {
             k := kind(g, i);
             if (k == scanner.Kind.Lt) depth++;
             else if (k == scanner.Kind.Gt) depth--;
-            else if (k == scanner.Kind.Shr) { if (depth >= 2) depth -= 2; else depth = 0; }
+            else if (k == scanner.Kind.Shr) { if (depth < 2) return 0; depth -= 2; }
             else if (k == scanner.Kind.Semi || k == scanner.Kind.LBrace || k == scanner.Kind.EOF) return 0;
             if (depth == 0) return i + 1;
         }
@@ -109,7 +134,8 @@ func startsType(k scanner.Kind) bool {
         k == scanner.Kind.KwStruct || k == scanner.Kind.KwInterface;
 }
 
-func base(g *legacyState, i int, out *util.Buf, changed *int) int {
+func base(g *legacyState, i int, out *util.Buf, changed *int, depth int) int {
+    if (depth > 400) return 0;
     k := kind(g, i);
     if (named(g, i, "buffer")) {
         if (kind(g, i + 1) != scanner.Kind.Lt) { out.Add("buffer"); return i + 1; }
@@ -120,6 +146,7 @@ func base(g *legacyState, i int, out *util.Buf, changed *int) int {
             if (end == 0) return 0;
             *changed = *changed | 4;
             verbatim(g, out, i, close - 1);
+            if (kind(g, close - 1) == scanner.Kind.Shr) out.Add(">");
             if (end > close + 2) { out.Add(", "); verbatim(g, out, close + 1, end - 1); }
             out.Add(">");
             return end;
@@ -138,7 +165,7 @@ func base(g *legacyState, i int, out *util.Buf, changed *int) int {
         if (close == 0) return 0;
         verbatim(g, out, i, close);
         value: util.Buf;
-        end := typ(g, close, &value, changed);
+        end := typ(g, close, &value, changed, depth + 1);
         if (end == 0) return 0;
         out.AddBuf(&value);
         return end;
@@ -157,7 +184,7 @@ func base(g *legacyState, i int, out *util.Buf, changed *int) int {
         }
         if (!startsType(kind(g, params))) return params;
         result: util.Buf;
-        end := typ(g, params, &result, changed);
+        end := typ(g, params, &result, changed, depth + 1);
         if (end == 0) return params;
         out.Add(" ");
         out.AddBuf(&result);
@@ -182,10 +209,11 @@ func base(g *legacyState, i int, out *util.Buf, changed *int) int {
     return end;
 }
 
-func typ(g *legacyState, i int, out *util.Buf, changed *int) int {
+func typ(g *legacyState, i int, out *util.Buf, changed *int, depth int) int {
+    if (depth > 400) return 0;
     if (kind(g, i) == scanner.Kind.Star || kind(g, i) == scanner.Kind.KwMixed) {
         rest: util.Buf;
-        end := typ(g, i + 1, &rest, changed);
+        end := typ(g, i + 1, &rest, changed, depth + 1);
         if (end == 0) return 0;
         out.Add(kind(g, i) == scanner.Kind.Star ? "*" : "mixed ");
         out.AddBuf(&rest);
@@ -195,14 +223,14 @@ func typ(g *legacyState, i int, out *util.Buf, changed *int) int {
         close := balanced(g, i);
         if (close == 0) return 0;
         rest: util.Buf;
-        end := typ(g, close, &rest, changed);
+        end := typ(g, close, &rest, changed, depth + 1);
         if (end == 0) return 0;
         verbatim(g, out, i, close);
         out.AddBuf(&rest);
         return end;
     }
     b: util.Buf;
-    end := base(g, i, &b, changed);
+    end := base(g, i, &b, changed, depth + 1);
     if (end == 0) return 0;
     text := b.String();
     for (;;) {
@@ -224,12 +252,13 @@ func typ(g *legacyState, i int, out *util.Buf, changed *int) int {
 // TypeRewrite parses a legacy type starting at toks[start]. ok is false when no
 // legacy suffix follows a type there.
 func TypeRewrite(toks *[]*scanner.Token, start int, source string, hasSource bool) Rewrite {
+    r: Rewrite;
+    if (start < 0 || start >= len(*toks)) return r;
     g := new(legacyState);
     g.toks = toks; g.start = start; g.source = source; g.hasSource = hasSource;
     out: util.Buf;
     changed := 0;
-    end := typ(g, 0, &out, &changed);
-    r: Rewrite;
+    end := typ(g, 0, &out, &changed, 0);
     if (end == 0 || changed == 0) return r;
     r.ok = true; r.text = out.String(); r.consumed = end; r.kinds = changed;
     return r;

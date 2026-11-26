@@ -17,26 +17,53 @@ func cacheRoot() string {
     return home + "/.cache/ocean-build/oc1";
 }
 
-func fnv(h uint, s string) uint {
-    for (i := 0; i < len(s); i++) {
-        h = h ^ (((s[i] -> int) & 255) -> uint);
-        h = h * 1099511628211->uint;
-    }
-    return h;
+func hashField(h *util.Sha256, label string, val string) {
+    h.WriteString(label);
+    h.WriteString(":");
+    h.WriteString(strconv.Itoa(len(val)));
+    h.WriteString(":");
+    h.WriteString(val);
+    h.WriteString("\n");
+}
+
+cachedClangVersion := "";
+clangVersionChecked := false;
+
+func clangVersion() string {
+    if (clangVersionChecked) return cachedClangVersion;
+    clangVersionChecked = true;
+    st, out := util.RunCapture([]string{"clang", "--version"}.array());
+    if (!st.Failed && st.Code == 0) cachedClangVersion = out;
+    return cachedClangVersion;
 }
 
 func cacheKey(p *Program, ir string, staticLink bool) string {
-    h := 14695981039346656037->uint;
-    h = fnv(h, ir);
-    h = fnv(h, runtime.Core());
-    if (p.checker.UsesThreads()) h = fnv(h, runtime.Threads());
-    if (usesPackage(p, "os/exec")) h = fnv(h, runtime.Process());
-    if (p.usesFFI) h = fnv(h, runtime.Ffi());
-    if (p.usesCurl) h = fnv(h, "curl");
-    h2 := fnv(h ^ 6148914691236517205->uint, ir);
-    tag := (p.isLibrary ? "lib" : "exe") + (staticLink ? "-static" : "") + optLevel() + Version() + Commit() + os.OS() + os.Arch();
-    h = fnv(h, tag); h2 = fnv(h2, tag);
-    return util.Hex(h, 16) + util.Hex(h2, 16);
+    h := util.NewSha256();
+    hashField(&h, "ir", ir);
+    hashField(&h, "core", runtime.Core());
+    if (targetWasm()) {
+        hashField(&h, "wasm", runtime.Wasm());
+    } else {
+        if (p.checker.UsesThreads()) hashField(&h, "threads", runtime.Threads());
+        if (usesPackage(p, "os/exec")) hashField(&h, "process", runtime.Process());
+        if (p.usesFFI) hashField(&h, "ffi", runtime.Ffi());
+    }
+    hashField(&h, "curl", p.usesCurl ? "1" : "0");
+    hashField(&h, "mode", p.isLibrary ? "lib" : "exe");
+    hashField(&h, "static", staticLink ? "1" : "0");
+    hashField(&h, "opt", optLevel());
+    hashField(&h, "ver", Version());
+    hashField(&h, "commit", Commit());
+    hashField(&h, "os", os.OS());
+    hashField(&h, "arch", os.Arch());
+    ocos, _ := util.Getenv("OCOS");
+    ocarch, _ := util.Getenv("OCARCH");
+    cross, _ := util.Getenv("OCEAN_CROSS_TARGET");
+    hashField(&h, "ocos", ocos);
+    hashField(&h, "ocarch", ocarch);
+    hashField(&h, "cross", cross);
+    hashField(&h, "clang", clangVersion());
+    return h.SumHex();
 }
 
 func cacheLookup(key string, output string) bool {
@@ -46,10 +73,7 @@ func cacheLookup(key string, output string) bool {
     if (!util.IsRegular(entry)) return false;
     data, ok := util.ReadFile(entry);
     if (!ok) return false;
-    staged := output + ".ocean-tmp";
-    if (!util.WriteFileMode(staged, data, 493)) return false;
-    if (!util.Rename(staged, output)) { util.Remove(staged); return false; }
-    return true;
+    return util.WriteFileAtomic(output, data, 493);
 }
 
 func cacheStore(key string, output string) {
@@ -59,9 +83,7 @@ func cacheStore(key string, output string) {
     if (!util.MkdirAll(dir)) return;
     data, ok := util.ReadFile(output);
     if (!ok) return;
-    tmp := dir + "/." + key + "." + strconv.Itoa(util.Pid());
-    if (util.WriteFile(tmp, data)) util.Rename(tmp, dir + "/" + key);
-    else util.Remove(tmp);
+    util.WriteFileAtomic(dir + "/" + key, data, 420);
 }
 
 func cleanCache() int {

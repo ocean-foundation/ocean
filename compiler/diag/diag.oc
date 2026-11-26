@@ -45,14 +45,46 @@ func useColor() bool {
     return util.IsTerminal(2);
 }
 
+func appendSanitized(b *util.Buf, s string, keepTab bool) {
+    limit := len(s);
+    i := 0;
+    for (i < limit) {
+        v := (s[i] -> int) & 255;
+        if (v < 32) {
+            if (keepTab && v == 9) b.Addc('\t');
+            else b.Add("\\x").Addc(util.HexDigit(v >> 4)).Addc(util.HexDigit(v & 15));
+            i++;
+            continue;
+        }
+        if (v == 127) { b.Add("\\x7f"); i++; continue; }
+        if (v == 194 && i + 1 < limit) {
+            v2 := (s[i + 1] -> int) & 255;
+            if (v2 >= 128 && v2 <= 159) {
+                b.Add("\\u00").Addc(util.HexDigit(v2 >> 4)).Addc(util.HexDigit(v2 & 15));
+                i += 2;
+                continue;
+            }
+        }
+        b.Addc(s[i]);
+        i++;
+    }
+}
+
 func (l *List) Format(d *Diagnostic) string {
     b: util.Buf;
     color := useColor();
     if (color) b.Add(d.severity == "warning" ? "\x1b[33m" : "\x1b[31m");
     line := d.line > 0 ? d.line : 1;
     col := d.col > 0 ? d.col : 1;
-    b.Add("[").Add(d.file == "" ? "<source>" : d.file).Add(":").AddInt(line).Add(":").AddInt(col).Add("]: ");
-    b.Add(d.phase).Add(" ").Add(d.severity).Add(": ").Add(d.message).Add("\n");
+    b.Add("[");
+    appendSanitized(&b, d.file == "" ? "<source>" : d.file, false);
+    b.Add(":").AddInt(line).Add(":").AddInt(col).Add("]: ");
+    appendSanitized(&b, d.phase, false);
+    b.Add(" ");
+    appendSanitized(&b, d.severity, false);
+    b.Add(": ");
+    appendSanitized(&b, d.message, false);
+    b.Add("\n");
     text, ok := l.sources[d.file];
     if (ok) b.Add(Snippet(text, line, col));
     if (color) b.Add("\x1b[0m");
@@ -69,15 +101,39 @@ func Snippet(text string, line int, col int) string {
         start = i + 1;
     }
     end := start;
-    for (end < len(text) && text[end] != '\n' && text[end] != '\r' && text[end] != 0) end++;
+    for (end < len(text) && text[end] != '\n' && text[end] != '\r') end++;
     b: util.Buf;
     prefix := " " + strconv.Itoa(line) + " | ";
-    b.Add(prefix).Add(text[start:end]).Add("\n");
+    b.Add(prefix);
+    truncated := end - start > 512;
+    if (truncated) {
+        end = start + 512;
+        // Move the cut back if it lands inside a multibyte character.
+        for (moved := 0; moved < 3 && ((text[end] -> int) & 192) == 128; moved++) end--;
+    }
+    appendSanitized(&b, text[start:end], true);
+    if (truncated) b.Add("...");
+    b.Add("\n");
     for (i := 0; i < len(prefix); i++) b.Addc(prefix[i] == '|' ? '|'->i8 : ' '->i8);
     caret := col - 1;
     if (caret < 0) caret = 0;
     if (caret > end - start) caret = end - start;
-    for (i := 0; i < caret; i++) b.Addc(text[start + i] == '\t' ? '\t'->i8 : ' '->i8);
+    i := 0;
+    for (i < caret) {
+        v := (text[start + i] -> int) & 255;
+        if (v == 9) { b.Addc('\t'); i++; continue; }
+        if (v < 32 || v == 127) { b.Add("    "); i++; continue; }
+        if (v == 194 && start + i + 1 < end) {
+            v2 := (text[start + i + 1] -> int) & 255;
+            if (v2 >= 128 && v2 <= 159) { b.Add("      "); i += 2; continue; }
+        }
+        b.Addc(' ');
+        if (v < 128) i++;
+        else if (v >= 194 && v <= 223 && start + i + 1 < end && (((text[start + i + 1] -> int) & 192) == 128)) i += 2;
+        else if (v >= 224 && v <= 239 && start + i + 2 < end && (((text[start + i + 1] -> int) & 192) == 128) && (((text[start + i + 2] -> int) & 192) == 128)) i += 3;
+        else if (v >= 240 && v <= 244 && start + i + 3 < end && (((text[start + i + 1] -> int) & 192) == 128) && (((text[start + i + 2] -> int) & 192) == 128) && (((text[start + i + 3] -> int) & 192) == 128)) i += 4;
+        else i++;
+    }
     b.Add("^\n");
     return b.String();
 }

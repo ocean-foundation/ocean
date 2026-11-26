@@ -51,11 +51,13 @@ func genStmt1(g *Gen, n *ast.Node) {
     case ast.NK.ReturnPanic:
         m := genAs(g, n.a, check.TString());
         setSite(g, n);
+        consume(g, m);
         emit(g, "call void @oc_return_panic(ptr " + m.r + ", i64 " + itoa(site(g, n)) + ")");
         term(g, "unreachable");
     case ast.NK.Panic:
         m := genAs(g, n.a, check.TString());
         setSite(g, n);
+        consume(g, m);
         emit(g, "call void @oc_panic(ptr " + m.r + ", i64 " + itoa(site(g, n)) + ")");
         term(g, "unreachable");
     case ast.NK.Forward:
@@ -189,7 +191,10 @@ func genFor(g *Gen, n *ast.Node) {
     label(g, body);
     if (g.usesThreads) emit(g, "call void @ocean_threads_checkpoint()");
     pushLoop(g, loopNode(g, n), done, post);
+    scoped := n.d.kind != ast.NK.Block;
+    if (scoped) pushScope(g);
     genStmt(g, n.d);
+    if (scoped) popScope(g);
     popLoop(g);
     br(g, post);
     label(g, post);
@@ -203,8 +208,8 @@ func loopNode(g *Gen, n *ast.Node) *ast.Node { return n; }
 
 func genRange(g *Gen, n *ast.Node) {
     cv := genExpr(g, n.a);
-    if (isAgg(cv.t) && !cv.fresh) cv = copyV(g, cv);
     u := under(cv.t);
+    if ((isAgg(cv.t) || u.kind == ast.TK.Dyn || u.kind == ast.TK.String || (u.kind == ast.TK.Array && u.len < 0)) && !cv.fresh) cv = copyV(g, cv);
     idx := alloca(g, check.TInt());
     emit(g, "store i64 0, ptr " + idx);
     keys := ""; vals := "";
@@ -248,7 +253,10 @@ func genRange(g *Gen, n *ast.Node) {
         storeReplace(g, vt, p, copyV(g, load(g, vt, src)));
     }
     pushLoop(g, n, done, post);
+    scoped := n.d.kind != ast.NK.Block;
+    if (scoped) pushScope(g);
     genStmt(g, n.d);
+    if (scoped) popScope(g);
     popLoop(g);
     br(g, post);
     label(g, post);
@@ -407,8 +415,29 @@ func genReturn(g *Gen, n *ast.Node) {
 
 // ---- defer ----
 
-// deferItem is one value captured at the defer site.
-struct deferItem { ty string; size int; agg bool; ot *ast.Type; }
+// Aggregate and wide integer captures use separately allocated storage.
+func indirectDeferCapture(t *ast.Type) bool {
+    u := under(t);
+    return isAgg(t) || (u.kind == ast.TK.Int && u.bits > 128);
+}
+
+// Each capture has a 16-byte value slot. Ownership bytes follow the slots so
+// clearing ownership leaves aggregate storage readable until the callee exits.
+func deferSlot(g *Gen, rec string, i int) string {
+    return gep(g, rec, 16 + i * 16);
+}
+
+func deferOwnership(g *Gen, rec string, count int, i int) string {
+    return gep(g, rec, 16 + count * 16 + i);
+}
+
+func ownsDeferCapture(g *Gen, v V) bool {
+    return g.trackTemps && v.fresh && owned(g, v.t);
+}
+
+func moveDeferCapture(g *Gen, items []V, i int) {
+    if (ownsDeferCapture(g, items[i])) emit(g, "store i8 0, ptr " + deferOwnership(g, "%rec", len(items), i));
+}
 
 // genDefer captures the callee and arguments now and registers a thunk record.
 func genDefer(g *Gen, n *ast.Node) {
@@ -416,9 +445,7 @@ func genDefer(g *Gen, n *ast.Node) {
     items := make([]V);
     callee := "";
     ft := zero(*ast.Type);
-    lead := "null";
     kind := 0; // 0 direct name, 1 closure value, 2 interface method, 3 extern, 4 builtin recover, 5 method
-    recvIdx := -1;
     switch (c.sem) {
     case ast.Sem.CallFunc, ast.Sem.CallIntrinsic:
         ft = c.sym.ty;
@@ -451,7 +478,6 @@ func genDefer(g *Gen, n *ast.Node) {
                 else rv = copyV(g, genExpr(g, mem.a));
                 items.append(rv);
             }
-            recvIdx = 0;
         }
     case ast.Sem.CallExtern:
         kind = 3;
@@ -468,6 +494,7 @@ func genDefer(g *Gen, n *ast.Node) {
         mem := memberOf(c);
         iv := genExpr(g, mem.a);
         if (iv.t.kind == ast.TK.Ptr) iv = load(g, iv.t.elem, iv.r);
+        iv = copyV(g, iv);
         items.append(iv);
         ft = sub(g, mem.ty);
         if (c.a.kind == ast.NK.Inst) ft = sub(g, c.a.ty);
@@ -490,94 +517,94 @@ func genDefer(g *Gen, n *ast.Node) {
         items.append(mkV(lvalueAddr(g, c.list[0]), check.PtrTo(typeOf(g, c.list[0]))));
     }
     else if (kind == 7) {
-        // free/delete: capture the operand value(s); the map/array header is shared
+        // free/delete: for lvalue maps, track the variable slot so map growth stays visible
         for (i, a := range c.list) {
+            if (c.text == "delete" && i == 0 && isLvalue(a)) { items.append(mkV(lvalueAddr(g, a), check.PtrTo(typeOf(g, a)))); continue; }
             if (c.text == "delete" && i == 1) { items.append(genAs(g, a, under(typeOf(g, c.list[0])).key)); continue; }
             items.append(genExpr(g, a));
         }
     } else if (kind == 3) {
-        // extern: evaluate arguments as values
+        // extern: copy owned values at defer time before converting string data in the thunk
         for (i, a := range c.list) {
+            if (i < len(c.sym.ty.params) && a.kind == ast.NK.Member && a.sem == ast.Sem.ArrayData && under(typeOf(g, a.a)).kind == ast.TK.String) {
+                items.append(copyV(g, genExpr(g, a.a)));
+                continue;
+            }
             v := genExpr(g, a);
             if (i < len(c.sym.ty.params)) v = conv(g, v, c.sym.ty.params[i]);
-            else v = promoteVariadic(g, v);
+            v = copyV(g, v);
             items.append(v);
         }
     } else if (kind != 4) {
-        argStart := len(items);
         for (_, v := range argValues(g, c, ft)) items.append(v);
-        argStart = argStart + 0;
     }
-    // record: {next, thunk, slot0, slot1, ...} with 16-byte slots
+    // record: {next, thunk, capture slots, ownership bytes}
     nslots := len(items);
     rec := tmp(g);
-    emit(g, rec + " = call ptr @oc_alloc(i64 " + itoa(16 + nslots * 16) + ")");
+    emit(g, rec + " = call ptr @oc_alloc(i64 " + itoa(16 + nslots * 17) + ")");
     for (i, v := range items) {
-        slot := gep(g, rec, 16 + i * 16);
-        if (isAgg(v.t) || (under(v.t).kind == ast.TK.Int && under(v.t).bits > 128)) {
+        slot := deferSlot(g, rec, i);
+        if (indirectDeferCapture(v.t)) {
             h := tmp(g);
             emit(g, h + " = call ptr @oc_alloc(i64 " + itoa(sizeOf(g, v.t)) + ")");
             store(g, v.t, h, v);
             emit(g, "store ptr " + h + ", ptr " + slot);
         } else store(g, v.t, slot, v);
+        if (ownsDeferCapture(g, v)) emit(g, "store i8 1, ptr " + deferOwnership(g, rec, nslots, i));
     }
-    thunk := deferThunk(g, n, c, kind, callee, ft, items, recvIdx);
+    thunk := deferThunk(g, n, c, kind, callee, ft, items);
     emit(g, "store ptr " + thunk + ", ptr " + gep(g, rec, g.c.PtrSize()));
     fd := gep(g, g.fn.frame, frameOff(g, "defers"));
     old := tmp(g); emit(g, old + " = load ptr, ptr " + fd);
     emit(g, "store ptr " + old + ", ptr " + rec);
     emit(g, "store ptr " + rec + ", ptr " + fd);
-    lead = lead + "";
 }
 
-// argValues evaluates call arguments (packing variadics) as individual values.
-func argValues(g *Gen, n *ast.Node, ft *ast.Type) []V {
-    out := make([]V);
-    params := make([]*ast.Type);
-    for (_, p := range ft.params) params.append(sub(g, p));
-    fixed := len(params);
-    if (ft.variadic) fixed--;
-    if (n.flag2) {
-        tv := genExpr(g, n.list[0]);
-        rts := under(tv.t).results;
-        vals := make([]V);
-        for (i, rt := range rts) vals.append(load(g, rt, gep(g, tv.r, tupleOffset(g, rts, i))));
-        for (i := 0; i < fixed; i++) out.append(copyV(g, conv(g, vals[i], params[i])));
-        if (ft.variadic) {
-            extra := make([]V);
-            for (i := fixed; i < len(vals); i++) extra.append(vals[i]);
-            out.append(packVariadic(g, params[len(params) - 1], extra, zero(*ast.Node)));
-        }
-        return out;
-    }
-    for (i := 0; i < fixed && i < len(n.list); i++) out.append(argValue(g, n.list[i], params[i]));
-    if (ft.variadic) {
-        vt := params[len(params) - 1];
-        extra := make([]V);
-        spread := zero(*ast.Node);
-        for (i := fixed; i < len(n.list); i++) {
-            if (n.flag && i == len(n.list) - 1) { spread = n.list[i]; break; }
-            extra.append(genAs(g, n.list[i], under(vt).elem));
-        }
-        out.append(packVariadic(g, vt, extra, spread));
-    }
-    return out;
-}
-
-func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, ft *ast.Type, items []V, recvIdx int) string {
+func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, ft *ast.Type, items []V) string {
     g.deferThunks++;
     name := "@\"defer." + itoa(g.deferThunks) + "\"";
     saved := g.fn;
     f := newFn(g, saved.inst, name);
     f.cur = "entry";
     g.fn = f;
-    vals := make([]V);
-    shells := make([]string); // heap copies of aggregate arguments, freed after the call
+    run := newLabel(g, "defer.run");
+    discard := newLabel(g, "defer.discard");
+    invoke := tmp(g);
+    emit(g, invoke + " = icmp ne i32 %invoke, 0");
+    condBr(g, invoke, run, discard);
+    label(g, discard);
     for (i, v := range items) {
-        slot := gep(g, "%rec", 16 + i * 16);
-        if (isAgg(v.t) || (under(v.t).kind == ast.TK.Int && under(v.t).bits > 128)) {
+        drop := ownsDeferCapture(g, v);
+        indirect := indirectDeferCapture(v.t);
+        if (!drop && !indirect) continue;
+        slot := deferSlot(g, "%rec", i);
+        if (indirect) {
+            h := tmp(g);
+            emit(g, h + " = load ptr, ptr " + slot);
+            slot = h;
+        }
+        if (drop) {
+            flag := tmp(g);
+            emit(g, flag + " = load i8, ptr " + deferOwnership(g, "%rec", len(items), i));
+            live := tmp(g);
+            emit(g, live + " = icmp ne i8 " + flag + ", 0");
+            release := newLabel(g, "defer.drop");
+            done := newLabel(g, "defer.next");
+            condBr(g, live, release, done);
+            label(g, release);
+            emit(g, "call void @oc_drop(ptr " + slot + ", ptr " + desc(g, v.t) + ")");
+            br(g, done);
+            label(g, done);
+        }
+        if (indirect) emit(g, "call void @oc_free(ptr " + slot + ")");
+    }
+    term(g, "ret void");
+    label(g, run);
+    vals := make([]V);
+    for (i, v := range items) {
+        slot := deferSlot(g, "%rec", i);
+        if (indirectDeferCapture(v.t)) {
             h := tmp(g); emit(g, h + " = load ptr, ptr " + slot);
-            shells.append(h);
             vals.append(load(g, v.t, h));
         } else vals.append(load(g, v.t, slot));
     }
@@ -589,7 +616,8 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
         ffiCall(g, c.sym, vals, check.TVoid());
     } else if (kind == 8) {
         slot := vals[0].r;
-        elem := under(vals[0].t.elem).elem;
+        rt := under(vals[0].t.elem);
+        elem := rt.elem;
         es := sizeOf(g, elem);
         st := itoa(site(g, site0));
         if (c.text == "pop" || c.text == "remove") {
@@ -605,12 +633,14 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
             for (i := first; i < len(vals); i++) {
                 v := vals[i];
                 if (c.flag && i == len(vals) - 1) {
-                    emit(g, "call void @oc_arr_insert_from(ptr " + slot + ", i64 " + index + ", ptr " + arrayDataPtr(g, v) + ", i64 " + collectionLen(g, v) + ", ptr " + desc(g, elem) + ", i64 " + st + ")");
+                    // The defer already owns a snapshot of the source.
+                    insertArraySpread(g, rt, slot, index, freshNoTemp(v.r, v.t), st);
                     continue;
                 }
                 p := tmp(g);
                 emit(g, p + " = call ptr @oc_arr_insert(ptr " + slot + ", i64 " + index + ", i64 1, i64 " + itoa(es) + ", i64 " + st + ")");
                 store(g, elem, p, v);
+                moveDeferCapture(g, items, i);
                 ni := tmp(g); emit(g, ni + " = add i64 " + index + ", 1"); index = ni;
             }
         }
@@ -621,15 +651,25 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
     } else if (kind == 7) {
         u := under(vals[0].t);
         if (c.text == "free") {
-            if (u.kind == ast.TK.Dyn) { slot := spill(g, vals[0]); emit(g, "call void @oc_arr_free(ptr " + slot + ", ptr " + desc(g, u.elem) + ")"); }
+            if (u.kind == ast.TK.Dyn) {
+                slot := deferSlot(g, "%rec", 0);
+                emit(g, "call void @oc_arr_free(ptr " + slot + ", ptr " + desc(g, u.elem) + ")");
+            }
             else if (u.kind == ast.TK.Ptr) {
                 pd := "null";
                 if (g.trackTemps && owned(g, u.elem)) pd = desc(g, u.elem);
                 emit(g, "call void @oc_free_ptr(ptr " + vals[0].r + ", ptr " + pd + ")");
             }
         } else {
-            slot := spill(g, vals[0]);
-            emit(g, "call void @oc_map_delete(ptr " + slot + ", ptr " + spill(g, vals[1]) + ", ptr " + desc(g, u.key) + ")");
+            slot := "";
+            mt := u;
+            if (u.kind == ast.TK.Ptr) { slot = vals[0].r; mt = under(u.elem); }
+            else slot = spill(g, vals[0]);
+            kslot := deferSlot(g, "%rec", 1);
+            if (indirectDeferCapture(items[1].t)) {
+                h := tmp(g); emit(g, h + " = load ptr, ptr " + kslot); kslot = h;
+            }
+            emit(g, "call void @oc_map_delete(ptr " + slot + ", ptr " + kslot + ", ptr " + desc(g, mt.key) + ")");
         }
     } else if (kind == 3) {
         s := c.sym;
@@ -640,10 +680,22 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
         if (eft.variadic) sig += len(eft.params) > 0 ? ", ..." : "...";
         sig += ")";
         args := "";
-        for (i, v := range vals) {
-            if (i > 0) args += ", ";
-            if (i < len(eft.params)) args += cParam(eft.params[i]) + " " + v.r;
-            else args += ll(v.t) + " " + v.r;
+        for (i, v0 := range vals) {
+            v := v0;
+            if (i < len(eft.params)) {
+                if (c.list[i].kind == ast.NK.Member && c.list[i].sem == ast.Sem.ArrayData && under(v.t).kind == ast.TK.String) {
+                    p := tmp(g); emit(g, p + " = call ptr @oc_str_cdata(ptr " + v.r + ")");
+                    if (args != "") args += ", ";
+                    args += cParam(eft.params[i]) + " " + p;
+                    continue;
+                }
+                if (args != "") args += ", ";
+                args += cParam(eft.params[i]) + " " + v.r;
+            } else {
+                v = promoteVariadic(g, v);
+                if (args != "") args += ", ";
+                args += ll(v.t) + " " + v.r;
+            }
         }
         emit(g, "call " + sig + " @\"" + s.name + "\"(" + args + ")");
     } else {
@@ -677,12 +729,15 @@ func deferThunk(g *Gen, site0 *ast.Node, c *ast.Node, kind int, callee string, f
             term(g, "unreachable");
             label(g, ok);
         }
+        // Ocean parameters take ownership after dispatch succeeds. The
+        // interface receiver stays with the record while its method runs.
+        firstMoved := kind == 5 ? 0 : start;
+        for (i := firstMoved; i < len(items); i++) moveDeferCapture(g, items, i);
         if (rl == "void") emit(g, "call void " + fn + call);
         else { r := tmp(g); emit(g, r + " = call " + rl + " " + fn + call); }
     }
-    if (!g.fn.terminated) { for (_, h := range shells) emit(g, "call void @oc_free(ptr " + h + ")"); }
     term(g, "ret void");
-    g.mod.Add("define internal void ").Add(name).Add("(ptr %rec) {\nentry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
+    g.mod.Add("define internal void ").Add(name).Add("(ptr %rec, i32 %invoke) {\nentry:\n").AddBuf(f.allocas).AddBuf(f.body).Add("}\n\n");
     g.fn = saved;
     return name;
 }
@@ -734,12 +789,14 @@ func genAsm(g *Gen, n *ast.Node) {
         cons += ",~{dirflag},~{fpsr},~{flags}";
     }
     if (n.name == "aarch64") {
-        for (k := 0; k <= 30; k++) { if (k != 18 && k != 29 && !(k >= 9 && k <= 15)) cons += ",~{x" + itoa(k) + "}"; }
+        noOps := len(order) == 0;
+        for (k := 0; k <= 30; k++) { if (k != 18 && k != 29 && (noOps || !(k >= 9 && k <= 15))) cons += ",~{x" + itoa(k) + "}"; }
         for (k := 0; k < 32; k++) cons += ",~{v" + itoa(k) + "}";
         cons += ",~{cc}";
     }
     if (n.name == "riscv64") {
-        for (k := 1; k < 28; k++) { if (k != 2 && k != 3 && k != 4 && k != 8) cons += ",~{x" + itoa(k) + "}"; }
+        lim := len(order) == 0 ? 32 : 28;
+        for (k := 1; k < lim; k++) { if (k != 2 && k != 3 && k != 4 && k != 8) cons += ",~{x" + itoa(k) + "}"; }
         for (k := 0; k < 32; k++) cons += ",~{f" + itoa(k) + "}";
     }
     args := "";

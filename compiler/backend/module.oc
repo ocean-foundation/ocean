@@ -60,11 +60,18 @@ func runtimeDecls() string {
         "declare ptr @oc_reflect_enum_variant(ptr, ptr)\n" +
         "declare ptr @oc_method(ptr, ptr, i64)\n" +
         "declare void @oc_panic(ptr, i64) noreturn\n" +
+        "declare void @oc_panic_div_zero(i64) noreturn\n" +
+        "declare void @oc_panic_neg_shift(i64) noreturn\n" +
         "declare void @oc_return_panic(ptr, i64) noreturn\n" +
         "declare void @oc_bounds(i64, i64, i64) noreturn\n" +
         "declare void @oc_data_literal_bounds(i64, i64, i64) noreturn\n" +
         "declare void @oc_uninit_func(i64) noreturn\n" +
         "declare void @oc_map_missing(i64) noreturn\n" +
+        "declare void @oc_buf_push(ptr, ptr, ptr)\n" +
+        "declare void @oc_buf_drop(ptr)\n" +
+        "declare void @oc_block_copy_elems(ptr, ptr)\n" +
+        "declare void @oc_data_destroy_elems(ptr, i64, ptr)\n" +
+        "declare void @oc_data_copy_elems(ptr, ptr, i64, ptr)\n" +
         "declare void @oc_recover(ptr)\n" +
         "declare void @oc_run_defers(ptr)\n" +
         "declare i32 @" + recoverySymbol() + "(ptr" + (util.BuildTarget().system == "windows" ? ", ptr" : "") + ") returns_twice\n" +
@@ -72,7 +79,9 @@ func runtimeDecls() string {
         "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n" +
         "declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n" +
         "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n" +
-        "@oc_top = external thread_local global ptr\n";
+        "@oc_top = external thread_local global ptr\n" +
+        "@oc_in_defer = external thread_local global i64\n" +
+        "@oc_type_buflist = external global i8\n";
 }
 
 func threadDecls() string {
@@ -176,9 +185,15 @@ func drain(g *Gen) {
 }
 
 struct Options { library bool; usesThreads bool; wasm bool; }
+struct Output { IR string; Ok bool; UsesFFI bool; UsesCurl bool; }
 
 // Generate produces a complete LLVM module for the checked program.
 func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts Options) (string, bool) {
+    res := GenerateOutput(c, packages, root, opts);
+    return res.IR, res.Ok;
+}
+
+func GenerateOutput(c *check.Checker, packages []*ast.Package, root *ast.Package, opts Options) Output {
     g := NewGen(c);
     g.library = opts.library;
     g.usesThreads = opts.usesThreads;
@@ -194,9 +209,8 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
         m := root.scope.LookupLocal("main");
         if (!nilS(m) && m.kind == ast.SK.Func) mainWrapper(g, m);
         setArgsWrapper(g, c.OsSetArgs());
-        // ELF (glibc) hands argc/argv to the runtime's constructor, so main
-        // takes no parameters there, as in ocean-c; elsewhere main stores them.
-        if (util.BuildTarget().system == "linux" || g.wasm) g.mod.Add("declare i32 @oc_start()\ndefine i32 @main() {\nentry:\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
+        // Pass (argc, argv) on all non-Wasm platforms so musl Linux works without glibc constructor args.
+        if (g.wasm) g.mod.Add("declare i32 @oc_start()\ndefine i32 @main() {\nentry:\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
         else g.mod.Add("@oc_argc = external global i32\n@oc_argv = external global ptr\ndeclare i32 @oc_start()\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n  store i32 %argc, ptr @oc_argc\n  store ptr %argv, ptr @oc_argv\n  %r = call i32 @oc_start()\n  ret i32 %r\n}\n\n");
     } else {
         for (_, p := range packages) {
@@ -221,9 +235,10 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
     }
     initFunction(g, packages);
     drain(g);
+    emitGenericMethods(g);
+    drain(g);
     emitMatchers(g);
     drain(g);
-    emitGenericMethods(g);
     out := util.NewBuf();
     out.Add("; Ocean program module\n");
     triple := util.BuildTarget().Triple();
@@ -242,7 +257,12 @@ func Generate(c *check.Checker, packages []*ast.Package, root *ast.Package, opts
     out.Add("@oc_nsites = constant i64 ").AddInt(g.nsites).Add("\n");
     out.AddBuf(g.globals);
     out.AddBuf(g.mod);
-    return out.String(), g.errors == 0;
+    res: Output;
+    res.IR = out.String();
+    res.Ok = g.errors == 0;
+    res.UsesFFI = g.usesFFI;
+    res.UsesCurl = g.usesCurl;
+    return res;
 }
 
 // emitGenericMethods registers, for every boxed type with a matching generic

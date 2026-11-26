@@ -2,50 +2,103 @@ package check;
 import "github.com/ocean-foundation/ocean/compiler/ast";
 
 // Field placement within a struct: byte offset of its storage unit, and for
-// bitfields the bit offset/width within that unit.
-struct FieldPlace { offset int; unitBits int; bitOffset int; bits int; unit int; }
+// bitfields the bit offset/width and backing unit byte size within that unit.
+struct FieldPlace { offset int; unitBits int; bitOffset int; bits int; unit int; unitSize int; }
 
-struct StructLayout { size int; align int; places []*FieldPlace; units []int; unitOffsets []int; }
+struct StructLayout { size int; align int; places []*FieldPlace; units []int; unitOffsets []int; overflow bool; }
+
+maxBitfieldWidth := 64;
+
+func maxStaticSize(c *Checker) int { return c.PtrSize() == 4 ? 2147483647 : 9223372036854775807; }
+
+func addCap(a int, b int, cap int) (int, bool) {
+    if (a < 0 || b < 0) return cap, true;
+    if (a > cap - b) return cap, true;
+    return a + b, false;
+}
+
+func mulCap(a int, b int, cap int) (int, bool) {
+    if (a == 0 || b == 0) return 0, false;
+    if (a < 0 || b < 0) return cap, true;
+    if (a > cap / b) return cap, true;
+    return a * b, false;
+}
+
+func alignCap(n int, a int, cap int) (int, bool) {
+    if (a <= 1) return n, false;
+    rem := n % a;
+    if (rem == 0) return n, false;
+    return addCap(n, a - rem, cap);
+}
+
+func copyStructLayout(dst *StructLayout, src *StructLayout) {
+    dst.size = src.size;
+    dst.align = src.align;
+    dst.places = src.places;
+    dst.units = src.units;
+    dst.unitOffsets = src.unitOffsets;
+    dst.overflow = src.overflow;
+}
+
+func (c *Checker) hasLayoutOverflow(t *ast.Type) bool {
+    if (nilT(t)) return false;
+    ov, ok := c.layoutOverflow[TypeKey(t)];
+    return ok && ov;
+}
 
 func structLayout(c *Checker, fields []*ast.FieldInfo) *StructLayout {
     l := new(StructLayout);
+    cap := maxStaticSize(c);
+    ov := false;
     off := 0; maxAlign := 1;
     i := 0;
     for (i < len(fields)) {
         f := fields[i];
-        if (f.bits > 0) {
+        if (f.bits > 0 && f.bits <= maxBitfieldWidth) {
             // gather a run of bitfields packed into one unit (<= 64 bits)
             total := 0;
             start := i;
-            for (i < len(fields) && fields[i].bits > 0 && total + fields[i].bits <= 64) { total += fields[i].bits; i++; }
+            for (i < len(fields) && fields[i].bits > 0 && fields[i].bits <= maxBitfieldWidth - total) { total += fields[i].bits; i++; }
             a := intAlign(total); sz := intSize(total);
-            off = align(off, a);
+            noff, ov1 := alignCap(off, a, cap);
+            if (ov1) ov = true;
+            off = noff;
             if (a > maxAlign) maxAlign = a;
             bitPos := 0;
             unit := len(l.units);
             for (j := start; j < i; j++) {
                 p := new(FieldPlace);
-                p.offset = off; p.unitBits = total; p.bitOffset = bitPos; p.bits = fields[j].bits; p.unit = unit;
+                p.offset = off; p.unitBits = total; p.bitOffset = bitPos; p.bits = fields[j].bits; p.unit = unit; p.unitSize = sz;
                 bitPos += fields[j].bits;
                 l.places.append(p);
             }
             l.units.append(total);
             l.unitOffsets.append(off);
-            off += sz;
+            noff2, ov2 := addCap(off, sz, cap);
+            if (ov2) ov = true;
+            off = noff2;
             continue;
         }
         a := c.AlignOf(f.ty); sz := c.SizeOf(f.ty);
-        off = align(off, a);
+        if (c.hasLayoutOverflow(f.ty)) ov = true;
+        noff, ov1 := alignCap(off, a, cap);
+        if (ov1) ov = true;
+        off = noff;
         if (a > maxAlign) maxAlign = a;
         p := new(FieldPlace);
         p.offset = off; p.unit = -1;
         l.places.append(p);
-        off += sz;
+        noff2, ov2 := addCap(off, sz, cap);
+        if (ov2) ov = true;
+        off = noff2;
         i++;
     }
     if (off == 0) off = 1;
-    l.size = align(off, maxAlign);
+    lsz, ov3 := alignCap(off, maxAlign, cap);
+    if (ov3) ov = true;
+    l.size = lsz;
     l.align = maxAlign;
+    l.overflow = ov;
     return l;
 }
 
@@ -53,17 +106,23 @@ func (c *Checker) StructLayoutOf(t *ast.Type) *StructLayout {
     key := TypeKey(t);
     l, ok := c.layoutMemo[key];
     if (ok) return l;
-    l = structLayout(c, c.FieldsOf(t));
-    c.layoutMemo[key] = l;
-    return l;
+    stub := new(StructLayout); stub.size = 1; stub.align = 1;
+    c.layoutMemo[key] = stub;
+    res := structLayout(c, c.FieldsOf(t));
+    copyStructLayout(stub, res);
+    if (stub.overflow) c.layoutOverflow[key] = true;
+    return stub;
 }
 // FieldsLayout lays out an anonymous field list (tuples, variant payloads), memoized by key.
 func (c *Checker) FieldsLayout(key string, fields []*ast.FieldInfo) *StructLayout {
     l, ok := c.layoutMemo[key];
     if (ok) return l;
-    l = structLayout(c, fields);
-    c.layoutMemo[key] = l;
-    return l;
+    stub := new(StructLayout); stub.size = 1; stub.align = 1;
+    c.layoutMemo[key] = stub;
+    res := structLayout(c, fields);
+    copyStructLayout(stub, res);
+    if (stub.overflow) c.layoutOverflow[key] = true;
+    return stub;
 }
 
 // payload layout of an enum variant as a struct of its fields
@@ -82,31 +141,43 @@ func (c *Checker) TupleLayout(results []*ast.Type) *StructLayout {
     key := "tuple" + TypeKey(TupleOf(results));
     l, ok := c.layoutMemo[key];
     if (ok) return l;
+    stub := new(StructLayout); stub.size = 1; stub.align = 1;
+    c.layoutMemo[key] = stub;
     fs := make([]*ast.FieldInfo);
     for (i, r := range results) { f := new(ast.FieldInfo); f.name = itoa(i); f.ty = r; fs.append(f); }
-    l = structLayout(c, fs);
-    c.layoutMemo[key] = l;
-    return l;
+    res := structLayout(c, fs);
+    copyStructLayout(stub, res);
+    if (stub.overflow) c.layoutOverflow[key] = true;
+    return stub;
 }
 // VariantLayout gives the payload layout of variant idx of enum t.
 func (c *Checker) VariantLayout(t *ast.Type, idx int) *StructLayout {
     key := "variant" + TypeKey(t) + "#" + itoa(idx);
     l, ok := c.layoutMemo[key];
     if (ok) return l;
+    stub := new(StructLayout); stub.size = 1; stub.align = 1;
+    c.layoutMemo[key] = stub;
     vs := c.VariantsOf(t);
-    l = structLayout(c, c.VariantFields(vs[idx]));
-    c.layoutMemo[key] = l;
-    return l;
+    res := structLayout(c, c.VariantFields(vs[idx]));
+    copyStructLayout(stub, res);
+    if (stub.overflow) { c.layoutOverflow[key] = true; c.layoutOverflow[TypeKey(t)] = true; }
+    return stub;
 }
 func enumPayload(c *Checker, t *ast.Type) (int, int) {
-    size := 0; al := 1;
+    sz, al, _ := enumPayloadCap(c, t);
+    return sz, al;
+}
+
+func enumPayloadCap(c *Checker, t *ast.Type) (int, int, bool) {
+    size := 0; al := 1; ov := false;
     for (i, v := range c.VariantsOf(t)) {
         if (v.vkind == 0 || (v.vkind == 3 && nilT(v.fixedType))) continue;
         l := c.VariantLayout(t, i);
+        if (l.overflow) ov = true;
         if (l.size > size) size = l.size;
         if (l.align > al) al = l.align;
     }
-    return size, al;
+    return size, al, ov;
 }
 
 // EnumPayloadOffset is the byte offset of the payload after the tag.
@@ -122,36 +193,62 @@ func (c *Checker) SizeOf(t *ast.Type) int {
         key := TypeKey(t);
         v, ok := c.sizeMemo[key];
         if (ok) return v;
-        v = sizeOf1(c, t);
-        c.sizeMemo[key] = v;
-        return v;
+        c.sizeMemo[key] = c.PtrSize();
+        sz, ov := sizeOf1Cap(c, t);
+        c.sizeMemo[key] = sz;
+        if (ov) c.layoutOverflow[key] = true;
+        return sz;
     }
-    return sizeOf1(c, t);
+    sz, _ := sizeOf1Cap(c, t);
+    return sz;
 }
-func sizeOf1(c *Checker, t *ast.Type) int {
+func sizeOf1Cap(c *Checker, t *ast.Type) (int, bool) {
+    cap := maxStaticSize(c);
     switch (t.kind) {
-    case ast.TK.Bool: return 1;
-    case ast.TK.Int: return intSize(t.bits);
-    case ast.TK.Float: return t.bits / 8;
-    case ast.TK.String, ast.TK.Ptr, ast.TK.Dyn, ast.TK.Map: return c.PtrSize();
-    case ast.TK.Interface, ast.TK.Func, ast.TK.Union, ast.TK.Family: return 2 * c.PtrSize();
-    case ast.TK.Named: return c.SizeOf(Underlying(t));
+    case ast.TK.Bool: return 1, false;
+    case ast.TK.Int: return intSize(t.bits), false;
+    case ast.TK.Float: return t.bits / 8, false;
+    case ast.TK.String, ast.TK.Ptr, ast.TK.Dyn, ast.TK.Map: return c.PtrSize(), false;
+    case ast.TK.Interface, ast.TK.Func, ast.TK.Union, ast.TK.Family: return 2 * c.PtrSize(), false;
+    case ast.TK.Named:
+        u := Underlying(t);
+        if (u == t || u.kind == ast.TK.Invalid) return 0, false;
+        sz := c.SizeOf(u);
+        return sz, c.hasLayoutOverflow(u);
     case ast.TK.Array:
-        if (t.len < 0) return c.PtrSize();
-        return align(c.ArrayDataOffset(t.elem) + t.len * c.SizeOf(t.elem), c.AlignOf(t));
+        if (t.len < 0) return c.PtrSize(), false;
+        elemSz := c.SizeOf(t.elem);
+        ov := c.hasLayoutOverflow(t.elem);
+        prod, ov1 := mulCap(t.len, elemSz, cap); if (ov1) ov = true;
+        dataOff, ovd := alignCap(8, c.AlignOf(t.elem), cap); if (ovd) ov = true;
+        sum, ov2 := addCap(dataOff, prod, cap); if (ov2) ov = true;
+        res, ov3 := alignCap(sum, c.AlignOf(t), cap); if (ov3) ov = true;
+        return res, ov;
     case ast.TK.Buffer:
-        if (nilT(t.elem)) return 2 * c.PtrSize();
-        if (t.len > 0) return t.len * c.SizeOf(t.elem);
-        return c.PtrSize();
-    case ast.TK.Struct: return c.StructLayoutOf(t).size;
+        if (nilT(t.elem)) return 2 * c.PtrSize(), false;
+        if (t.len > 0) {
+            elemSz := c.SizeOf(t.elem);
+            ov := c.hasLayoutOverflow(t.elem);
+            prod, ov1 := mulCap(t.len, elemSz, cap); if (ov1) ov = true;
+            return prod, ov;
+        }
+        return c.PtrSize(), false;
+    case ast.TK.Struct:
+        l := c.StructLayoutOf(t);
+        return l.size, l.overflow;
     case ast.TK.Enum:
-        size, al := enumPayload(c, t);
-        if (size == 0) return 8;
+        size, al, ov := enumPayloadCap(c, t);
+        if (size == 0) return 8, ov;
         a := al > 8 ? al : 8;
-        return align(align(8, al) + size, a);
-    case ast.TK.Tuple: return c.TupleLayout(t.results).size;
+        off, ov1 := alignCap(8, al, cap); if (ov1) ov = true;
+        sum, ov2 := addCap(off, size, cap); if (ov2) ov = true;
+        tot, ov3 := alignCap(sum, a, cap); if (ov3) ov = true;
+        return tot, ov;
+    case ast.TK.Tuple:
+        l := c.TupleLayout(t.results);
+        return l.size, l.overflow;
     }
-    return c.PtrSize();
+    return c.PtrSize(), false;
 }
 
 func (c *Checker) AlignOf(t *ast.Type) int {
@@ -159,6 +256,7 @@ func (c *Checker) AlignOf(t *ast.Type) int {
         key := TypeKey(t);
         v, ok := c.alignMemo[key];
         if (ok) return v;
+        c.alignMemo[key] = 1;
         v = alignOf1(c, t);
         c.alignMemo[key] = v;
         return v;
@@ -170,7 +268,10 @@ func alignOf1(c *Checker, t *ast.Type) int {
     case ast.TK.Bool: return 1;
     case ast.TK.Int: return intAlign(t.bits);
     case ast.TK.Float: return t.bits / 8;
-    case ast.TK.Named: return c.AlignOf(Underlying(t));
+    case ast.TK.Named:
+        u := Underlying(t);
+        if (u == t || u.kind == ast.TK.Invalid) return 1;
+        return c.AlignOf(u);
     case ast.TK.Array:
         if (t.len < 0) return c.PtrSize();
         a := c.AlignOf(t.elem);
@@ -190,3 +291,128 @@ func alignOf1(c *Checker, t *ast.Type) int {
 // PtrSize is the target's pointer width in bytes (4 on wasm32).
 func (c *Checker) PtrSize() int { return c.ptrSize > 0 ? c.ptrSize : 8; }
 func (c *Checker) SetPtrSize(n int) { c.ptrSize = n; }
+
+// Limit recursive generic expansion before building an unbounded layout or
+// descriptor graph. The key size also catches instances that grow in breadth.
+func typeExpansionExceeded(c *Checker, at *ast.Node, depth int, key string) bool {
+    if (depth <= 128 && (depth <= 1 || len(key) <= 65536)) return false;
+    id := nodeKey(at);
+    reported, _ := c.typeExpansionErrors[id];
+    if (!reported) {
+        c.typeExpansionErrors[id] = true;
+        err(c, at, "generic type expansion exceeds compiler limits");
+    }
+    return true;
+}
+
+func layoutReady(c *Checker, at *ast.Node, t *ast.Type, seen *map[string]bool, depth int) bool {
+    if (nilT(t)) return true;
+    switch (t.kind) {
+    case ast.TK.Invalid, ast.TK.Void, ast.TK.Bool, ast.TK.Int, ast.TK.Float, ast.TK.String, ast.TK.Null, ast.TK.Param, ast.TK.Family, ast.TK.UntypedInt, ast.TK.UntypedFloat:
+        return true;
+    }
+    if (len(t.args) > 0) depth++;
+    k := TypeKey(t);
+    sv, sok := (*seen)[k];
+    if (sok && sv) return true;
+    if (typeExpansionExceeded(c, at, depth, k)) return false;
+    (*seen)[k] = true;
+    switch (t.kind) {
+    case ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
+        return nilT(t.elem) || layoutReady(c, at, t.elem, seen, depth);
+    case ast.TK.Map:
+        return layoutReady(c, at, t.key, seen, depth) && layoutReady(c, at, t.elem, seen, depth);
+    case ast.TK.Tuple, ast.TK.Func:
+        for (_, p := range t.params) { if (!layoutReady(c, at, p, seen, depth)) return false; }
+        for (_, r := range t.results) { if (!layoutReady(c, at, r, seen, depth)) return false; }
+        return true;
+    case ast.TK.Union:
+        for (_, term := range t.terms) { if (!layoutReady(c, at, term, seen, depth)) return false; }
+        return true;
+    case ast.TK.Interface:
+        if (!nilS(t.sym) && t.sym.state != 2) return false;
+        for (_, term := range t.terms) { if (!layoutReady(c, at, term, seen, depth)) return false; }
+        return true;
+    case ast.TK.Named:
+        if (!nilS(t.sym) && t.sym.state != 2) return false;
+        u := Underlying(t);
+        if (u != t && !layoutReady(c, at, u, seen, depth)) return false;
+        return true;
+    case ast.TK.Struct:
+        if (!nilS(t.sym) && t.sym.state != 2) return false;
+        for (_, a := range t.args) { if (!layoutReady(c, at, a, seen, depth)) return false; }
+        for (_, f := range c.FieldsOf(t)) { if (!layoutReady(c, at, f.ty, seen, depth)) return false; }
+        return true;
+    case ast.TK.Enum:
+        if (!nilS(t.sym) && t.sym.state != 2) return false;
+        for (_, a := range t.args) { if (!layoutReady(c, at, a, seen, depth)) return false; }
+        for (_, v := range c.VariantsOf(t)) {
+            for (_, pt := range v.types) { if (!layoutReady(c, at, pt, seen, depth)) return false; }
+            for (_, pf := range v.fields) { if (!layoutReady(c, at, pf.ty, seen, depth)) return false; }
+            if (!nilT(v.fixedType) && !layoutReady(c, at, v.fixedType, seen, depth)) return false;
+        }
+        return true;
+    }
+    return true;
+}
+
+func checkLayoutWalk(c *Checker, at *ast.Node, t *ast.Type, seen *map[string]bool) bool {
+    if (nilT(t)) return false;
+    switch (t.kind) {
+    case ast.TK.Invalid, ast.TK.Void, ast.TK.Bool, ast.TK.Int, ast.TK.Float, ast.TK.String, ast.TK.Null, ast.TK.Param, ast.TK.Family, ast.TK.UntypedInt, ast.TK.UntypedFloat:
+        return false;
+    }
+    k := TypeKey(t);
+    sv, sok := (*seen)[k];
+    if (sok && sv) return false;
+    (*seen)[k] = true;
+    hasP := HasParams(t);
+    if (!hasP && (t.kind == ast.TK.Struct || t.kind == ast.TK.Enum || t.kind == ast.TK.Array || t.kind == ast.TK.Buffer || t.kind == ast.TK.Tuple || t.kind == ast.TK.Named)) {
+        c.SizeOf(t);
+        if (c.hasLayoutOverflow(t)) {
+            err(c, at, "type size exceeds maximum addressable size");
+            return true;
+        }
+    }
+    switch (t.kind) {
+    case ast.TK.Dyn, ast.TK.Array, ast.TK.Buffer:
+        if (!nilT(t.elem) && checkLayoutWalk(c, at, t.elem, seen)) return true;
+    case ast.TK.Map:
+        if (checkLayoutWalk(c, at, t.key, seen)) return true;
+        if (checkLayoutWalk(c, at, t.elem, seen)) return true;
+    case ast.TK.Tuple, ast.TK.Func:
+        for (_, p := range t.params) { if (checkLayoutWalk(c, at, p, seen)) return true; }
+        for (_, r := range t.results) { if (checkLayoutWalk(c, at, r, seen)) return true; }
+    case ast.TK.Union, ast.TK.Interface:
+        for (_, term := range t.terms) { if (checkLayoutWalk(c, at, term, seen)) return true; }
+    case ast.TK.Named:
+        u := Underlying(t);
+        if (u != t && checkLayoutWalk(c, at, u, seen)) return true;
+    case ast.TK.Struct:
+        for (_, a := range t.args) { if (checkLayoutWalk(c, at, a, seen)) return true; }
+        if (hasP) {
+            for (_, f := range c.FieldsOf(t)) { if (checkLayoutWalk(c, at, f.ty, seen)) return true; }
+        }
+    case ast.TK.Enum:
+        for (_, a := range t.args) { if (checkLayoutWalk(c, at, a, seen)) return true; }
+        if (hasP) {
+            for (_, v := range c.VariantsOf(t)) {
+                for (_, pt := range v.types) { if (checkLayoutWalk(c, at, pt, seen)) return true; }
+                for (_, pf := range v.fields) { if (checkLayoutWalk(c, at, pf.ty, seen)) return true; }
+                if (!nilT(v.fixedType) && checkLayoutWalk(c, at, v.fixedType, seen)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+func (c *Checker) CheckLayoutSize(at *ast.Node, t *ast.Type) bool {
+    if (nilT(t)) return false;
+    readySeen: map[string]bool;
+    if (!layoutReady(c, at, t, &readySeen, 0)) {
+        failed, _ := c.typeExpansionErrors[nodeKey(at)];
+        return failed;
+    }
+    seen: map[string]bool;
+    return checkLayoutWalk(c, at, t, &seen);
+}
