@@ -94,7 +94,7 @@ func packVariadicConverted(g *Gen, slot string, data string, count string, sourc
     condBr(g, c, body, done);
     label(g, body);
     ep := gepDyn(g, data, i, sizeOf(g, source));
-    ev := conv(g, load(g, source, ep), elem);
+    ev := copyV(g, conv(g, load(g, source, ep), elem));
     dst := tmp(g);
     emit(g, dst + " = call ptr @oc_arr_push(ptr " + slot + ", i64 " + itoa(sizeOf(g, elem)) + ")");
     store(g, elem, dst, ev);
