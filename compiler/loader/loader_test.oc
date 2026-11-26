@@ -82,9 +82,11 @@ func TestTestHarness(t *testing.T) {
 func TestPaths(t *testing.T) {
     if (!ValidModulePath("github.com/a/b") || ValidModulePath("a//b") || ValidModulePath("../x") || ValidModulePath("a b")) t.Error("valid path");
     cwd := util.Getcwd();
-    if (RelativeSourcePath(cwd + "/x/y.oc") != "x/y.oc") t.Error("rel1 ", RelativeSourcePath(cwd + "/x/y.oc"));
+    if (RelativeSourcePath(util.JoinPath(cwd, "x/y.oc")) != "x/y.oc") t.Error("rel1 ", RelativeSourcePath(util.JoinPath(cwd, "x/y.oc")));
     if (RelativeSourcePath("./a.oc") != "a.oc") t.Error("rel2");
-    if (RelativeSourcePath(filepath.Dir(cwd) + "/z.oc") != "../z.oc") t.Error("rel3 ", RelativeSourcePath(filepath.Dir(cwd) + "/z.oc"));
+    if (RelativeSourcePath(util.JoinPath(filepath.Dir(cwd), "z.oc")) != "../z.oc") t.Error("rel3 ", RelativeSourcePath(util.JoinPath(filepath.Dir(cwd), "z.oc")));
+    if (relativeSourcePath("/work", "/z.oc") != "../z.oc") t.Error("root rel1");
+    if (relativeSourcePath("/work/sub", "/work//z.oc") != "../z.oc") t.Error("root rel2");
     if (relativeSourcePath("D:/a/ocean/ocean", "D:/a/ocean/ocean/x/y.oc") != "x/y.oc") t.Error("win rel1");
     if (relativeSourcePath("D:/a/ocean/ocean", "D:/a/ocean/z.oc") != "../z.oc") t.Error("win rel2");
     if (relativeSourcePath("D:/", "D:/x/y.oc") != "x/y.oc") t.Error("win rel3");

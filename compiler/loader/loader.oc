@@ -114,7 +114,8 @@ func relativeSourcePath(cwd string, path string) string {
         for (len(path) >= 2 && path[0] == '.' && path[1] == '/') path = path[2:];
         return path;
     }
-    cwd = util.NormalizePath(cwd);
+    cwd = util.Clean(util.NormalizePath(cwd));
+    path = util.Clean(path);
     common := 0; i := 0;
     for (i < len(cwd) && i < len(path) && cwd[i] == path[i]) {
         if (path[i] == '/') common = i + 1;
