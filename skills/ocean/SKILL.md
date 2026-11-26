@@ -19,14 +19,15 @@ argument or returned expression; strings display as `string`.
 
 ## Tooling and build workflow
 
-The compiler and installer are maintained at `https://github.com/ocean-foundation/ocean-c`;
+The Ocean compiler is written in Ocean (`github.com/ocean-foundation/ocean`);
 the matching standard library is at `https://github.com/ocean-foundation/ocean-src`.
 Clone them as sibling checkouts when building from source.
 
-An installed compiler is named `ocean`; `ocean-c` accepts the same interface.
-From a compiler checkout, build it with a C23 compiler, CMake, and libffi development
-headers. Clang must be on PATH to check, link, or run Ocean programs. LLVM development
-libraries are unnecessary: Ocean emits textual LLVM IR and invokes Clang.
+An installed compiler is named `ocean` (`ocean-c` is the legacy C bootstrap name).
+From a compiler checkout, build it with GNU Make using an installed bootstrap `ocean`
+compiler (with a matching standard library), Clang, libffi development headers,
+`pkg-config`, and Git. Clang must be on PATH to check, link, or run Ocean programs.
+LLVM development libraries are unnecessary: Ocean emits textual LLVM IR and invokes Clang.
 Wasm program/package code uses `-O1` for register coloring to stay within
 JavaScript engine local-variable limits; large shared reflection support keeps
 the default pipeline to bound compilation time. Native Windows executables
@@ -34,26 +35,19 @@ reserve an 8 MiB default stack. Native Windows run/test helpers use `.exe`
 paths, and deferred recovery uses the matching host CRT ABI.
 
 ```sh
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build --output-on-failure
-# Run the resulting build/ocean, or install:
-cmake --install build --prefix "$HOME/.local"
+make              # produces build/ocean
+make selfhost     # produces build/ocean-stage2
+make test         # runs compiler unit tests
+make runtime      # regenerates compiler/runtime/source.oc after editing compiler/runtime/*.c
 ```
 
-Build with `make VERSION=1.2.3` (default: `dev`), or configure CMake with
-`cmake -S . -B build -DOCEAN_VERSION=1.2.3` before building. The Make wrapper
-uses `build/` by default; override it with `BUILD_DIR=...`. `ocean -v` and
-`ocean --version` print the version, full Git commit hash, commit date, UTC build
-date, and copyright year from the commit date. Metadata refreshes on each build. When all commit fields are supplied,
-metadata generation skips Git discovery and copies its header within CMake
-without launching a nested CMake process (important under RISC-V QEMU).
-Unchanged header contents retain their timestamp for compiler-object caching.
-Source archives without Git metadata report `unknown` for commit fields.
-`SOURCE_DATE_EPOCH` can fix the build timestamp for reproducible builds.
-The top-level `-v` does not change `ocean test -v` (verbose test reporting).
-Module/package resolution, program builds, and standard-library integration are
-unchanged.
+Override the bootstrap compiler or version with `make OCEAN=/path/to/ocean VERSION=1.2.3`
+(default: `VERSION=dev`). `ocean -v` and `ocean --version` print the ASCII art logo,
+version, full Git commit hash, commit date, UTC build date, and copyright year from
+the commit date; `ocean logo` prints only the logo. Metadata is injected via
+`-ldflags "-X importpath.name=value"` (supported by `ocean build` and `ocean run` to
+set package-level `string` variables). `SOURCE_DATE_EPOCH` can fix the build timestamp
+for reproducible builds. The top-level `-v` does not change `ocean test -v` (verbose test reporting).
 
 The compiler repository also contains an interactive release installer in
 `installer/`. Build it with `ocean build installer -o installer/ocean-installer` and
@@ -87,7 +81,7 @@ Tagged compiler releases build all seven native targets: Linux x86_64,
 AArch64, and RISC-V64; macOS x86_64 and AArch64; Windows x86_64 and AArch64.
 Release builds pass the literal tag and commit/date metadata through Make.
 Metadata can also be supplied as `COMMIT`, `COMMIT_DATE`, `COMMIT_YEAR`, and
-`BUILD_DATE` Make variables (or corresponding `OCEAN_...` CMake settings).
+`BUILD_DATE` Make variables.
 Compiler and installer tar assets use `<name>_<version>_<arch>-<os>.tar`;
 Windows additionally gets zip assets. Archives contain one executable only.
 The installer is entirely native Ocean. Matching ocean-deps tar.xz assets
@@ -124,8 +118,9 @@ IDs before signing the tools/libraries.
 The Ubuntu 26.04 RISC-V build also installs `libjitterentropy3-dev`, required by
 that distribution's static OpenSSL libraries.
 
-Build Windows compilers with native LLVM/MinGW (MSYS2 CLANG64 or CLANGARM64),
-CMake, Make/Ninja, and target-matching libffi headers. Ocean programs require a
+Build Windows compilers with GNU Make from an MSYS2 CLANG64 or CLANGARM64 shell
+using native LLVM/MinGW, `llvm-ar`, `pkg-config`, target-matching libffi headers,
+and a bootstrap `ocean.exe` on PATH. Ocean programs require a
 Windows GNU/MinGW Clang toolchain on PATH. Decimal floating-point literals are
 converted directly to binary64 rather than accumulated in host `long double`, including on Windows ARM64.
 Integer literals through 64 bits use fixed-width storage on every native host, including Windows where C `long` is 32-bit; larger literals retain their exact magnitude for wide integer types.
@@ -136,8 +131,7 @@ Windows unit tests use captured reports, not the Unix live terminal frontend.
 Package/module resolution and installed `bin/`/`src/` layout are unchanged.
 
 Installation places the executable in `bin/` and standard-library sources in
-`src/`. CMake's `OCEAN_STANDARD_LIBRARY_SOURCE` selects the library source tree
-(default: sibling `../ocean-src`). `OCEAN_SRC` overrides the runtime source lookup;
+`src/`. `OCEAN_SRC` overrides the runtime source lookup;
 otherwise it is `<executable-directory>/../src`. Keep standard-library source
 files and package directories intact; do not precompile the library.
 
@@ -145,15 +139,21 @@ In an Ocean project:
 
 ```sh
 ocean mod init codeberg.org/example/application
+ocean fetch codeberg.org/example/collections@v1.2.3
+ocean fetch
 ocean check .
 ocean test .
 ocean run . arg1 --verbose
 ocean build . -o application
 ocean build --emit-llvm . -o application.ll
 ocean build --check .
+ocean target --list
+ocean target x86_64-windows riscv64-linux wasm-js
+ocean target --remove x86_64-windows
 ocean check --lsp
 ocean clean --cache
 ocean fix ./...
+ocean logo
 ```
 
 `ocean fix [location...]` rewrites the removed postfix type syntax (`int[]`,
@@ -302,7 +302,8 @@ func main() int { return helper.Answer(); }
 ```
 
 Imports resolve within the module, the standard-library source tree, or external
-Git repositories over HTTPS. Module-relative imports such as `"helper"` work.
+modules declared in `ocean.mod` and fetched ahead of time with `ocean fetch`.
+Module-relative imports such as `"helper"` work.
 The default qualifier is the imported package's declared name, except at a module
 root: importing any root package uses the final component of the module import
 path, regardless of its package declaration (including `package main;`). For
@@ -319,13 +320,31 @@ Capitalized names are exported (including types, globals, and receiver methods);
 lowercase names remain package-private. Extern declarations are file-scoped and
 are not exported. Import cycles and conflicting declarations fail.
 
-External modules cache under `~/.cache/ocean/modules/<module>@<version>`;
-`OCEAN_MOD_CACHE` overrides this path. Undeclared conventional
-`host/owner/repository/subpackage` imports use the repository's default branch.
-There is no module proxy or Go vanity-URL discovery. Prefer declared versions
-for reproducible dependencies. Dependencies initialize before importers; files
-initialize in filename order, then declaration order. Globals initially have
-zero values, even when their explicit initializer has not run yet.
+Unknown external modules are **not** automatically fetched during compilation
+(`ocean build`, `ocean check`, or `ocean test`); declare and fetch remote
+dependencies explicitly with `ocean fetch`:
+
+- `ocean fetch <url>[@version]` (`@latest` or a Git tag; defaults to `latest`)
+  clones the dependency with Git hooks and interactive prompts disabled into
+  `$OCEAN_MOD_CACHE` or `$HOME/.cache/ocean/modules/<module>@<version|latest>`
+  (failing if neither is set rather than falling back to `/tmp`; slashes in
+  versions are encoded as `%2F`), adds or updates `ocean.mod`, and records the
+  dependency's deterministic SHA-256 checksum (computed over sorted relative
+  file paths and contents, excluding `.git/`) in the root project's `ocean.sum`.
+- If `<url>` is already declared in `ocean.mod` and no `@version` is passed,
+  `ocean fetch <url>` fetches the recorded version without altering `ocean.mod`.
+- Bare `ocean fetch` follows dependency declarations in the root `ocean.mod` and
+  transitively in each dependency's `ocean.mod`, recording all checksums in the
+  root `ocean.sum`.
+- `ocean build`, `ocean check`, and `ocean test` verify cached external
+  dependencies against the root project's `ocean.sum` and refuse to compile if
+  any dependency is missing from the cache, absent from `ocean.sum`, or modified
+  since download.
+
+There is no module proxy or Go vanity-URL discovery. Dependencies initialize
+before importers; files initialize in filename order, then declaration order.
+Globals initially have zero values, even when their explicit initializer has not
+run yet.
 
 ## Core syntax
 
@@ -493,11 +512,25 @@ type, as in `small: f32 = 1.5;`, and defaults to `float` without a narrower
 context.
 
 Use `value -> Type` for casts and parentheses for compound targets, such as
-`raw -> (*Point)` or `value -> (pkg.Type)`. Arithmetic, bit operations,
-comparisons, compound assignments, `++`, `--`, short-circuit `&&`/`||`, and
-`condition ? yes : no` work. `sizeof(value)` does not evaluate its operand;
-`zero(Type)` takes a type and produces its default value. Uninitialized locals
-are defaulted. Explicit returns avoid implicit zero-return warnings.
+`raw -> (*Point)` or `value -> (pkg.Type)`. Float-to-int casts truncate toward
+zero and **saturate** on `NaN` (`0`), `±Inf`, and out-of-range values to the
+destination type's bounds. Fixed-array casts (`[M]T -> [N]U`) are permitted only
+when both element types are unowned and total payload byte sizes are equal
+(`M * sizeof(T) == N * sizeof(U)`). Pointers to `string` cannot be cast to or
+from pointers or buffers to mutable values (such as `*[]i8` or `buffer<i8>`).
+Unboxing `any`/interface values to a concrete type uses type assertions `x.(T)`
+or type switches `x.(type)`, not `->`; narrowing interface-to-interface casts
+(`wide -> Narrow`) preserve `null` and trap if a non-null dynamic value does not
+satisfy `Narrow`. Arithmetic, bit operations, comparisons, compound assignments,
+`++`, `--`, short-circuit `&&`/`||`, and `condition ? yes : no` work. Integer
+`+`, `-`, `*`, `++`, and `--` wrap at their width; integer division or remainder
+by `0` and shifting by a negative count raise a **recoverable panic**; signed
+`INT_MIN / -1` wraps to `INT_MIN` (`INT_MIN % -1 == 0`); and shifts by a count
+`>=` the operand bit width yield `0`. `sizeof(value)` does not evaluate its
+operand, and static type layout sizes must not exceed `isize::MAX` (`INT64_MAX`
+on 64-bit targets, `INT32_MAX` / 2 GiB on 32-bit/`wasm32`); `zero(Type)` takes a
+type and produces its default value. Uninitialized locals are defaulted. Explicit
+returns avoid implicit zero-return warnings.
 
 Multiple results unpack with `a, b := f();` or simultaneous assignment; `_`
 discards a result. Named results use `(total, count int)` and allow `return;`.
@@ -554,7 +587,10 @@ Control flow includes `if`/`else`, `for`, range loops, `switch`, `break`,
 `continue`, and explicit `fallthrough`. A one-binding range receives the index,
 not the element. Use `_` in either binding to discard it, such as
 `for (_, value := range values)`. `for (_ := range values)` runs once per
-entry without binding a variable. Type switches use `switch (v := value.(type)) { case int: ... }`.
+entry without binding a variable. `range` evaluates once and iterates over a
+snapshot of the collection (for arrays, dynamic arrays, strings, and maps
+alike), so mutating, resizing, or freeing the original collection during the
+loop does not invalidate traversal. Type switches use `switch (v := value.(type)) { case int: ... }`.
 Labels and `goto` are function-local and cannot enter nested scopes or skip
 in-scope declarations. An unrecovered `panic "message";` terminates with a diagnostic and call
 trace. `return panic "message";` reports at the caller. Use
@@ -589,11 +625,15 @@ function, so WebAssembly programs must not rely on `recover()`.
 An ordinary `panic` runs the function's defers, then its callers' defers as it
 propagates. `return panic` skips the originating function's defers. A caller
 that forwards that returned panic with `forward panic` also skips its defers;
-the first caller that does not forward runs its defers and can recover. Further
-propagation runs callers' defers normally. A direct panic inside
+the first caller that does not forward runs its defers and can recover. The
+runtime releases owned arguments and receivers captured by skipped deferred
+calls, as well as active defer captures and statement temporaries during panic
+unwinding. Further propagation runs callers' defers normally. A direct panic inside
 `forward panic { panic "hi"; }` runs local defers, as does an ordinary panic from
-a called function. An unrecovered panic prints its diagnostic and exits with
-status 1. A new panic in a deferred call starts unwinding from that call.
+a called function. Runtime panics (integer division/remainder by zero, negative
+shift counts, missing map key, null-interface method call, `unwrap` failures)
+are recoverable via `defer`/`recover`. An unrecovered panic prints its diagnostic
+and exits with status 1. A new panic in a deferred call starts unwinding from that call.
 
 Compiler CLI, module/package discovery, and build configuration use the existing
 commands. Callable values can cross Ocean package boundaries; ordinary standard-library
@@ -609,8 +649,8 @@ Choose the collection explicitly; these types have different storage and APIs:
 | `[n]T` | Value array with length in its type when constant; immutable `.size` is payload bytes, `.data` exposes raw elements. |
 | `array<T>` | Length-independent array value/constraint; accepts `[n]T` of any length. |
 | `[]T` | Heap-backed dynamic array with length, capacity, and data; grows with mutation methods. |
-| `buffer<T, n>` | Raw unchecked storage with lexical length metadata. |
-| `buffer<T>` | Raw pointer view, without stored length or ownership. |
+| `buffer<T, n>` | Raw unchecked storage with lexical length metadata; runtime `buffer<T, n>` and `buffer<T>{…}` literals are block-scoped stack views. |
+| `buffer<T>` | Non-nullable raw pointer view, without stored length or ownership (`zero(buffer<T>)` is `0x0`; use `Optional<buffer<T>>` if nullable). |
 | `string` | Immutable heap-backed bytes; capacity equals length. |
 | `map[K]V` | Hash map with independently typed keys and values; interface sides always allow mixed concrete types. |
 
@@ -686,20 +726,34 @@ Pointers and buffer views copy addresses. Use `*T`, `&value`, and `*pointer` for
 shared access; `*[]T` points to a dynamic array while `[]*T` holds pointers.
 For a sized pointee, `p + n`, `n + p`, and `p - n` count elements. Pointer
 updates use `+=`, `-=`, `++`, and `--`. Subtract identical pointer types into
-one array to get an `int` element difference. Arithmetic has no bounds checks
-and traps on `null`. `ip: *int = 5;` and `ip := 5->(*int);` both initialize the
+one array to get an `int` element difference. Pointer arithmetic has no bounds
+checks. `ip: *int = 5;` and `ip := 5->(*int);` both initialize the
 pointer to address `0x5`. Use an explicit cast for integer addresses in
 reassignments and function arguments, as in `ip = 5->(*int)` or `f(5->(*int))`.
 A sized buffer casts to its storage address (`st: buffer<i8, 256>; a := st->int;`
 or `st->(*int)`), and an integer address casts directly to a view, as in
 `f((a + 19)->(buffer<i8>))` or `(a + 48)->(buffer<i8, 4>)`.
+Runtime `buffer<T, n>` allocations and `buffer<T>{…}` literals allocate
+block-scoped stack storage (live until block exit; repeated evaluations in a
+loop do not invalidate earlier live views in the same block). Directly returning
+such a stack buffer emits a compiler warning (casting to `*T` or returning
+`&buf` does not).
 `new(T)` returns an explicitly managed `*T` initialized to `zero(T)`;
 `free(pointer)` releases owned contents and the allocation, without following
-pointer fields. Pointer scope exit never frees the pointee. `free(items)` can
-release dynamic storage early; recreate it before further use.
+pointer fields. Calling `free(&local)` or `free(&global)` is a compile error.
+`free(p)` leaves the pointer value intact and invalidates all aliases to that
+allocation; the compiler does not track freed raw pointers, so accessing a
+released allocation or freeing twice is undefined behavior. Pointer scope exit
+never frees the pointee. `free(items)` can release dynamic storage early;
+recreate it before further use.
 
-Explicit `null` is distinct from a default zero-address pointer. Initialize list
-terminators explicitly: `p: *Node = null;`. `p := null` cannot infer a type.
+Raw pointers (`*T` and `*void`) and unsized buffers (`buffer<T>`) are
+**non-nullable**: `null` cannot be assigned to or compared with them. An
+uninitialized pointer or `zero(*T)` is address `0x0`, which is a valid machine
+address on flat-memory targets and corresponds directly to C `NULL`. Use
+`Optional<*T>` (or `Optional<buffer<T>>`) when a pointer may be absent. `null`
+is only for interfaces, `any`, `Optional<T>`, and unions, and `p := null`
+cannot infer a type.
 Strings compare byte contents with `==`/`!=` and support unsigned-byte
 lexicographic ordering with `<`, `<=`, `>`, and `>=`. String-to-`[]i8` conversions copy.
 String `.data` in a call is an isolated temporary buffer valid for that call;
@@ -1166,8 +1220,9 @@ other native output failures return errors.
 `Optional<T>` needs no imports or standard-library files. It is an enum with
 `Optional<T>.value(value)` carrying one `T` and `Optional<T>.none` carrying no
 payload. `none` equals `null`; assigning `null` to an optional selects `none`.
-Uninitialized optionals and `zero(Optional<T>)` are `none`. `value(null)` is still
-`value` when `T` is nullable, so it does not equal `null`.
+Uninitialized optionals and `zero(Optional<T>)` are `none`. `Optional<*int>.value(zero(*int))`
+and `Optional<any>.value(null)` are still `value`, so they do not equal `null`.
+Raw `*T` and unsized `buffer<T>` are non-nullable (use `Optional<*T>` or `Optional<buffer<T>>`).
 The built-in `hasValue() bool` method returns true for `value` and false for `none`,
 including true for `value(null)`.
 The built-in `unwrap() T` method returns the payload of `value` (including a null
@@ -1220,8 +1275,7 @@ A user-declared Result may shadow the built-in name and remains a distinct type.
 `unwrapOrElse` accepts a value, not a callback; its argument is evaluated with
 normal function-call rules even when the Result holds a value. Payloads and
 fallbacks retain ordinary value-copy and ownership behavior. `zero(T)` follows
-Ocean's existing zero semantics, including a zero-address pointer distinct from
-explicit `null`.
+Ocean's existing zero semantics, including the zero-address pointer `zero(*T)` (`0x0`).
 
 ```ocean
 package main;
@@ -1270,14 +1324,27 @@ unchanged.
 `u32`, `u16`, and `u8` values as decimal strings across their full ranges,
 including 18446744073709551615 for `uint`/`u64`.
 
-### WebAssembly backend
+### Cross-compilation and WebAssembly
+
+By default, compilation targets the host platform. Set both `OCOS` and `OCARCH`
+for `ocean build` or `ocean check`: Linux supports `x86_64`, `aarch64`, and
+`riscv64`; macOS and Windows support `x86_64` and `aarch64`; and
+`OCOS=js OCARCH=wasm` targets `wasm32-unknown-unknown`. `ocean run` and
+`ocean test` require the host target. `ocean target --list` lists available
+targets with their `OCOS`/`OCARCH` pairs and toolchain readiness;
+`ocean target <target>...` installs managed toolchain components (stored in
+`~/.ocean/targets` or `%LOCALAPPDATA%/Ocean/targets`, overridable via
+`OCEAN_TARGET_DIR`), and `ocean target --remove <target>...` removes them.
+`OCEAN_CLANG` and `OCEAN_SYSROOT` override managed toolchains. Running
+`ocean build --emit-llvm` for a non-host target emits program IR without
+needing the target runtime or toolchain.
 
 Use `OCOS=js OCARCH=wasm ocean build -o main.wasm` to emit a
 `wasm32-unknown-unknown` WebAssembly module for a JavaScript host. Set both
 environment variables together; leaving both unset uses the native host.
 The same target selection applies to `ocean check`, `--emit-llvm`, library
 objects, and cached package builds. Clang with WebAssembly support and
-`wasm-ld` must be installed. LLVM output includes the Wasm target triple.
+`wasm-ld` must be installed (or installed via `ocean target wasm-js`). LLVM output includes the Wasm target triple.
 
 The module exports `main` and imports unresolved runtime/extern functions
 from `env`. The JavaScript host must supply those imports, including any
@@ -1294,8 +1361,10 @@ supported. Module/package resolution and build inputs otherwise stay the same.
 
 `threads.Spawn(job func()) int` starts an OS thread from a function or closure.
 `CurrentID() int` returns 0 for main; worker IDs are positive and never reused.
-`Await(id int)` waits for completion and joins the native thread; repeat and
-concurrent awaits work. `IsDone(id int) bool` reports completion. Invalid IDs
+`Await(id int)` waits for completion; the native thread is joined once, and
+repeated or concurrent awaits on the same worker succeed. `IsDone(id int) bool`
+reports completion and keeps reporting completion for that ID until process
+shutdown. Invalid IDs
 panic; awaiting yourself panics. `Yield()` parks the caller until `Wake(id)`
 finds it yielded. Wake on running/completed threads does nothing and saves no
 wake token. Wake on an unknown ID panics.
@@ -1309,8 +1378,9 @@ Arbitrary blocking native calls and long inline assembly cannot be interrupted
 until control returns to a checkpoint. Return and cancellation are not panics;
 recover does not stop them. An unrecovered worker panic exits the process.
 
-`sync.Mutex` provides Lock, Unlock and TryLock; `sync.WaitGroup` provides Add,
-Done and Wait. Zero values work. These types use pointer receivers; never copy
+`sync.Mutex` provides `Lock`, `Unlock`, `TryLock`, `Destroy`, and `Close`;
+`sync.WaitGroup` provides `Add`, `Done`, `Wait`, `Destroy`, and `Close`. Zero
+values work. These types use pointer receivers; never copy
 them after first use. Add work before spawning it and reuse a WaitGroup only
 after preceding Wait calls return. Shared mutable data and existing library
 registries require caller synchronization. Closure capture does not make shared
@@ -1342,7 +1412,10 @@ panic for all ID-taking APIs; CurrentID panics on unregistered native threads.
 Spawn panics on an uninitialized function or native creation failure. Mutexes
 are nonrecursive and have no fairness guarantee; unlocking an unlocked mutex
 panics, and another thread may unlock a mutex. Native synchronization state is
-initialized lazily and retained until process shutdown. These APIs require the
+initialized lazily. Call `Destroy()` or `Close()` after all threads have
+finished using a `Mutex` or `WaitGroup` to release native resources explicitly;
+closing an already closed object or calling any operation on it panics. Process
+shutdown cleans up any objects that are still open. These APIs require the
 matching `threads` and `sync` standard-library sources.
 
 
@@ -1357,9 +1430,10 @@ Use the matching standard-library tree with the compiler fixes for mutable
 interface arrays, owned boxed array elements, enum payload tuples, and fields
 whose names match their types (for example `Header Header`). Mutable `[]any`
 remains homogeneous; use `mixed []any` for JSON arrays. Interface arrays support
-append/prepend/add/remove/pop and normal value-copy ownership. Recursive owning
-array/map layouts remain unsupported and report a diagnostic rather than
-crashing; use explicit pointers for recursive ownership.
+append/prepend/add/remove/pop and normal value-copy ownership. Value-embedding
+type cycles (through structs, enums, tuples, fixed arrays, sized buffers, or
+defined-type aliases) are rejected at compile time; use pointers, dynamic
+arrays, maps, or interfaces for recursive structures.
 
 ### encoding/json
 
@@ -1505,10 +1579,9 @@ Run `ocean test encoding/json net/http os/exec io` or `ocean test ./...` from th
 standard-library root. HTTP integration tests need local loopback socket access;
 no external network is used. Process tests use local Unix tools.
 
-At native C boundaries, use `zero(*void)` (or an appropriate zero-address pointer)
-for a C NULL argument. Ocean's explicit `null` is a distinct sentinel and must
-not be passed as C NULL. Compare native pointer results numerically with zero,
-for example `(handle -> int) == 0`, rather than with explicit `null`.
+At native C boundaries, raw pointers are non-nullable and `zero(*void)`
+(address `0x0`, or `zero(*T)`) corresponds directly to C `NULL`. Compare native
+pointer results with `handle == zero(*void)` or `(handle -> int) == 0`.
 
 ### Text, paths and the operating system
 
@@ -1528,12 +1601,18 @@ DecodeLast, Encode, Len, Valid, Count, Runes, FromRunes, RuneError.
 `os.PathSeparator` and `os.PathListSeparator`; `os.Windows*` functions
 (KnownFolder, LookupEnv, Stat, Mkdir, ReadDir, Rename, Remove) are Windows-only.
 
-`os` adds Getenv/LookupEnv/Setenv/Unsetenv, Getpid, Stat/Lstat (FileInfo: Name,
+`os` adds Getenv/LookupEnv/Setenv/Unsetenv (coordinated via an internal lock on
+POSIX), Getpid, Stat/Lstat (FileInfo: Name,
 Size, Mode, ModTime ns; IsDir/IsRegular/IsSymlink/Perm), Exists, IsDir, ListDir
 (sorted), Mkdir, MkdirAll, Remove, RemoveAll (no link following; missing is ok),
+StageRemoval(path, stagingDir) (same-filesystem rename into a unique private
+slot containing `entry`, returning its absolute path or `""` if missing; clean
+up with `RemoveAll(slot)`),
 Rename, Chmod, Getwd, Chdir, Realpath, Executable, TempDir, MkdirTemp,
 CreateTemp, ReadFile, WriteFile, returning Results such as
-`os: mkdir data: File exists`; they error on Wasm. `time.Now()` is Unix
+`os: mkdir data: File exists`; they error on Wasm. `mem.Copy(src, dest, bytes)`
+copies raw bytes with overlap support (`bytes == 0` permits `zero(*void)`;
+negative panics). `time.Now()` is Unix
 nanoseconds (Wasm imports `env.ocean_time_now_ns`). `os/signal` (Linux/macOS):
 Block before starting threads, then Pending() or Wait(ns) return SIGINT/SIGTERM/
 SIGHUP numbers (0 if none); Unblock, Name. Standard-library C/Win32 calls go
