@@ -103,20 +103,25 @@ func injectStrings(b *Build, p *ast.Package, src *ast.Source, d *ast.Node) {
 
 func NewBuild(diags *diag.List) *Build { b := new(Build); b.diags = diags; return b; }
 
-// RelativeSourcePath displays absolute paths relative to the working directory.
-func RelativeSourcePath(path string) string {
+func isDriveAbs(path string) bool {
+    return len(path) >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' && path[2] == '/';
+}
+
+func relativeSourcePath(cwd string, path string) string {
     if (path == "") return "<source>";
-    if (path[0] != '/') {
+    path = util.NormalizePath(path);
+    if (!(util.IsAbs(path) || isDriveAbs(path))) {
         for (len(path) >= 2 && path[0] == '.' && path[1] == '/') path = path[2:];
         return path;
     }
-    cwd := util.Getcwd();
+    cwd = util.NormalizePath(cwd);
     common := 0; i := 0;
     for (i < len(cwd) && i < len(path) && cwd[i] == path[i]) {
         if (path[i] == '/') common = i + 1;
         i++;
     }
     if (i == len(cwd) && (i == len(path) || path[i] == '/')) common = i + ((i < len(path) && path[i] == '/') ? 1 : 0);
+    if (common == 0) return path;
     parents := 0;
     if (common < len(cwd)) {
         for (j := common; j < len(cwd); j++) { if (j == common || cwd[j - 1] == '/') parents++; }
@@ -131,6 +136,11 @@ func RelativeSourcePath(path string) string {
         return ".";
     }
     return s;
+}
+
+// RelativeSourcePath displays absolute paths relative to the working directory.
+func RelativeSourcePath(path string) string {
+    return relativeSourcePath(util.Getcwd(), path);
 }
 
 func error(b *Build, file string, msg string) {

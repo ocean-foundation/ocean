@@ -61,11 +61,12 @@ func TestHost(t *testing.T) {
     first := MonoSeconds();
     second := MonoSeconds();
     if (first <= 0.0 || second < first) t.Error("monotonic clock");
+    if (windowsArg("") != "\"\"" || windowsArg("/c") != "/c" || windowsArg("cmd.exe") != "cmd.exe") t.Error("plain argument quoting");
+    if (windowsArg("a b\\") != "\"a b\\\\\"" || windowsArg("a\\\"b") != "\"a\\\\\\\"b\"") t.Error("argument quoting");
     if (Windows()) {
         if (Clean("C:\\one\\..\\two") != "C:/two") t.Error("drive path");
         if (Dir("C:/one") != "C:/" || Dir("C:/") != "C:/") t.Error("drive root");
         if (Clean("//server/share/../file") != "//server/share/file") t.Error("UNC root");
-        if (windowsArg("a b\\") != "\"a b\\\\\"") t.Error("argument quoting");
     }
 }
 

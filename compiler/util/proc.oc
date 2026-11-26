@@ -355,9 +355,16 @@ func Fork() int { return native_fork() -> int; }
 // ExitNow terminates immediately without running atexit handlers.
 func ExitNow(code int) { extern._exit(code->i32); }
 
-// The CRT spawn API reparses a command line on Windows. Quote every argument,
-// doubling backslashes before quotes and before the closing quote.
+// The CRT spawn API reparses a command line on Windows. Quote arguments that
+// are empty or contain whitespace or quotes, doubling backslashes before
+// quotes and before the closing quote.
 func windowsArg(arg string) string {
+    needsQuote := len(arg) == 0;
+    for (i := 0; !needsQuote && i < len(arg); i++) {
+        c := arg[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == '"') needsQuote = true;
+    }
+    if (!needsQuote) return arg;
     out := "\""; slashes := 0;
     for (i := 0; i <= len(arg); i++) {
         if (i < len(arg) && arg[i] == '\\') { slashes++; continue; }
