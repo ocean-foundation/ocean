@@ -85,6 +85,10 @@ func TestPaths(t *testing.T) {
     if (RelativeSourcePath(cwd + "/x/y.oc") != "x/y.oc") t.Error("rel1 ", RelativeSourcePath(cwd + "/x/y.oc"));
     if (RelativeSourcePath("./a.oc") != "a.oc") t.Error("rel2");
     if (RelativeSourcePath(filepath.Dir(cwd) + "/z.oc") != "../z.oc") t.Error("rel3 ", RelativeSourcePath(filepath.Dir(cwd) + "/z.oc"));
+    if (relativeSourcePath("D:/a/ocean/ocean", "D:/a/ocean/ocean/x/y.oc") != "x/y.oc") t.Error("win rel1");
+    if (relativeSourcePath("D:/a/ocean/ocean", "D:/a/ocean/z.oc") != "../z.oc") t.Error("win rel2");
+    if (relativeSourcePath("D:/", "D:/x/y.oc") != "x/y.oc") t.Error("win rel3");
+    if (relativeSourcePath("D:/a/ocean/ocean", "C:/other/z.oc") != "C:/other/z.oc") t.Error("win rel4");
     if (!TargetSource("a.oc") || !TargetSource("a_native.oc") || TargetSource("a_wasm_test.oc")) t.Error("target");
 }
 
