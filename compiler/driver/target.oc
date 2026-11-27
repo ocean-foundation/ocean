@@ -130,7 +130,7 @@ func targetMain(args []string) int {
         util.Stderr("ocean target: set OCEAN_TARGET_DIR to an absolute, writable directory\n");
         return 1;
     }
-    if (force && !checkMacOSSDKSource(root, targets)) return 1;
+    if (!remove && !checkMacOSSDKSource(root, targets, force)) return 1;
     // Every forced install uses the shared host tools, so refresh them once first.
     if (force && !ensureHostTools(root, true)) return 1;
     failed := false;
@@ -356,32 +356,26 @@ func macOSSDKURL() string {
         "/MacOSX" + macOSSDKVersion() + ".sdk.tar.xz";
 }
 
-// checkMacOSSDKSource rejects, for a forced command that installs a macOS
-// target, an OCEAN_MACOS_SDK directory inside an installation the command
-// replaces: the shared host tools or any selected target. The new macOS
-// installation records the SDK by path, and replacing an installation deletes
-// its previous contents.
-func checkMacOSSDKSource(root string, targets []util.Target) bool {
+// checkMacOSSDKSource rejects an OCEAN_MACOS_SDK directory or archive inside
+// the managed target storage when the command installs a macOS target. A
+// directory SDK is recorded by path, and an archive is read after earlier
+// replacements in the same command. Replacing or removing any installation,
+// including a forced refresh of the shared host tools, deletes its contents,
+// so an SDK stored there could disappear from under an installation.
+func checkMacOSSDKSource(root string, targets []util.Target, force bool) bool {
     source, _ := util.Getenv("OCEAN_MACOS_SDK");
-    if (source == "" || !util.IsDir(source)) return true;
-    macOS := false;
+    if (source == "" || !util.Exists(source)) return true;
+    installs := false;
     for (_, target := range targets) {
-        if (target.system == "macos") { macOS = true; break; }
+        if (target.system == "macos" && (force || !targetInstalled(targetPath(root, target)))) { installs = true; break; }
     }
-    if (!macOS) return true;
+    if (!installs || !util.IsDir(root)) return true;
     sdk, ok := util.Realpath(source);
-    if (!ok) return true;
-    replaced := []string{hostToolPath(root)};
-    for (_, target := range targets) replaced.append(targetPath(root, target));
-    for (_, path := range replaced) {
-        if (!util.IsDir(path)) continue;
-        installed, iok := util.Realpath(path);
-        if (!iok || (sdk != installed && !strings.HasPrefix(sdk, installed + "/"))) continue;
-        util.Stderr("ocean target: OCEAN_MACOS_SDK is inside " + path + ", which --force replaces; " +
-            "unset it to download the SDK again, or copy the SDK outside that directory\n");
-        return false;
-    }
-    return true;
+    managed, mok := util.Realpath(root);
+    if (!ok || !mok || (sdk != managed && !strings.HasPrefix(sdk, managed + "/"))) return true;
+    util.Stderr("ocean target: OCEAN_MACOS_SDK must be outside the managed target directory " + root +
+        "; copy the SDK elsewhere, or unset OCEAN_MACOS_SDK to download it\n");
+    return false;
 }
 
 // installMacOSSDK places a macOS SDK at payload/MacOSX.sdk. OCEAN_MACOS_SDK may
@@ -529,7 +523,11 @@ func probeTarget(root string, target util.Target, stage string, payload string, 
     args := managedClangArgs(root, target, payload, sdk);
     if (!appendTargetProbe(target, stage, &args)) return false;
     if (!target.Wasm()) args.append("-lffi", "-lcurl");
-    return targetCommand(args);
+    if (!targetCommand(args)) return false;
+    // Windows and cross-macOS libraries are indexed archives made by llvm-ar.
+    if (target.system == "windows" || util.IsRegular(payload + "/cross"))
+        return targetCommand([]string{targetTool(root, "llvm-ar"), "--version"});
+    return true;
 }
 
 func appendTargetProbe(target util.Target, stage string, args *[]string) bool {
@@ -549,10 +547,13 @@ func managedTargetRoot(target util.Target) string {
     if (clang != "" || sysroot != "") return "";
     root := targetRoot();
     if (root == "") return "";
-    if (targetInstalled(targetPath(root, target))) return root;
     // WebAssembly only needs the shared host tools and the bundled runtime.
-    // Both must be present; otherwise the system Clang and wasm-ld are used.
-    if (target.Wasm() && targetTool(root, "clang") != "clang" && targetTool(root, "wasm-ld") != "wasm-ld") return root;
+    // Both bundled tools must be present, even for an installed wasm-js;
+    // otherwise the system Clang and wasm-ld are used.
+    if (target.Wasm()) {
+        return targetTool(root, "clang") != "clang" && targetTool(root, "wasm-ld") != "wasm-ld" ? root : "";
+    }
+    if (targetInstalled(targetPath(root, target))) return root;
     return "";
 }
 

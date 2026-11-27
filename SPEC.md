@@ -1970,17 +1970,22 @@ executable. File paths are relative to the compiler's working directory.
   toolchain components for the specified targets, and
   `ocean target --remove <target>...` uninstalls them. A target the system
   toolchain already compiles and links is left uninstalled, because builds
-  without managed components use the system toolchain. `--force` installs
-  such targets anyway, reinstalls targets that are already installed,
+  without managed components use the system toolchain. macOS targets are the
+  exception: on a Mac with the Command Line Tools and no `OCEAN_MACOS_SDK`,
+  installing one records the Apple SDK, and builds use the Apple toolchain.
+  Elsewhere, including a Mac without the Command Line Tools or with
+  `OCEAN_MACOS_SDK` set, macOS targets use the bundled Clang and `ld64.lld`
+  with a downloaded SDK or the one `OCEAN_MACOS_SDK` names, which must be
+  outside the managed target directory. `--force` installs targets the system
+  toolchain supports anyway, reinstalls targets that are already installed,
   refreshes the shared host tools, and installs the bundled cross toolchain
-  and macOS SDK even where the host provides an Apple SDK. Set flags select groups of targets and may be mixed
+  and macOS SDK even where the Apple toolchain is available. Set flags select groups of targets and may be mixed
   with target names: `--all` (every target), `--native` (every target except
   `wasm-js`), `--x86_64` (`--x86`), `--aarch64` (`--arm`, `--arm64`),
   `--riscv64` (`--riscv`), `--linux`, `--macos` (`--darwin`), and `--windows`.
   `ocean target --sets` lists the sets and their targets. Explicit target builds
   automatically pick up these managed components. `OCEAN_TARGET_DIR` overrides
-  the default per-user storage location; on a macOS host, macOS targets rely on
-  the local Apple SDK unless installed with `--force`.
+  the default per-user storage location.
 - Running `build --emit-llvm` for a non-host target emits only the program's
   LLVM IR, without needing a target runtime. Producing or checking a full
   binary requires Clang, a compatible linker, and the target's headers and

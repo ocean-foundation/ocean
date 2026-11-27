@@ -107,8 +107,10 @@ pinned by SHA-256) and links with the bundled Clang and `ld64.lld`. Libraries
 built this way are indexed archives, because `ld64.lld` cannot produce
 relocatable objects. Set `OCEAN_MACOS_SDK` to the absolute path of an SDK
 directory, or an SDK tarball such as one made by osxcross's
-`tools/gen_sdk_package.sh`, to use your own SDK instead. Setting it on a
-Mac also selects the bundled toolchain. The macOS SDK is subject to the
+`tools/gen_sdk_package.sh`, to use your own SDK instead. The SDK must be
+outside the managed target directory, which `ocean target` replaces and
+removes installations in. Setting it on a Mac also selects the bundled
+toolchain. The macOS SDK is subject to the
 Xcode and Apple SDKs license agreement.
 
 By default the components live in `~/.ocean/targets` on Linux and macOS and
