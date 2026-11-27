@@ -130,11 +130,7 @@ func targetMain(args []string) int {
         util.Stderr("ocean target: set OCEAN_TARGET_DIR to an absolute, writable directory\n");
         return 1;
     }
-    if (force) {
-        for (_, target := range targets) {
-            if (!checkMacOSSDKSource(root, target)) return 1;
-        }
-    }
+    if (force && !checkMacOSSDKSource(root, targets)) return 1;
     // Every forced install uses the shared host tools, so refresh them once first.
     if (force && !ensureHostTools(root, true)) return 1;
     failed := false;
@@ -335,7 +331,7 @@ func ensureHostTools(root string, force bool) bool {
     linker := payload + "/bin/ld.lld" + suffix;
     if (!targetCommand([]string{clang, "--version"}) || !targetCommand([]string{linker, "--version"})) return false;
     if (!ensureLinkerDriver(payload, "wasm-ld") || !ensureLinkerDriver(payload, "ld64.lld")) return false;
-    return publishTarget(payload, path, force);
+    return publishTarget(root, payload, path, force);
 }
 
 // LLD selects its linker driver from the executable basename, so a copy of
@@ -360,22 +356,32 @@ func macOSSDKURL() string {
         "/MacOSX" + macOSSDKVersion() + ".sdk.tar.xz";
 }
 
-// checkMacOSSDKSource rejects, for a forced reinstall, an OCEAN_MACOS_SDK
-// directory inside the target's own installation. The new installation would
-// only record that path, and replacing the old installation deletes it.
-func checkMacOSSDKSource(root string, target util.Target) bool {
+// checkMacOSSDKSource rejects, for a forced command that installs a macOS
+// target, an OCEAN_MACOS_SDK directory inside an installation the command
+// replaces: the shared host tools or any selected target. The new macOS
+// installation records the SDK by path, and replacing an installation deletes
+// its previous contents.
+func checkMacOSSDKSource(root string, targets []util.Target) bool {
     source, _ := util.Getenv("OCEAN_MACOS_SDK");
-    path := targetPath(root, target);
-    if (target.system != "macos" || source == "" || !util.IsDir(source) || !util.IsDir(path)) return true;
+    if (source == "" || !util.IsDir(source)) return true;
+    macOS := false;
+    for (_, target := range targets) {
+        if (target.system == "macos") { macOS = true; break; }
+    }
+    if (!macOS) return true;
     sdk, ok := util.Realpath(source);
-    installed, iok := util.Realpath(path);
-    if (!ok || !iok) return true;
-    sdk = util.NormalizePath(sdk);
-    installed = util.NormalizePath(installed);
-    if (sdk != installed && !strings.HasPrefix(sdk, installed + "/")) return true;
-    util.Stderr("ocean target: OCEAN_MACOS_SDK is inside the " + target.Name() + " installation being replaced; " +
-        "unset it to download the SDK again, or copy the SDK outside " + path + "\n");
-    return false;
+    if (!ok) return true;
+    replaced := []string{hostToolPath(root)};
+    for (_, target := range targets) replaced.append(targetPath(root, target));
+    for (_, path := range replaced) {
+        if (!util.IsDir(path)) continue;
+        installed, iok := util.Realpath(path);
+        if (!iok || (sdk != installed && !strings.HasPrefix(sdk, installed + "/"))) continue;
+        util.Stderr("ocean target: OCEAN_MACOS_SDK is inside " + path + ", which --force replaces; " +
+            "unset it to download the SDK again, or copy the SDK outside that directory\n");
+        return false;
+    }
+    return true;
 }
 
 // installMacOSSDK places a macOS SDK at payload/MacOSX.sdk. OCEAN_MACOS_SDK may
@@ -385,7 +391,11 @@ func installMacOSSDK(stage string, payload string) bool {
     source, _ := util.Getenv("OCEAN_MACOS_SDK");
     if (source != "" && util.IsDir(source)) {
         if (!util.IsAbs(source)) { util.Stderr("ocean target: OCEAN_MACOS_SDK must be an absolute path\n"); return false; }
-        return util.WriteFile(payload + "/sdk", util.NormalizePath(source));
+        // Record the resolved directory so the installation does not depend
+        // on a symbolic link that may be removed with an old installation.
+        resolved, ok := util.Realpath(source);
+        if (!ok) { util.Stderr("ocean target: cannot resolve OCEAN_MACOS_SDK: " + source + "\n"); return false; }
+        return util.WriteFile(payload + "/sdk", resolved);
     }
     archive := source;
     if (archive == "") {
@@ -428,17 +438,38 @@ func macOSSDKPath(path string, sdk string) string {
 }
 
 // publishTarget moves a probed payload into place. With replace, an existing
-// installation is first moved beside the payload, inside the stage directory
-// that the caller deletes, and is restored if the new payload cannot be moved.
-func publishTarget(payload string, path string, replace bool) bool {
-    if (util.WriteFile(payload + "/installed", bundleRelease() + "\n")) {
-        previous := payload + "-previous";
-        detached := replace && util.Exists(path) && util.Rename(path, previous);
-        if (util.Rename(payload, path)) return true;
-        if (detached) util.Rename(previous, path);
-        else if (!replace && targetInstalled(path)) return true;
+// installation is first moved to a backup directory of its own, outside the
+// stage that the caller deletes. The backup is deleted once the payload is in
+// place or the old installation is restored; if neither move succeeds, it is
+// kept and its location reported.
+func publishTarget(root string, payload string, path string, replace bool) bool {
+    if (!util.WriteFile(payload + "/installed", bundleRelease() + "\n")) {
+        util.Stderr("ocean target: could not install into " + path + "\n");
+        return false;
     }
-    util.Stderr("ocean target: could not install into " + path + "\n");
+    if (!replace || !util.Exists(path)) {
+        if (util.Rename(payload, path) || (!replace && targetInstalled(path))) return true;
+        util.Stderr("ocean target: could not install into " + path + "\n");
+        return false;
+    }
+    backup := targetStage(versionedTargetRoot(root));
+    previous := backup + "/previous";
+    if (backup == "" || !util.Rename(path, previous)) {
+        if (backup != "") util.RemoveAll(backup);
+        util.Stderr("ocean target: could not replace " + path + "\n");
+        return false;
+    }
+    if (util.Rename(payload, path)) {
+        util.RemoveAll(backup);
+        return true;
+    }
+    if (util.Rename(previous, path)) {
+        util.RemoveAll(backup);
+        util.Stderr("ocean target: could not install into " + path + "; kept the previous installation\n");
+    } else {
+        util.Stderr("ocean target: could not install into " + path + " or restore the previous installation; " +
+            "it is preserved at " + previous + "\n");
+    }
     return false;
 }
 
@@ -488,7 +519,7 @@ func installTarget(root string, target util.Target, force bool) bool {
             sdk = macOSSDKPath(payload, sdk);
         }
     } else if (!unpackTargetBundle(stage, payload, target)) return false;
-    if (!probeTarget(root, target, stage, payload, sdk) || !publishTarget(payload, path, force)) return false;
+    if (!probeTarget(root, target, stage, payload, sdk) || !publishTarget(root, payload, path, force)) return false;
     util.Stdout("Installed " + target.Name() + "\n");
     return true;
 }
