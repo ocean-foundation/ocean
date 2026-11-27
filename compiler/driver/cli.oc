@@ -11,7 +11,7 @@ func usage() string {
         "       ocean test [location] [--json] [--outfile path] [--jsonfile path]\n" +
         "       ocean check [location]\n" +
         "       ocean check --lsp\n" +
-        "       ocean target [--list | --remove target... | target...]\n" +
+        "       ocean target [--list | --sets | [--force | --remove] [--<set>...] target...]\n" +
         "       ocean mod init [name]\n" +
         "       ocean fetch [<url>[@version]]\n" +
         "       ocean fix [location...]\n" +

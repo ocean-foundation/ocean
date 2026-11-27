@@ -5,48 +5,138 @@ import "os";
 import "strconv";
 import "strings";
 
+func targetUsage() string {
+    return "Usage: ocean target --list | ocean target --sets\n" +
+        "       ocean target [--force] [--<set>...] [target...]\n" +
+        "       ocean target --remove [--<set>...] [target...]\n";
+}
+
+// A TargetSet names a group of targets selected with --<name> or an alias.
+// Empty system and arch match every target; native excludes WebAssembly.
+struct TargetSet {
+    name string;
+    aliases string;
+    system string;
+    arch string;
+    native bool;
+}
+
+func targetSets() []TargetSet {
+    return []TargetSet{
+        TargetSet{name: "all"},
+        TargetSet{name: "native", native: true},
+        TargetSet{name: "x86_64", aliases: "x86", arch: "x86_64"},
+        TargetSet{name: "aarch64", aliases: "arm arm64", arch: "aarch64"},
+        TargetSet{name: "riscv64", aliases: "riscv", arch: "riscv64"},
+        TargetSet{name: "linux", system: "linux"},
+        TargetSet{name: "macos", aliases: "darwin", system: "macos"},
+        TargetSet{name: "windows", system: "windows"},
+    };
+}
+
+func (s TargetSet) Contains(target util.Target) bool {
+    if (s.native && target.Wasm()) return false;
+    if (s.system != "" && target.system != s.system) return false;
+    return s.arch == "" || target.arch == s.arch;
+}
+
+func (s TargetSet) Matches(flag string) bool {
+    if (flag == s.name) return true;
+    for (_, alias := range strings.Fields(s.aliases)) {
+        if (flag == alias) return true;
+    }
+    return false;
+}
+
+func listTargetSets() int {
+    util.Stdout("SET        ALIASES          TARGETS\n");
+    for (_, set := range targetSets()) {
+        names := make([]string);
+        for (_, target := range util.KnownTargets()) {
+            if (set.Contains(target)) names.append(target.Name());
+        }
+        aliases := "";
+        for (_, alias := range strings.Fields(set.aliases)) {
+            if (aliases != "") aliases = aliases + " ";
+            aliases = aliases + "--" + alias;
+        }
+        flag := "--" + set.name;
+        util.Stdout(flag + strings.Repeat(" ", 11 - len(flag)) +
+            aliases + strings.Repeat(" ", 17 - len(aliases)) + strings.Join(names, " ") + "\n");
+    }
+    return 0;
+}
+
 func targetMain(args []string) int {
-    usage := "Usage: ocean target --list | ocean target [--remove] <target>...\n";
     if (len(args) == 0 || (len(args) == 1 && (args[0] == "--help" || args[0] == "-h"))) {
-        util.Stdout(usage);
+        util.Stdout(targetUsage());
         return 0;
     }
-    if (len(args) == 1 && args[0] == "--list") {
-        return listTargets();
-    }
-    remove := args[0] == "--remove";
-    if (remove) args = args[1:];
-    if (len(args) == 0) { util.Stderr(usage); return 1; }
+    if (len(args) == 1 && args[0] == "--list") return listTargets();
+    if (len(args) == 1 && args[0] == "--sets") return listTargetSets();
 
     // Validate the entire argument list before changing any installation.
+    remove := false;
+    force := false;
     targets := make([]util.Target);
     seen: map[string]bool;
-    for (_, name := range args) {
-        if (name == "86_64-windows") name = "x86_64-windows";
-        found := false;
-        for (_, target := range util.KnownTargets()) {
-            if (target.Name() != name) continue;
-            _, duplicate := seen[name];
-            if (!duplicate) { targets.append(target); seen[name] = true; }
-            found = true;
-            break;
+    for (_, arg := range args) {
+        if (arg == "--remove") { remove = true; continue; }
+        if (arg == "--force") { force = true; continue; }
+        selected := make([]util.Target);
+        if (strings.HasPrefix(arg, "-")) {
+            found := false;
+            for (_, set := range targetSets()) {
+                if (!strings.HasPrefix(arg, "--") || !set.Matches(arg[2:])) continue;
+                for (_, target := range util.KnownTargets()) {
+                    if (set.Contains(target)) selected.append(target);
+                }
+                found = true;
+                break;
+            }
+            if (!found) {
+                if (arg == "--list" || arg == "--sets") {
+                    util.Stderr("ocean target: " + arg + " cannot be combined with other arguments\n");
+                } else {
+                    util.Stderr("ocean target: unknown flag or set " + arg + ". See ocean target --sets.\n");
+                }
+                util.Stderr(targetUsage());
+                return 1;
+            }
+        } else {
+            name := arg;
+            if (name == "86_64-windows") name = "x86_64-windows";
+            for (_, target := range util.KnownTargets()) {
+                if (target.Name() == name) { selected.append(target); break; }
+            }
+            if (len(selected) == 0) {
+                util.Stderr("ocean target: unknown target " + name + ". See ocean target --list.\n");
+                return 1;
+            }
         }
-        if (!found) {
-            util.Stderr("ocean target: unknown target " + name + ". See ocean target --list.\n");
-            return 1;
+        for (_, target := range selected) {
+            _, duplicate := seen[target.Name()];
+            if (!duplicate) { targets.append(target); seen[target.Name()] = true; }
         }
     }
+    if (remove && force) {
+        util.Stderr("ocean target: --force cannot be combined with --remove\n");
+        return 1;
+    }
+    if (len(targets) == 0) { util.Stderr(targetUsage()); return 1; }
 
     root := targetRoot();
     if (root == "") {
         util.Stderr("ocean target: set OCEAN_TARGET_DIR to an absolute, writable directory\n");
         return 1;
     }
+    // Every forced install uses the shared host tools, so refresh them once first.
+    if (force && !ensureHostTools(root, true)) return 1;
     failed := false;
     for (_, target := range targets) {
         if (remove) {
             if (!removeTarget(root, target)) failed = true;
-        } else if (!installTarget(root, target)) failed = true;
+        } else if (!installTarget(root, target, force)) failed = true;
     }
     return failed ? 1 : 0;
 }
@@ -215,9 +305,9 @@ func unpackTargetBundle(stage string, destination string, target util.Target) bo
     return util.Remove(archive);
 }
 
-func ensureHostTools(root string) bool {
+func ensureHostTools(root string, force bool) bool {
     path := hostToolPath(root);
-    if (targetInstalled(path)) return true;
+    if (!force && targetInstalled(path)) return true;
     stage := targetStage(versionedTargetRoot(root));
     if (stage == "") { util.Stderr("ocean target: cannot stage host tools\n"); return false; }
     defer util.RemoveAll(stage);
@@ -228,7 +318,7 @@ func ensureHostTools(root string) bool {
     linker := payload + "/bin/ld.lld" + suffix;
     if (!targetCommand([]string{clang, "--version"}) || !targetCommand([]string{linker, "--version"})) return false;
     if (!ensureLinkerDriver(payload, "wasm-ld") || !ensureLinkerDriver(payload, "ld64.lld")) return false;
-    return publishTarget(payload, path);
+    return publishTarget(payload, path, force);
 }
 
 // LLD selects its linker driver from the executable basename, so a copy of
@@ -302,16 +392,27 @@ func macOSSDKPath(path string, sdk string) string {
     return path + "/" + sdk;
 }
 
-func publishTarget(payload string, path string) bool {
-    if (util.WriteFile(payload + "/installed", bundleRelease() + "\n") &&
-        (util.Rename(payload, path) || targetInstalled(path))) return true;
+// publishTarget moves a probed payload into place. With replace, an existing
+// installation is first moved beside the payload, inside the stage directory
+// that the caller deletes, and is restored if the new payload cannot be moved.
+func publishTarget(payload string, path string, replace bool) bool {
+    if (util.WriteFile(payload + "/installed", bundleRelease() + "\n")) {
+        previous := payload + "-previous";
+        detached := replace && util.Exists(path) && util.Rename(path, previous);
+        if (util.Rename(payload, path)) return true;
+        if (detached) util.Rename(previous, path);
+        else if (!replace && targetInstalled(path)) return true;
+    }
     util.Stderr("ocean target: could not install into " + path + "\n");
     return false;
 }
 
-func installTarget(root string, target util.Target) bool {
+// installTarget installs target unless it is already installed. With force, it
+// reinstalls an existing installation and ignores the Apple SDK, so a macOS
+// target always gets the bundled cross toolchain and SDK.
+func installTarget(root string, target util.Target, force bool) bool {
     path := targetPath(root, target);
-    if (targetInstalled(path)) {
+    if (!force && targetInstalled(path)) {
         util.Stdout(target.Name() + " is already installed\n");
         return true;
     }
@@ -319,14 +420,14 @@ func installTarget(root string, target util.Target) bool {
     // targets. Other hosts use the bundled Clang and ld64.lld with a macOS SDK.
     sdk := "";
     xcode := false;
-    if (target.system == "macos" && util.MacOS()) {
+    if (target.system == "macos" && util.MacOS() && !force) {
         override, _ := util.Getenv("OCEAN_MACOS_SDK");
         status, output := util.RunCapture([]string{"xcrun", "--show-sdk-path"}.array());
         sdk = strings.TrimSpace(output);
         xcode = override == "" && !status.Failed && status.Code == 0 && util.IsDir(sdk) && util.IsExecutable("/usr/bin/clang");
         if (!xcode) sdk = "";
     }
-    if (!xcode && !ensureHostTools(root)) return false;
+    if (!xcode && !ensureHostTools(root, false)) return false;
     if (target.system == "macos" && !xcode && !ensureLinkerDriver(hostToolPath(root), "ld64.lld")) return false;
     stage := targetStage(versionedTargetRoot(root));
     if (stage == "") { util.Stderr("ocean target: cannot stage " + target.Name() + "\n"); return false; }
@@ -341,7 +442,7 @@ func installTarget(root string, target util.Target) bool {
             sdk = macOSSDKPath(payload, sdk);
         }
     } else if (!unpackTargetBundle(stage, payload, target)) return false;
-    if (!probeTarget(root, target, stage, payload, sdk) || !publishTarget(payload, path)) return false;
+    if (!probeTarget(root, target, stage, payload, sdk) || !publishTarget(payload, path, force)) return false;
     util.Stdout("Installed " + target.Name() + "\n");
     return true;
 }

@@ -149,6 +149,9 @@ ocean build --emit-llvm . -o application.ll
 ocean build --check .
 ocean target --list
 ocean target x86_64-windows riscv64-linux wasm-js
+ocean target --sets
+ocean target --linux --arm
+ocean target --force --native
 ocean target --remove x86_64-windows
 ocean check --lsp
 ocean clean --cache
@@ -1335,6 +1338,11 @@ targets with their `OCOS`/`OCARCH` pairs and toolchain readiness;
 `ocean target <target>...` installs managed toolchain components (stored in
 `~/.ocean/targets` or `%LOCALAPPDATA%/Ocean/targets`, overridable via
 `OCEAN_TARGET_DIR`), and `ocean target --remove <target>...` removes them.
+Set flags select groups of targets: `--all`, `--native` (all but `wasm-js`),
+`--x86_64`/`--x86`, `--aarch64`/`--arm`/`--arm64`, `--riscv64`/`--riscv`,
+`--linux`, `--macos`/`--darwin`, and `--windows` (`ocean target --sets` lists
+them). `--force` reinstalls already-installed targets and uses the bundled
+cross toolchain and macOS SDK even when the host provides an Apple SDK.
 `OCEAN_CLANG` and `OCEAN_SYSROOT` override managed toolchains. Running
 `ocean build --emit-llvm` for a non-host target emits program IR without
 needing the target runtime or toolchain.
