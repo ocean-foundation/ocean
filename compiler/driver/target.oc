@@ -413,6 +413,9 @@ func publishTarget(payload string, path string, replace bool) bool {
 func installTarget(root string, target util.Target, force bool) bool {
     path := targetPath(root, target);
     if (!force && targetInstalled(path)) {
+        // Host tools installed by earlier releases may lack a linker driver.
+        if (util.IsRegular(path + "/cross") && !ensureLinkerDriver(hostToolPath(root), "ld64.lld")) return false;
+        if (target.Wasm() && !ensureLinkerDriver(hostToolPath(root), "wasm-ld")) return false;
         util.Stdout(target.Name() + " is already installed\n");
         return true;
     }
@@ -429,6 +432,7 @@ func installTarget(root string, target util.Target, force bool) bool {
     }
     if (!xcode && !ensureHostTools(root, false)) return false;
     if (target.system == "macos" && !xcode && !ensureLinkerDriver(hostToolPath(root), "ld64.lld")) return false;
+    if (target.Wasm() && !ensureLinkerDriver(hostToolPath(root), "wasm-ld")) return false;
     stage := targetStage(versionedTargetRoot(root));
     if (stage == "") { util.Stderr("ocean target: cannot stage " + target.Name() + "\n"); return false; }
     defer util.RemoveAll(stage);
@@ -474,7 +478,8 @@ func managedTargetRoot(target util.Target) string {
     if (root == "") return "";
     if (targetInstalled(targetPath(root, target))) return root;
     // WebAssembly only needs the shared host tools and the bundled runtime.
-    if (target.Wasm() && (targetTool(root, "clang") != "clang" || targetTool(root, "wasm-ld") != "wasm-ld")) return root;
+    // Both must be present; otherwise the system Clang and wasm-ld are used.
+    if (target.Wasm() && targetTool(root, "clang") != "clang" && targetTool(root, "wasm-ld") != "wasm-ld") return root;
     return "";
 }
 
@@ -503,7 +508,11 @@ func managedClangArgs(root string, target util.Target, payload string, sdk strin
     args := []string{clang, "--target=" + target.Triple()};
     if (clang != "clang") args.append("--no-default-config");
     if (target.Wasm()) {
+        // Debian-built Clang looks for a versioned wasm-ld-<major> by default,
+        // so name the bundled linker by its absolute path.
         args.append("-B" + bin);
+        linker := targetTool(root, "wasm-ld");
+        if (linker != "wasm-ld") args.append("-fuse-ld=" + linker);
     } else {
         args.append("-I" + payload + "/include", "-L" + payload + "/lib",
             "-fuse-ld=lld", "--ld-path=" + targetTool(root, "ld.lld"));
