@@ -130,6 +130,11 @@ func targetMain(args []string) int {
         util.Stderr("ocean target: set OCEAN_TARGET_DIR to an absolute, writable directory\n");
         return 1;
     }
+    if (force) {
+        for (_, target := range targets) {
+            if (!checkMacOSSDKSource(root, target)) return 1;
+        }
+    }
     // Every forced install uses the shared host tools, so refresh them once first.
     if (force && !ensureHostTools(root, true)) return 1;
     failed := false;
@@ -341,6 +346,24 @@ func macOSSDKDigest() string { return "c15cf0f3f17d714d1aa5a642da8e118db53d79429
 func macOSSDKURL() string {
     return "https://github.com/joseluisq/macosx-sdks/releases/download/" + macOSSDKVersion() +
         "/MacOSX" + macOSSDKVersion() + ".sdk.tar.xz";
+}
+
+// checkMacOSSDKSource rejects, for a forced reinstall, an OCEAN_MACOS_SDK
+// directory inside the target's own installation. The new installation would
+// only record that path, and replacing the old installation deletes it.
+func checkMacOSSDKSource(root string, target util.Target) bool {
+    source, _ := util.Getenv("OCEAN_MACOS_SDK");
+    path := targetPath(root, target);
+    if (target.system != "macos" || source == "" || !util.IsDir(source) || !util.IsDir(path)) return true;
+    sdk, ok := util.Realpath(source);
+    installed, iok := util.Realpath(path);
+    if (!ok || !iok) return true;
+    sdk = util.NormalizePath(sdk);
+    installed = util.NormalizePath(installed);
+    if (sdk != installed && !strings.HasPrefix(sdk, installed + "/")) return true;
+    util.Stderr("ocean target: OCEAN_MACOS_SDK is inside the " + target.Name() + " installation being replaced; " +
+        "unset it to download the SDK again, or copy the SDK outside " + path + "\n");
+    return false;
 }
 
 // installMacOSSDK places a macOS SDK at payload/MacOSX.sdk. OCEAN_MACOS_SDK may
