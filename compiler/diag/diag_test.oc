@@ -1,0 +1,118 @@
+package diag;
+import "strings";
+import "testing";
+import "github.com/ocean-foundation/ocean/compiler/util";
+
+func repeatStr(s string, n int) string {
+    b: util.Buf;
+    for (i := 0; i < n; i++) b.Add(s);
+    return b.String();
+}
+
+func charCount(s string) int {
+    n := 0;
+    for (i := 0; i < len(s); ) {
+        bl, _ := sanitizedStep(s, i, len(s));
+        n++;
+        i += bl;
+    }
+    return n;
+}
+
+func splitSnippet(s string) (string, string) {
+    nl := strings.Index(s, "\n");
+    if (nl < 0) return s, "";
+    codeLine := s[0:nl];
+    rest := s[nl + 1 : len(s)];
+    nl2 := strings.Index(rest, "\n");
+    caretLine := nl2 >= 0 ? rest[0:nl2] : rest;
+    sep := strings.Index(codeLine, "| ");
+    if (sep >= 0) codeLine = codeLine[sep + 2 : len(codeLine)];
+    sep2 := strings.Index(caretLine, "| ");
+    if (sep2 >= 0) caretLine = caretLine[sep2 + 2 : len(caretLine)];
+    return codeLine, caretLine;
+}
+
+func TestSnippetMax80AndCaret(t *testing.T) {
+    // Exact 80-char line: no truncation.
+    line80 := repeatStr("a", 80);
+    code, caret := splitSnippet(Snippet(line80, 1, 80));
+    if (len(code) != 80 || code != line80) t.Error("80-char line should not truncate: ", len(code));
+    if (len(caret) != 80 || caret[79] != '^') t.Error("80-char caret misaligned: ", len(caret));
+
+    // 81-char line, col <= 50: right-truncated only to 80 chars (77 + "...").
+    line81 := repeatStr("a", 49) + "X" + repeatStr("b", 31);
+    code, caret = splitSnippet(Snippet(line81, 1, 50));
+    if (len(code) != 80 || !strings.HasSuffix(code, "...")) t.Error("81-char right trunc: ", len(code), " ", code);
+    if (code[49] != 'X' || len(caret) != 50 || caret[49] != '^') t.Error("81-char col 50 caret: ", len(caret));
+
+    // 81-char line, col == 51: left-truncated only, must be exactly 80 chars ("..." + 77).
+    line81b := repeatStr("a", 50) + "X" + repeatStr("b", 30);
+    code, caret = splitSnippet(Snippet(line81b, 1, 51));
+    if (len(code) != 80 || !strings.HasPrefix(code, "...") || strings.HasSuffix(code, "...")) {
+        t.Error("81-char col 51 should be left-only 80 chars: ", len(code), " ", code);
+    }
+    if (code[len(caret) - 1] != 'X') t.Error("81-char col 51 caret misaligned: ", code, " / ", caret);
+
+    // 82-char and 83-char lines, col == 51: previously produced 81..83 chars!
+    for (extra := 1; extra <= 5; extra++) {
+        line := repeatStr("a", 50) + "X" + repeatStr("b", 30 + extra);
+        code, caret = splitSnippet(Snippet(line, 1, 51));
+        if (len(code) > 80) t.Error("exceeded 80 chars for len ", len(line), ": ", len(code));
+        if (!strings.HasPrefix(code, "...") || !strings.HasSuffix(code, "...")) {
+            t.Error("expected both ellipses for len ", len(line), ": ", code);
+        }
+        if (code[len(caret) - 1] != 'X') t.Error("caret misaligned for len ", len(line));
+    }
+
+    // Col near or past end of line must not panic and must stay <= 80 chars.
+    line100 := repeatStr("a", 94) + "X" + repeatStr("b", 5);
+    code, caret = splitSnippet(Snippet(line100, 1, 95));
+    if (len(code) != 80 || !strings.HasPrefix(code, "...") || strings.HasSuffix(code, "...")) {
+        t.Error("near-EOL snippet: ", len(code), " ", code);
+    }
+    if (code[len(caret) - 1] != 'X') t.Error("near-EOL caret misaligned: ", code, " / ", caret);
+
+    // Way past EOL (would have panicked before).
+    code, caret = splitSnippet(Snippet(line100, 1, 200));
+    if (len(code) != 80 || !strings.HasPrefix(code, "...")) t.Error("past-EOL snippet: ", len(code));
+    if (len(caret) != 81 || caret[80] != '^') t.Error("past-EOL caret: ", len(caret));
+
+    // Exhaustive sweep of lengths 75..120 and columns 0..140.
+    for (n := 75; n <= 120; n++) {
+        line := repeatStr("x", n);
+        for (c := 0; c <= n + 20; c += 7) {
+            code, _ = splitSnippet(Snippet(line, 1, c));
+            if (len(code) > 80) t.Error("sweep exceeded 80: n=", n, " c=", c, " len=", len(code));
+        }
+    }
+}
+
+func TestSnippetControlAndUTF8(t *testing.T) {
+    // Control chars expand to 4 chars (\x00), so 25 NULs = 100 printed chars > 80.
+    nuls := repeatStr("\x00", 25);
+    code, _ := splitSnippet(Snippet(nuls, 1, 1));
+    if (len(code) > 80 || !strings.HasSuffix(code, "...")) {
+        t.Error("control chars exceeded 80: ", len(code), " ", code);
+    }
+    // Left-truncated control chars with col far in.
+    code2, caret := splitSnippet(Snippet(repeatStr("\x00", 15) + "X" + repeatStr("\x00", 15), 1, 16));
+    if (len(code2) > 80) t.Error("left-trunc control chars exceeded 80: ", len(code2));
+    if (code2[len(caret) - 1] != 'X') t.Error("control chars caret misaligned: ", code2, " / ", caret);
+
+    // UTF-8 multibyte chars: never split mid-codepoint and char count <= 80.
+    utf8Line := repeatStr("é", 60) + "X" + repeatStr("é", 40);
+    code3, caret3 := splitSnippet(Snippet(utf8Line, 1, 121));
+    if (charCount(code3) > 80) t.Error("utf8 exceeded 80 chars: ", charCount(code3));
+    if (!strings.HasPrefix(code3, "...") || !strings.HasSuffix(code3, "...")) {
+        t.Error("utf8 expected both ellipses: ", code3);
+    }
+    // Walk code3 by charCount(caret3)-1 characters and verify it lands on 'X'.
+    targetChar := charCount(caret3) - 1;
+    pos := 0;
+    for (ci := 0; ci < targetChar && pos < len(code3); ci++) {
+        bl, _ := sanitizedStep(code3, pos, len(code3));
+        pos += bl;
+    }
+    if (pos >= len(code3) || code3[pos] != 'X') t.Error("utf8 caret misaligned: ", code3, " / ", caret3);
+}

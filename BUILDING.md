@@ -98,8 +98,20 @@ the closest reachable nightly tag by default. Override the bundle tag with
 `make BUNDLE_VERSION=nightly-YYYY.MM.DD`.
 Linux and Windows bundles include the target development libraries for libffi
 and libcurl. With dynamic linking, the deployed program still needs its
-target runtime libraries. macOS targets use the Apple SDK on a Mac. Install
-the Command Line Tools with `xcode-select --install` if prompted by the command.
+target runtime libraries.
+
+On a Mac with the Command Line Tools, macOS targets use the Apple toolchain
+and SDK. On Linux, Windows, or a Mac without the Command Line Tools, the
+installer downloads an osxcross-style macOS SDK package (`MacOSX15.5.sdk`,
+pinned by SHA-256) and links with the bundled Clang and `ld64.lld`. Libraries
+built this way are indexed archives, because `ld64.lld` cannot produce
+relocatable objects. Set `OCEAN_MACOS_SDK` to the absolute path of an SDK
+directory, or an SDK tarball such as one made by osxcross's
+`tools/gen_sdk_package.sh`, to use your own SDK instead. The SDK must be
+outside the managed target directory, which `ocean target` replaces and
+removes installations in. Setting it on a Mac also selects the bundled
+toolchain. The macOS SDK is subject to the
+Xcode and Apple SDKs license agreement.
 
 By default the components live in `~/.ocean/targets` on Linux and macOS and
 `%LOCALAPPDATA%/Ocean/targets` on Windows. Set `OCEAN_TARGET_DIR` to an absolute
@@ -114,7 +126,8 @@ libraries are in a separate sysroot.
   startup objects and compiler runtime libraries. A matching Linux GCC cross
   toolchain can provide these files for Clang.
 - macOS needs a macOS SDK and a Mach-O linker. On macOS, install the Xcode
-  Command Line Tools with `xcode-select --install`.
+  Command Line Tools with `xcode-select --install`. Elsewhere, use
+  `ocean target` or an osxcross toolchain.
 - Windows needs a matching MinGW-w64 toolchain such as LLVM-MinGW. Put
   `llvm-ar` on PATH to build package libraries.
 - WebAssembly needs Clang with WebAssembly support and the LLD tool `wasm-ld`.

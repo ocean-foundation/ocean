@@ -91,6 +91,22 @@ func (l *List) Format(d *Diagnostic) string {
     return b.String();
 }
 
+// sanitizedStep returns (byteLen, charWidth) for the next sanitized unit in text[pos:end].
+func sanitizedStep(text string, pos int, end int) (int, int) {
+    v := (text[pos] -> int) & 255;
+    if (v == 9) return 1, 1;
+    if (v < 32 || v == 127) return 1, 4;
+    if (v == 194 && pos + 1 < end) {
+        v2 := (text[pos + 1] -> int) & 255;
+        if (v2 >= 128 && v2 <= 159) return 2, 6;
+    }
+    if (v < 128) return 1, 1;
+    if (v >= 194 && v <= 223 && pos + 1 < end && (((text[pos + 1] -> int) & 192) == 128)) return 2, 1;
+    if (v >= 224 && v <= 239 && pos + 2 < end && (((text[pos + 1] -> int) & 192) == 128) && (((text[pos + 2] -> int) & 192) == 128)) return 3, 1;
+    if (v >= 240 && v <= 244 && pos + 3 < end && (((text[pos + 1] -> int) & 192) == 128) && (((text[pos + 2] -> int) & 192) == 128) && (((text[pos + 3] -> int) & 192) == 128)) return 4, 1;
+    return 1, 1;
+}
+
 // Snippet renders " N | source line" and a caret line.
 func Snippet(text string, line int, col int) string {
     start := 0;
@@ -102,37 +118,67 @@ func Snippet(text string, line int, col int) string {
     }
     end := start;
     for (end < len(text) && text[end] != '\n' && text[end] != '\r') end++;
+    lineStart := start;
+    lineEnd := end;
+    caretPos := lineStart + col - 1;
+    if (caretPos < lineStart) caretPos = lineStart;
+    if (caretPos > lineEnd) caretPos = lineEnd;
+
+    totalWidth := 0;
+    caretWidth := 0;
+    for (p := lineStart; p < lineEnd; ) {
+        bl, cw := sanitizedStep(text, p, lineEnd);
+        if (p < caretPos) caretWidth += cw;
+        totalWidth += cw;
+        p += bl;
+    }
+
     b: util.Buf;
     prefix := " " + strconv.Itoa(line) + " | ";
     b.Add(prefix);
-    truncated := end - start > 512;
+    maxSnippet := 80;
+    truncated := totalWidth > maxSnippet;
+    leftTruncated := truncated && caretWidth >= 50;
+    if (leftTruncated) { // left truncate if the error is far into the line
+        targetSkip := caretWidth - 46;
+        maxSkip := totalWidth - (maxSnippet - 3);
+        if (targetSkip > maxSkip) targetSkip = maxSkip;
+        skipped := 0;
+        for (start < lineEnd && skipped < targetSkip) {
+            bl, cw := sanitizedStep(text, start, lineEnd);
+            start += bl;
+            skipped += cw;
+        }
+        b.Add("...");
+        truncated = totalWidth - skipped > maxSnippet - 3; // recheck if right truncation is needed after left truncation
+    }
     if (truncated) {
-        end = start + 512;
-        // Move the cut back if it lands inside a multibyte character.
-        for (moved := 0; moved < 3 && ((text[end] -> int) & 192) == 128; moved++) end--;
+        budget := maxSnippet - 3 - (leftTruncated ? 3 : 0);
+        w := 0;
+        p := start;
+        for (p < lineEnd) {
+            bl, cw := sanitizedStep(text, p, lineEnd);
+            if (w + cw > budget) break;
+            w += cw;
+            p += bl;
+        }
+        end = p;
     }
     appendSanitized(&b, text[start:end], true);
     if (truncated) b.Add("...");
     b.Add("\n");
     for (i := 0; i < len(prefix); i++) b.Addc(prefix[i] == '|' ? '|'->i8 : ' '->i8);
-    caret := col - 1;
+    if (leftTruncated) b.Add("   ");
+    caret := caretPos - start;
     if (caret < 0) caret = 0;
     if (caret > end - start) caret = end - start;
     i := 0;
     for (i < caret) {
         v := (text[start + i] -> int) & 255;
         if (v == 9) { b.Addc('\t'); i++; continue; }
-        if (v < 32 || v == 127) { b.Add("    "); i++; continue; }
-        if (v == 194 && start + i + 1 < end) {
-            v2 := (text[start + i + 1] -> int) & 255;
-            if (v2 >= 128 && v2 <= 159) { b.Add("      "); i += 2; continue; }
-        }
-        b.Addc(' ');
-        if (v < 128) i++;
-        else if (v >= 194 && v <= 223 && start + i + 1 < end && (((text[start + i + 1] -> int) & 192) == 128)) i += 2;
-        else if (v >= 224 && v <= 239 && start + i + 2 < end && (((text[start + i + 1] -> int) & 192) == 128) && (((text[start + i + 2] -> int) & 192) == 128)) i += 3;
-        else if (v >= 240 && v <= 244 && start + i + 3 < end && (((text[start + i + 1] -> int) & 192) == 128) && (((text[start + i + 2] -> int) & 192) == 128) && (((text[start + i + 3] -> int) & 192) == 128)) i += 4;
-        else i++;
+        bl, cw := sanitizedStep(text, start + i, end);
+        for (k := 0; k < cw; k++) b.Addc(' ');
+        i += bl;
     }
     b.Add("^\n");
     return b.String();

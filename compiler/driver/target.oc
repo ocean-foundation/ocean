@@ -5,48 +5,139 @@ import "os";
 import "strconv";
 import "strings";
 
+func targetUsage() string {
+    return "Usage: ocean target --list | ocean target --sets\n" +
+        "       ocean target [--force] [--<set>...] [target...]\n" +
+        "       ocean target --remove [--<set>...] [target...]\n";
+}
+
+// A TargetSet names a group of targets selected with --<name> or an alias.
+// Empty system and arch match every target; native excludes WebAssembly.
+struct TargetSet {
+    name string;
+    aliases string;
+    system string;
+    arch string;
+    native bool;
+}
+
+func targetSets() []TargetSet {
+    return []TargetSet{
+        TargetSet{name: "all"},
+        TargetSet{name: "native", native: true},
+        TargetSet{name: "x86_64", aliases: "x86", arch: "x86_64"},
+        TargetSet{name: "aarch64", aliases: "arm arm64", arch: "aarch64"},
+        TargetSet{name: "riscv64", aliases: "riscv", arch: "riscv64"},
+        TargetSet{name: "linux", system: "linux"},
+        TargetSet{name: "macos", aliases: "darwin", system: "macos"},
+        TargetSet{name: "windows", system: "windows"},
+    };
+}
+
+func (s TargetSet) Contains(target util.Target) bool {
+    if (s.native && target.Wasm()) return false;
+    if (s.system != "" && target.system != s.system) return false;
+    return s.arch == "" || target.arch == s.arch;
+}
+
+func (s TargetSet) Matches(flag string) bool {
+    if (flag == s.name) return true;
+    for (_, alias := range strings.Fields(s.aliases)) {
+        if (flag == alias) return true;
+    }
+    return false;
+}
+
+func listTargetSets() int {
+    util.Stdout("SET        ALIASES          TARGETS\n");
+    for (_, set := range targetSets()) {
+        names := make([]string);
+        for (_, target := range util.KnownTargets()) {
+            if (set.Contains(target)) names.append(target.Name());
+        }
+        aliases := "";
+        for (_, alias := range strings.Fields(set.aliases)) {
+            if (aliases != "") aliases = aliases + " ";
+            aliases = aliases + "--" + alias;
+        }
+        flag := "--" + set.name;
+        util.Stdout(flag + strings.Repeat(" ", 11 - len(flag)) +
+            aliases + strings.Repeat(" ", 17 - len(aliases)) + strings.Join(names, " ") + "\n");
+    }
+    return 0;
+}
+
 func targetMain(args []string) int {
-    usage := "Usage: ocean target --list | ocean target [--remove] <target>...\n";
     if (len(args) == 0 || (len(args) == 1 && (args[0] == "--help" || args[0] == "-h"))) {
-        util.Stdout(usage);
+        util.Stdout(targetUsage());
         return 0;
     }
-    if (len(args) == 1 && args[0] == "--list") {
-        return listTargets();
-    }
-    remove := args[0] == "--remove";
-    if (remove) args = args[1:];
-    if (len(args) == 0) { util.Stderr(usage); return 1; }
+    if (len(args) == 1 && args[0] == "--list") return listTargets();
+    if (len(args) == 1 && args[0] == "--sets") return listTargetSets();
 
     // Validate the entire argument list before changing any installation.
+    remove := false;
+    force := false;
     targets := make([]util.Target);
     seen: map[string]bool;
-    for (_, name := range args) {
-        if (name == "86_64-windows") name = "x86_64-windows";
-        found := false;
-        for (_, target := range util.KnownTargets()) {
-            if (target.Name() != name) continue;
-            _, duplicate := seen[name];
-            if (!duplicate) { targets.append(target); seen[name] = true; }
-            found = true;
-            break;
+    for (_, arg := range args) {
+        if (arg == "--remove") { remove = true; continue; }
+        if (arg == "--force") { force = true; continue; }
+        selected := make([]util.Target);
+        if (strings.HasPrefix(arg, "-")) {
+            found := false;
+            for (_, set := range targetSets()) {
+                if (!strings.HasPrefix(arg, "--") || !set.Matches(arg[2:])) continue;
+                for (_, target := range util.KnownTargets()) {
+                    if (set.Contains(target)) selected.append(target);
+                }
+                found = true;
+                break;
+            }
+            if (!found) {
+                if (arg == "--list" || arg == "--sets") {
+                    util.Stderr("ocean target: " + arg + " cannot be combined with other arguments\n");
+                } else {
+                    util.Stderr("ocean target: unknown flag or set " + arg + ". See ocean target --sets.\n");
+                }
+                util.Stderr(targetUsage());
+                return 1;
+            }
+        } else {
+            name := arg;
+            if (name == "86_64-windows") name = "x86_64-windows";
+            for (_, target := range util.KnownTargets()) {
+                if (target.Name() == name) { selected.append(target); break; }
+            }
+            if (len(selected) == 0) {
+                util.Stderr("ocean target: unknown target " + name + ". See ocean target --list.\n");
+                return 1;
+            }
         }
-        if (!found) {
-            util.Stderr("ocean target: unknown target " + name + ". See ocean target --list.\n");
-            return 1;
+        for (_, target := range selected) {
+            _, duplicate := seen[target.Name()];
+            if (!duplicate) { targets.append(target); seen[target.Name()] = true; }
         }
     }
+    if (remove && force) {
+        util.Stderr("ocean target: --force cannot be combined with --remove\n");
+        return 1;
+    }
+    if (len(targets) == 0) { util.Stderr(targetUsage()); return 1; }
 
     root := targetRoot();
     if (root == "") {
         util.Stderr("ocean target: set OCEAN_TARGET_DIR to an absolute, writable directory\n");
         return 1;
     }
+    if (!remove && !checkMacOSSDKSource(root, targets, force)) return 1;
+    // Every forced install uses the shared host tools, so refresh them once first.
+    if (force && !ensureHostTools(root, true)) return 1;
     failed := false;
     for (_, target := range targets) {
         if (remove) {
             if (!removeTarget(root, target)) failed = true;
-        } else if (!installTarget(root, target)) failed = true;
+        } else if (!installTarget(root, target, force)) failed = true;
     }
     return failed ? 1 : 0;
 }
@@ -75,14 +166,26 @@ func listTargets() int {
 }
 
 func targetReady(target util.Target, dir string) bool {
-    args := clangTargetArgs(target);
+    return toolchainReady(target, dir, clangTargetArgs(target), targetTool(managedTargetRoot(target), "llvm-ar"));
+}
+
+// systemTargetReady reports whether the system toolchain, without managed
+// components, compiles and links the target probe.
+func systemTargetReady(target util.Target) bool {
+    dir, ok := util.MakeTempDir("ocean-target-probe-");
+    if (!ok) return false;
+    defer util.RemoveAll(dir);
+    return toolchainReady(target, dir, systemClangArgs(target), "llvm-ar");
+}
+
+func toolchainReady(target util.Target, dir string, args []string, archiver string) bool {
     if (!target.Wasm()) args.append(ffiCompileFlags(target)...);
     if (!appendTargetProbe(target, dir, &args)) return false;
     if (!target.Wasm() && !appendDependencyLinkFlags(target, &args, true, true, false)) return false;
     status, _ := util.RunCapture(args.array());
     if (status.Failed || status.Code != 0) return false;
-    if (target.system == "windows") {
-        status, _ = util.RunCapture([]string{targetTool(managedTargetRoot(target), "llvm-ar"), "--version"}.array());
+    if (archivesLibraries(target)) {
+        status, _ = util.RunCapture([]string{archiver, "--version"}.array());
     }
     return !status.Failed && status.Code == 0;
 }
@@ -165,7 +268,11 @@ func verifyTargetArchive(archive string, digest string) bool {
 }
 
 func downloadTargetAsset(asset string, path string, showProgress bool) bool {
-    url := "https://github.com/ocean-foundation/ocean/releases/download/" + bundleVersion + "/" + asset;
+    return downloadTargetURL("https://github.com/ocean-foundation/ocean/releases/download/" + bundleVersion + "/" + asset,
+        asset, path, showProgress);
+}
+
+func downloadTargetURL(url string, asset string, path string, showProgress bool) bool {
     progress := showProgress && util.IsTerminal(2) ? "--progress-bar" : "--silent";
     status := util.Run([]string{"curl", "--fail", "--location", progress, "--show-error", "--retry", "2",
         "--connect-timeout", "15", "--proto", "=https", "--proto-redir", "=https", "--output", path, url}.array());
@@ -211,9 +318,9 @@ func unpackTargetBundle(stage string, destination string, target util.Target) bo
     return util.Remove(archive);
 }
 
-func ensureHostTools(root string) bool {
+func ensureHostTools(root string, force bool) bool {
     path := hostToolPath(root);
-    if (targetInstalled(path)) return true;
+    if (!force && targetInstalled(path)) return true;
     stage := targetStage(versionedTargetRoot(root));
     if (stage == "") { util.Stderr("ocean target: cannot stage host tools\n"); return false; }
     defer util.RemoveAll(stage);
@@ -223,52 +330,190 @@ func ensureHostTools(root string) bool {
     clang := payload + "/bin/clang" + suffix;
     linker := payload + "/bin/ld.lld" + suffix;
     if (!targetCommand([]string{clang, "--version"}) || !targetCommand([]string{linker, "--version"})) return false;
-    // LLD selects its linker driver from the executable basename.
-    if (!util.IsExecutable(payload + "/bin/wasm-ld" + suffix)) {
-        binary, ok := util.ReadFile(linker);
-        if (!ok || !util.WriteFileMode(payload + "/bin/wasm-ld" + suffix, binary, 493)) {
-            util.Stderr("ocean target: could not install wasm-ld\n");
-            return false;
-        }
-    }
-    return publishTarget(payload, path);
+    if (!ensureLinkerDriver(payload, "wasm-ld") || !ensureLinkerDriver(payload, "ld64.lld")) return false;
+    return publishTarget(root, payload, path, force);
 }
 
-func publishTarget(payload string, path string) bool {
-    if (util.WriteFile(payload + "/installed", bundleRelease() + "\n") &&
-        (util.Rename(payload, path) || targetInstalled(path))) return true;
-    util.Stderr("ocean target: could not install into " + path + "\n");
+// LLD selects its linker driver from the executable basename, so a copy of
+// ld.lld named wasm-ld or ld64.lld links WebAssembly or Mach-O.
+func ensureLinkerDriver(tools string, name string) bool {
+    suffix := os.ExeSuffix();
+    driver := tools + "/bin/" + name + suffix;
+    if (util.IsExecutable(driver)) return true;
+    binary, ok := util.ReadFile(tools + "/bin/ld.lld" + suffix);
+    if (ok && util.WriteFileMode(driver, binary, 493)) return true;
+    util.Stderr("ocean target: could not install " + name + "\n");
     return false;
 }
 
-func installTarget(root string, target util.Target) bool {
+// The default macOS SDK for other hosts is an osxcross-style SDK package,
+// a MacOSX<version>.sdk directory packed as tar.xz from Xcode.
+func macOSSDKVersion() string { return "15.5"; }
+func macOSSDKDigest() string { return "c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd"; }
+
+func macOSSDKURL() string {
+    return "https://github.com/joseluisq/macosx-sdks/releases/download/" + macOSSDKVersion() +
+        "/MacOSX" + macOSSDKVersion() + ".sdk.tar.xz";
+}
+
+// checkMacOSSDKSource rejects an OCEAN_MACOS_SDK directory or archive inside
+// the managed target storage when the command installs a macOS target. A
+// directory SDK is recorded by path, and an archive is read after earlier
+// replacements in the same command. Replacing or removing any installation,
+// including a forced refresh of the shared host tools, deletes its contents,
+// so an SDK stored there could disappear from under an installation.
+func checkMacOSSDKSource(root string, targets []util.Target, force bool) bool {
+    source, _ := util.Getenv("OCEAN_MACOS_SDK");
+    if (source == "" || !util.Exists(source)) return true;
+    installs := false;
+    for (_, target := range targets) {
+        if (target.system == "macos" && (force || !targetInstalled(targetPath(root, target)))) { installs = true; break; }
+    }
+    if (!installs || !util.IsDir(root)) return true;
+    sdk, ok := util.Realpath(source);
+    managed, mok := util.Realpath(root);
+    if (!ok || !mok || (sdk != managed && !strings.HasPrefix(sdk, managed + "/"))) return true;
+    util.Stderr("ocean target: OCEAN_MACOS_SDK must be outside the managed target directory " + root +
+        "; copy the SDK elsewhere, or unset OCEAN_MACOS_SDK to download it\n");
+    return false;
+}
+
+// installMacOSSDK places a macOS SDK at payload/MacOSX.sdk. OCEAN_MACOS_SDK may
+// name an SDK directory or an SDK tarball such as one made by osxcross's
+// gen_sdk_package.sh; otherwise the pinned SDK package is downloaded.
+func installMacOSSDK(stage string, payload string) bool {
+    source, _ := util.Getenv("OCEAN_MACOS_SDK");
+    if (source != "" && util.IsDir(source)) {
+        if (!util.IsAbs(source)) { util.Stderr("ocean target: OCEAN_MACOS_SDK must be an absolute path\n"); return false; }
+        // Record the resolved directory so the installation does not depend
+        // on a symbolic link that may be removed with an old installation.
+        resolved, ok := util.Realpath(source);
+        if (!ok) { util.Stderr("ocean target: cannot resolve OCEAN_MACOS_SDK: " + source + "\n"); return false; }
+        return util.WriteFile(payload + "/sdk", resolved);
+    }
+    archive := source;
+    if (archive == "") {
+        asset := "MacOSX" + macOSSDKVersion() + ".sdk.tar.xz";
+        archive = stage + "/" + asset;
+        util.Stdout("Downloading " + asset + " (use of the macOS SDK is subject to the Xcode license agreement)\n");
+        if (!downloadTargetURL(macOSSDKURL(), asset, archive, true)) return false;
+        util.Stdout("Verifying download... ");
+        if (!verifyTargetArchive(archive, macOSSDKDigest())) return false;
+    } else if (!util.IsRegular(archive)) {
+        util.Stderr("ocean target: OCEAN_MACOS_SDK is not an SDK directory or archive: " + archive + "\n");
+        return false;
+    }
+    unpacked := stage + "/sdk";
+    util.Stdout("Extracting SDK... ");
+    if (!util.Mkdir(unpacked) || !targetCommand([]string{"tar", "-xf", archive, "-C", unpacked})) return false;
+    if (source == "") util.Remove(archive);
+    entries, _ := util.ListDir(unpacked);
+    for (_, entry := range entries) {
+        sdk := unpacked + "/" + entry;
+        if (!strings.HasSuffix(entry, ".sdk") || !util.IsDir(sdk + "/usr/include")) continue;
+        return util.Rename(sdk, payload + "/MacOSX.sdk") && util.WriteFile(payload + "/sdk", "MacOSX.sdk");
+    }
+    util.Stderr("ocean target: the SDK archive does not contain a MacOSX*.sdk directory\n");
+    return false;
+}
+
+// crossMacOSTarget reports a macOS target linked by the bundled ld64.lld.
+func crossMacOSTarget(target util.Target) bool {
+    if (target.system != "macos") return false;
+    root := managedTargetRoot(target);
+    return root != "" && util.IsRegular(targetPath(root, target) + "/cross");
+}
+
+// A relative sdk entry names an SDK inside the target installation.
+func macOSSDKPath(path string, sdk string) string {
+    sdk = strings.TrimSpace(sdk);
+    if (sdk == "" || util.IsAbs(sdk)) return sdk;
+    return path + "/" + sdk;
+}
+
+// publishTarget moves a probed payload into place. With replace, an existing
+// installation is first moved to a backup directory of its own, outside the
+// stage that the caller deletes. The backup is deleted once the payload is in
+// place or the old installation is restored; if neither move succeeds, it is
+// kept and its location reported.
+func publishTarget(root string, payload string, path string, replace bool) bool {
+    if (!util.WriteFile(payload + "/installed", bundleRelease() + "\n")) {
+        util.Stderr("ocean target: could not install into " + path + "\n");
+        return false;
+    }
+    if (!replace || !util.Exists(path)) {
+        if (util.Rename(payload, path) || (!replace && targetInstalled(path))) return true;
+        util.Stderr("ocean target: could not install into " + path + "\n");
+        return false;
+    }
+    backup := targetStage(versionedTargetRoot(root));
+    previous := backup + "/previous";
+    if (backup == "" || !util.Rename(path, previous)) {
+        if (backup != "") util.RemoveAll(backup);
+        util.Stderr("ocean target: could not replace " + path + "\n");
+        return false;
+    }
+    if (util.Rename(payload, path)) {
+        util.RemoveAll(backup);
+        return true;
+    }
+    if (util.Rename(previous, path)) {
+        util.RemoveAll(backup);
+        util.Stderr("ocean target: could not install into " + path + "; kept the previous installation\n");
+    } else {
+        util.Stderr("ocean target: could not install into " + path + " or restore the previous installation; " +
+            "it is preserved at " + previous + "\n");
+    }
+    return false;
+}
+
+// installTarget installs target unless it is already installed. With force, it
+// reinstalls an existing installation and ignores the Apple SDK, so a macOS
+// target always gets the bundled cross toolchain and SDK.
+func installTarget(root string, target util.Target, force bool) bool {
     path := targetPath(root, target);
-    if (targetInstalled(path)) {
+    if (!force && targetInstalled(path)) {
+        // Host tools installed by earlier releases may lack a linker driver.
+        if (util.IsRegular(path + "/cross") && !ensureLinkerDriver(hostToolPath(root), "ld64.lld")) return false;
+        if (target.Wasm() && !ensureLinkerDriver(hostToolPath(root), "wasm-ld")) return false;
         util.Stdout(target.Name() + " is already installed\n");
         return true;
     }
+    // On a Mac with the Command Line Tools, the Apple toolchain links macOS
+    // targets. Other hosts use the bundled Clang and ld64.lld with a macOS SDK.
     sdk := "";
-    if (target.system == "macos") {
-        if (!util.MacOS()) {
-            util.Stderr("ocean target: " + target.Name() + " requires the Apple SDK on a macOS host\n");
-            return false;
-        }
+    xcode := false;
+    override, _ := util.Getenv("OCEAN_MACOS_SDK");
+    if (target.system == "macos" && util.MacOS() && !force) {
         status, output := util.RunCapture([]string{"xcrun", "--show-sdk-path"}.array());
         sdk = strings.TrimSpace(output);
-        if (status.Code != 0 || status.Failed || !util.IsDir(sdk)) {
-            util.Stderr("ocean target: install the Apple SDK with xcode-select --install, then retry\n");
-            return false;
-        }
-    } else if (!ensureHostTools(root)) return false;
+        xcode = override == "" && !status.Failed && status.Code == 0 && util.IsDir(sdk) && util.IsExecutable("/usr/bin/clang");
+        if (!xcode) sdk = "";
+    }
+    // Builds without managed components use the system toolchain, so there is
+    // nothing to install when it already handles the target. An explicit
+    // OCEAN_MACOS_SDK asks for a managed macOS installation.
+    if (!force && !xcode && !(target.system == "macos" && override != "") && systemTargetReady(target)) {
+        util.Stdout(target.Name() + " is supported by the system toolchain; use --force to install the bundled toolchain\n");
+        return true;
+    }
+    if (!xcode && !ensureHostTools(root, false)) return false;
+    if (target.system == "macos" && !xcode && !ensureLinkerDriver(hostToolPath(root), "ld64.lld")) return false;
+    if (target.Wasm() && !ensureLinkerDriver(hostToolPath(root), "wasm-ld")) return false;
     stage := targetStage(versionedTargetRoot(root));
     if (stage == "") { util.Stderr("ocean target: cannot stage " + target.Name() + "\n"); return false; }
     defer util.RemoveAll(stage);
     payload := stage + "/payload";
     if (target.system == "macos" || target.Wasm()) {
         if (!util.Mkdir(payload)) return false;
-        if (sdk != "" && !util.WriteFile(payload + "/sdk", sdk)) return false;
+        if (xcode && !util.WriteFile(payload + "/sdk", sdk)) return false;
+        if (target.system == "macos" && !xcode) {
+            if (!installMacOSSDK(stage, payload) || !util.WriteFile(payload + "/cross", "")) return false;
+            sdk, _ = util.ReadFile(payload + "/sdk");
+            sdk = macOSSDKPath(payload, sdk);
+        }
     } else if (!unpackTargetBundle(stage, payload, target)) return false;
-    if (!probeTarget(root, target, stage, payload, sdk) || !publishTarget(payload, path)) return false;
+    if (!probeTarget(root, target, stage, payload, sdk) || !publishTarget(root, payload, path, force)) return false;
     util.Stdout("Installed " + target.Name() + "\n");
     return true;
 }
@@ -278,7 +523,11 @@ func probeTarget(root string, target util.Target, stage string, payload string, 
     args := managedClangArgs(root, target, payload, sdk);
     if (!appendTargetProbe(target, stage, &args)) return false;
     if (!target.Wasm()) args.append("-lffi", "-lcurl");
-    return targetCommand(args);
+    if (!targetCommand(args)) return false;
+    // Windows and cross-macOS libraries are indexed archives made by llvm-ar.
+    if (target.system == "windows" || util.IsRegular(payload + "/cross"))
+        return targetCommand([]string{targetTool(root, "llvm-ar"), "--version"});
+    return true;
 }
 
 func appendTargetProbe(target util.Target, stage string, args *[]string) bool {
@@ -298,9 +547,13 @@ func managedTargetRoot(target util.Target) string {
     if (clang != "" || sysroot != "") return "";
     root := targetRoot();
     if (root == "") return "";
-    if (targetInstalled(targetPath(root, target))) return root;
     // WebAssembly only needs the shared host tools and the bundled runtime.
-    if (target.Wasm() && (targetTool(root, "clang") != "clang" || targetTool(root, "wasm-ld") != "wasm-ld")) return root;
+    // Both bundled tools must be present, even for an installed wasm-js;
+    // otherwise the system Clang and wasm-ld are used.
+    if (target.Wasm()) {
+        return targetTool(root, "clang") != "clang" && targetTool(root, "wasm-ld") != "wasm-ld" ? root : "";
+    }
+    if (targetInstalled(targetPath(root, target))) return root;
     return "";
 }
 
@@ -314,14 +567,26 @@ func targetTool(root string, name string) string {
 
 func managedClangArgs(root string, target util.Target, payload string, sdk string) []string {
     bin := hostToolPath(root) + "/bin/";
-    if (target.system == "macos") {
+    if (target.system == "macos" && !util.IsRegular(payload + "/cross")) {
         return []string{"/usr/bin/clang", "--target=" + target.Triple(), "-isysroot", sdk, "-iwithsysroot", "/usr/include/ffi"};
+    }
+    if (target.system == "macos") {
+        clang := targetTool(root, "clang");
+        args := []string{clang, "--target=" + target.Triple()};
+        if (clang != "clang") args.append("--no-default-config");
+        args.append("-isysroot", sdk, "-iwithsysroot", "/usr/include/ffi",
+            "-fuse-ld=lld", "--ld-path=" + targetTool(root, "ld64.lld"));
+        return args;
     }
     clang := targetTool(root, "clang");
     args := []string{clang, "--target=" + target.Triple()};
     if (clang != "clang") args.append("--no-default-config");
     if (target.Wasm()) {
+        // Debian-built Clang looks for a versioned wasm-ld-<major> by default,
+        // so name the bundled linker by its absolute path.
         args.append("-B" + bin);
+        linker := targetTool(root, "wasm-ld");
+        if (linker != "wasm-ld") args.append("-fuse-ld=" + linker);
     } else {
         args.append("-I" + payload + "/include", "-L" + payload + "/lib",
             "-fuse-ld=lld", "--ld-path=" + targetTool(root, "ld.lld"));
