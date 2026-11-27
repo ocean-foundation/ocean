@@ -1968,10 +1968,12 @@ executable. File paths are relative to the compiler's working directory.
   and `OCARCH` pairs and whether the available toolchain can compile and link
   for each target. `ocean target <target>...` downloads and installs managed
   toolchain components for the specified targets, and
-  `ocean target --remove <target>...` uninstalls them. `--force` reinstalls
-  targets that are already installed, refreshes the shared host tools, and
-  installs the bundled cross toolchain and macOS SDK even where the host
-  provides an Apple SDK. Set flags select groups of targets and may be mixed
+  `ocean target --remove <target>...` uninstalls them. A target the system
+  toolchain already compiles and links is left uninstalled, because builds
+  without managed components use the system toolchain. `--force` installs
+  such targets anyway, reinstalls targets that are already installed,
+  refreshes the shared host tools, and installs the bundled cross toolchain
+  and macOS SDK even where the host provides an Apple SDK. Set flags select groups of targets and may be mixed
   with target names: `--all` (every target), `--native` (every target except
   `wasm-js`), `--x86_64` (`--x86`), `--aarch64` (`--arm`, `--arm64`),
   `--riscv64` (`--riscv`), `--linux`, `--macos` (`--darwin`), and `--windows`.

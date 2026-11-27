@@ -170,14 +170,26 @@ func listTargets() int {
 }
 
 func targetReady(target util.Target, dir string) bool {
-    args := clangTargetArgs(target);
+    return toolchainReady(target, dir, clangTargetArgs(target), targetTool(managedTargetRoot(target), "llvm-ar"));
+}
+
+// systemTargetReady reports whether the system toolchain, without managed
+// components, compiles and links the target probe.
+func systemTargetReady(target util.Target) bool {
+    dir, ok := util.MakeTempDir("ocean-target-probe-");
+    if (!ok) return false;
+    defer util.RemoveAll(dir);
+    return toolchainReady(target, dir, systemClangArgs(target), "llvm-ar");
+}
+
+func toolchainReady(target util.Target, dir string, args []string, archiver string) bool {
     if (!target.Wasm()) args.append(ffiCompileFlags(target)...);
     if (!appendTargetProbe(target, dir, &args)) return false;
     if (!target.Wasm() && !appendDependencyLinkFlags(target, &args, true, true, false)) return false;
     status, _ := util.RunCapture(args.array());
     if (status.Failed || status.Code != 0) return false;
     if (archivesLibraries(target)) {
-        status, _ = util.RunCapture([]string{targetTool(managedTargetRoot(target), "llvm-ar"), "--version"}.array());
+        status, _ = util.RunCapture([]string{archiver, "--version"}.array());
     }
     return !status.Failed && status.Code == 0;
 }
@@ -446,12 +458,19 @@ func installTarget(root string, target util.Target, force bool) bool {
     // targets. Other hosts use the bundled Clang and ld64.lld with a macOS SDK.
     sdk := "";
     xcode := false;
+    override, _ := util.Getenv("OCEAN_MACOS_SDK");
     if (target.system == "macos" && util.MacOS() && !force) {
-        override, _ := util.Getenv("OCEAN_MACOS_SDK");
         status, output := util.RunCapture([]string{"xcrun", "--show-sdk-path"}.array());
         sdk = strings.TrimSpace(output);
         xcode = override == "" && !status.Failed && status.Code == 0 && util.IsDir(sdk) && util.IsExecutable("/usr/bin/clang");
         if (!xcode) sdk = "";
+    }
+    // Builds without managed components use the system toolchain, so there is
+    // nothing to install when it already handles the target. An explicit
+    // OCEAN_MACOS_SDK asks for a managed macOS installation.
+    if (!force && !xcode && !(target.system == "macos" && override != "") && systemTargetReady(target)) {
+        util.Stdout(target.Name() + " is supported by the system toolchain; use --force to install the bundled toolchain\n");
+        return true;
     }
     if (!xcode && !ensureHostTools(root, false)) return false;
     if (target.system == "macos" && !xcode && !ensureLinkerDriver(hostToolPath(root), "ld64.lld")) return false;

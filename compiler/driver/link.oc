@@ -79,14 +79,21 @@ func clangTargetArgs(target util.Target) []string {
         path := targetPath(root, target);
         sdk, _ := util.ReadFile(path + "/sdk");
         args = managedClangArgs(root, target, path, macOSSDKPath(path, sdk));
-    } else {
-        clang, _ := util.Getenv("OCEAN_CLANG");
-        args.append(clang == "" ? "clang" : clang);
-        triple := target.Triple();
-        if (triple != "") args.append("--target=" + triple);
-        sysroot, _ := util.Getenv("OCEAN_SYSROOT");
-        if (sysroot != "" && !target.Wasm()) args.append("--sysroot=" + sysroot);
+        if (target.system == "windows") args.append("-D_longjmp=longjmp", "-D__USE_MINGW_SETJMP_NON_SEH");
+        return args;
     }
+    return systemClangArgs(target);
+}
+
+// systemClangArgs invokes the system Clang, or OCEAN_CLANG, for target.
+func systemClangArgs(target util.Target) []string {
+    args := make([]string);
+    clang, _ := util.Getenv("OCEAN_CLANG");
+    args.append(clang == "" ? "clang" : clang);
+    triple := target.Triple();
+    if (triple != "") args.append("--target=" + triple);
+    sysroot, _ := util.Getenv("OCEAN_SYSROOT");
+    if (sysroot != "" && !target.Wasm()) args.append("--sysroot=" + sysroot);
     if (target.system == "windows") args.append("-D_longjmp=longjmp", "-D__USE_MINGW_SETJMP_NON_SEH");
     return args;
 }
