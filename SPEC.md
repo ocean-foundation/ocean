@@ -1964,9 +1964,9 @@ executable. File paths are relative to the compiler's working directory.
   `x86_64`, `aarch64`, and `riscv64`; macOS and Windows support `x86_64` and
   `aarch64`; and `OCOS=js OCARCH=wasm` targets `wasm32-unknown-unknown`.
   Executing code via `run` or `test` is restricted to the host target.
-- `ocean target --list` lists available target names along with their `OCOS`
-  and `OCARCH` pairs and whether the available toolchain can compile and link
-  for each target. `ocean target <target>...` downloads and installs managed
+- `ocean target --list` lists available target names along with their `OCOS` and
+  `OCARCH` pairs and whether the available toolchain can compile and link for
+  each target. `ocean target <target>...` downloads and installs managed
   toolchain components for the specified targets, and
   `ocean target --remove <target>...` uninstalls them. A target the system
   toolchain already compiles and links is left uninstalled, because builds
@@ -1974,18 +1974,18 @@ executable. File paths are relative to the compiler's working directory.
   exception: on a Mac with the Command Line Tools and no `OCEAN_MACOS_SDK`,
   installing one records the Apple SDK, and builds use the Apple toolchain.
   Elsewhere, including a Mac without the Command Line Tools or with
-  `OCEAN_MACOS_SDK` set, macOS targets use the bundled Clang and `ld64.lld`
-  with a downloaded SDK or the one `OCEAN_MACOS_SDK` names, which must be
-  outside the managed target directory. `--force` installs targets the system
-  toolchain supports anyway, reinstalls targets that are already installed,
-  refreshes the shared host tools, and installs the bundled cross toolchain
-  and macOS SDK even where the Apple toolchain is available. Set flags select groups of targets and may be mixed
-  with target names: `--all` (every target), `--native` (every target except
-  `wasm-js`), `--x86_64` (`--x86`), `--aarch64` (`--arm`, `--arm64`),
-  `--riscv64` (`--riscv`), `--linux`, `--macos` (`--darwin`), and `--windows`.
-  `ocean target --sets` lists the sets and their targets. Explicit target builds
-  automatically pick up these managed components. `OCEAN_TARGET_DIR` overrides
-  the default per-user storage location.
+  `OCEAN_MACOS_SDK` set, macOS targets use the bundled Clang and `ld64.lld` with
+  a downloaded SDK or the one `OCEAN_MACOS_SDK` names, which must be outside the
+  managed target directory. `--force` installs targets the system toolchain
+  supports anyway, reinstalls targets that are already installed, refreshes the
+  shared host tools, and installs the bundled cross toolchain and macOS SDK even
+  where the Apple toolchain is available. Set flags select groups of targets and
+  may be mixed with target names: `--all` (every target), `--native` (every
+  target except `wasm-js`), `--x86_64` (`--x86`), `--aarch64` (`--arm`,
+  `--arm64`), `--riscv64` (`--riscv`), `--linux`, `--macos` (`--darwin`), and
+  `--windows`. `ocean target --sets` lists the sets and their targets. Explicit
+  target builds automatically pick up these managed components.
+  `OCEAN_TARGET_DIR` overrides the default per-user storage location.
 - Running `build --emit-llvm` for a non-host target emits only the program's
   LLVM IR, without needing a target runtime. Producing or checking a full
   binary requires Clang, a compatible linker, and the target's headers and
